@@ -82,6 +82,12 @@ var (
 	ErrCursorNotFound = errors.New("cursor not found")
 )
 
+// Tree structure errors
+var (
+	// ErrNotALeaf indicates that an operation expected a leaf node but got an internal node.
+	ErrNotALeaf = errors.New("expected leaf node")
+)
+
 // Configuration errors
 var (
 	// ErrNoDataSource indicates that no data source was provided in FileOptions.

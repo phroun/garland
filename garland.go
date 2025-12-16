@@ -667,48 +667,154 @@ func (g *Garland) updateCursorReady(c *Cursor) {
 }
 
 func (g *Garland) waitForBytePosition(pos int64) error {
-	// TODO: Implement blocking wait
-	if pos > g.totalBytes && !g.countComplete {
+	if pos < 0 {
+		return ErrInvalidPosition
+	}
+	// TODO: Implement blocking wait for lazy loading
+	if !g.countComplete && pos > g.totalBytes {
 		return ErrNotReady
+	}
+	// After loading is complete, validate position
+	if g.countComplete && pos > g.totalBytes {
+		return ErrInvalidPosition
 	}
 	return nil
 }
 
 func (g *Garland) waitForRunePosition(pos int64) error {
-	// TODO: Implement blocking wait
-	if pos > g.totalRunes && !g.countComplete {
+	if pos < 0 {
+		return ErrInvalidPosition
+	}
+	// TODO: Implement blocking wait for lazy loading
+	if !g.countComplete && pos > g.totalRunes {
 		return ErrNotReady
+	}
+	if g.countComplete && pos > g.totalRunes {
+		return ErrInvalidPosition
 	}
 	return nil
 }
 
 func (g *Garland) waitForLine(line int64) error {
-	// TODO: Implement blocking wait
-	if line > g.totalLines && !g.countComplete {
+	if line < 0 {
+		return ErrInvalidPosition
+	}
+	// TODO: Implement blocking wait for lazy loading
+	if !g.countComplete && line > g.totalLines {
 		return ErrNotReady
+	}
+	if g.countComplete && line > g.totalLines {
+		return ErrInvalidPosition
 	}
 	return nil
 }
 
-// Address conversion stubs
+// Address conversion functions
+
 func (g *Garland) byteToRuneInternal(bytePos int64) (int64, error) {
-	// TODO: Implement
-	return 0, nil
+	if bytePos == 0 {
+		return 0, nil
+	}
+
+	result, err := g.findLeafByByte(bytePos)
+	if err != nil {
+		return 0, err
+	}
+
+	// Absolute rune position = leaf's rune start + rune offset within leaf
+	return result.LeafRuneStart + result.RuneOffset, nil
 }
 
 func (g *Garland) runeToByteInternal(runePos int64) (int64, error) {
-	// TODO: Implement
-	return 0, nil
+	if runePos == 0 {
+		return 0, nil
+	}
+
+	result, err := g.findLeafByRune(runePos)
+	if err != nil {
+		return 0, err
+	}
+
+	// Absolute byte position = leaf's byte start + byte offset within leaf
+	return result.LeafByteStart + result.ByteOffset, nil
 }
 
 func (g *Garland) byteToLineRuneInternal(bytePos int64) (int64, int64, error) {
-	// TODO: Implement
-	return 0, 0, nil
+	if bytePos == 0 {
+		return 0, 0, nil
+	}
+
+	result, err := g.findLeafByByte(bytePos)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// Find which line within the leaf
+	snap := result.Snapshot
+	line := int64(0)
+	lineRuneStart := int64(0)
+
+	// Find the line that contains our byte offset
+	for i := len(snap.lineStarts) - 1; i >= 0; i-- {
+		if snap.lineStarts[i].ByteOffset <= result.ByteOffset {
+			line = int64(i)
+			lineRuneStart = snap.lineStarts[i].RuneOffset
+			break
+		}
+	}
+
+	// Calculate absolute line number
+	absoluteLine := g.countLinesBeforeLeaf(result.LeafByteStart) + line
+
+	// Calculate rune position within the line
+	runeInLine := result.RuneOffset - lineRuneStart
+
+	return absoluteLine, runeInLine, nil
 }
 
 func (g *Garland) lineRuneToByteInternal(line, runeInLine int64) (int64, error) {
-	// TODO: Implement
-	return 0, nil
+	result, err := g.findLeafByLine(line, runeInLine)
+	if err != nil {
+		return 0, err
+	}
+
+	return result.LeafResult.LeafByteStart + result.LeafResult.ByteOffset, nil
+}
+
+// countLinesBeforeLeaf counts the total lines in all leaves before the one starting at byteStart.
+func (g *Garland) countLinesBeforeLeaf(byteStart int64) int64 {
+	if byteStart == 0 {
+		return 0
+	}
+
+	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
+	if rootSnap == nil {
+		return 0
+	}
+
+	return g.countLinesBeforeByteInternal(g.root, rootSnap, byteStart, 0)
+}
+
+func (g *Garland) countLinesBeforeByteInternal(node *Node, snap *NodeSnapshot, targetByte int64, currentByte int64) int64 {
+	if snap.isLeaf {
+		return 0
+	}
+
+	leftNode := g.nodeRegistry[snap.leftID]
+	leftSnap := leftNode.snapshotAt(g.currentFork, g.currentRevision)
+
+	leftEnd := currentByte + leftSnap.byteCount
+
+	if targetByte <= leftEnd {
+		// Target is in left subtree
+		return g.countLinesBeforeByteInternal(leftNode, leftSnap, targetByte, currentByte)
+	}
+
+	// Target is in right subtree; count all lines in left subtree
+	rightNode := g.nodeRegistry[snap.rightID]
+	rightSnap := rightNode.snapshotAt(g.currentFork, g.currentRevision)
+
+	return leftSnap.lineCount + g.countLinesBeforeByteInternal(rightNode, rightSnap, targetByte, leftEnd)
 }
 
 // Mutation stubs
@@ -737,20 +843,170 @@ func (g *Garland) truncateAt(c *Cursor, pos int64) (ChangeResult, error) {
 	return ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}, nil
 }
 
-// Read stubs
+// Read operations
+
 func (g *Garland) readBytesAt(pos int64, length int64) ([]byte, error) {
-	// TODO: Implement
-	return nil, nil
+	if pos < 0 {
+		return nil, ErrInvalidPosition
+	}
+
+	if length <= 0 {
+		return nil, nil
+	}
+
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	if pos > g.totalBytes {
+		return nil, ErrInvalidPosition
+	}
+
+	// Clamp length to available data
+	if pos+length > g.totalBytes {
+		length = g.totalBytes - pos
+	}
+
+	return g.readBytesRangeInternal(pos, length)
 }
 
 func (g *Garland) readStringAt(pos int64, length int64) (string, error) {
-	// TODO: Implement
-	return "", nil
+	if length <= 0 {
+		return "", nil
+	}
+
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	if pos < 0 || pos > g.totalRunes {
+		return "", ErrInvalidPosition
+	}
+
+	// Convert rune range to byte range
+	byteStart, err := g.runeToByteInternal(pos)
+	if err != nil {
+		return "", err
+	}
+
+	byteEnd, err := g.runeToByteInternal(pos + length)
+	if err != nil {
+		// If end is past EOF, clamp to EOF
+		byteEnd = g.totalBytes
+	}
+
+	data, err := g.readBytesRangeInternal(byteStart, byteEnd-byteStart)
+	if err != nil {
+		return "", err
+	}
+
+	return string(data), nil
 }
 
 func (g *Garland) readLineAt(line int64) (string, error) {
-	// TODO: Implement
-	return "", nil
+	if line < 0 {
+		return "", ErrInvalidPosition
+	}
+
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	// Validate line number
+	if line > g.totalLines {
+		return "", ErrInvalidPosition
+	}
+
+	// Find start of line
+	lineResult, err := g.findLeafByLine(line, 0)
+	if err != nil {
+		return "", err
+	}
+
+	lineStart := lineResult.LineByteStart
+
+	// Find end of line (next newline or EOF)
+	lineEnd := g.findLineEnd(lineStart)
+
+	// Read the line content
+	length := lineEnd - lineStart
+	if length <= 0 {
+		return "", nil
+	}
+
+	data, err := g.readBytesRangeInternal(lineStart, length)
+	if err != nil {
+		return "", err
+	}
+
+	return string(data), nil
+}
+
+// readBytesRangeInternal reads bytes from pos to pos+length.
+// Caller must hold at least read lock.
+func (g *Garland) readBytesRangeInternal(pos int64, length int64) ([]byte, error) {
+	if length <= 0 {
+		return nil, nil
+	}
+
+	result := make([]byte, 0, length)
+	remaining := length
+	currentPos := pos
+
+	for remaining > 0 {
+		leafResult, err := g.findLeafByByte(currentPos)
+		if err != nil {
+			return nil, err
+		}
+
+		snap := leafResult.Snapshot
+
+		// Calculate how much we can read from this leaf
+		availableInLeaf := snap.byteCount - leafResult.ByteOffset
+		toRead := remaining
+		if toRead > availableInLeaf {
+			toRead = availableInLeaf
+		}
+
+		// Copy data from leaf
+		start := leafResult.ByteOffset
+		end := start + toRead
+		result = append(result, snap.data[start:end]...)
+
+		remaining -= toRead
+		currentPos += toRead
+	}
+
+	return result, nil
+}
+
+// findLineEnd finds the byte position of the end of the line (at newline or EOF).
+func (g *Garland) findLineEnd(lineStart int64) int64 {
+	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
+	if rootSnap == nil {
+		return lineStart
+	}
+
+	currentPos := lineStart
+	totalBytes := rootSnap.byteCount
+
+	for currentPos < totalBytes {
+		leafResult, err := g.findLeafByByte(currentPos)
+		if err != nil {
+			return currentPos
+		}
+
+		snap := leafResult.Snapshot
+
+		// Search for newline in this leaf starting from our offset
+		for i := leafResult.ByteOffset; i < snap.byteCount; i++ {
+			if snap.data[i] == '\n' {
+				return currentPos + (i - leafResult.ByteOffset) + 1 // include the newline
+			}
+		}
+
+		// Move to next leaf
+		currentPos += snap.byteCount - leafResult.ByteOffset
+	}
+
+	return totalBytes
 }
 
 func formatGarlandID(id uint64) string {
