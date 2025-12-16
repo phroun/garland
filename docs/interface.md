@@ -375,6 +375,85 @@ func (g *Garland) FindForksBetween(revisionFirst, revisionLast RevisionID) (
 
 ---
 
+## Transactions
+
+Transactions group multiple operations into a single revision.
+
+```go
+// TransactionStart begins a new transaction.
+// All mutations until commit/rollback are bundled into one pending revision.
+// Transactions can be nested; the outermost commit creates the revision.
+// UndoSeek and ForkSeek are not allowed while a transaction is pending.
+func (g *Garland) TransactionStart() error
+
+// TransactionCommit commits the current transaction.
+// For nested transactions, only the outermost commit creates a revision.
+// Returns ErrTransactionPoisoned if any inner transaction was rolled back.
+func (g *Garland) TransactionCommit() (ChangeResult, error)
+
+// TransactionRollback discards all changes in the current transaction.
+// For nested transactions, this "poisons" all outer transactions,
+// causing their commits to automatically rollback.
+func (g *Garland) TransactionRollback() error
+
+// TransactionDepth returns the current nesting depth (0 = no active transaction).
+func (g *Garland) TransactionDepth() int
+
+// InTransaction returns true if any transaction is active.
+func (g *Garland) InTransaction() bool
+```
+
+### Transaction Behavior
+
+**Nesting Rules:**
+- `TransactionStart` increments the nesting depth
+- `TransactionCommit` decrements the nesting depth; revision created only at depth 0→0
+- `TransactionRollback` poisons the transaction and decrements depth
+
+**Poisoned Transactions:**
+- Once any inner `TransactionRollback` is called, the transaction is poisoned
+- All subsequent `TransactionCommit` calls at any depth will rollback instead
+- The entire outer transaction's changes are discarded
+
+**Restrictions During Transactions:**
+- `UndoSeek` returns `ErrTransactionPending`
+- `ForkSeek` returns `ErrTransactionPending`
+- Optimized region `CommitSnapshot` is deferred until transaction commit
+
+**Example Usage:**
+```go
+g.TransactionStart()
+
+cursor.SeekByte(100)
+cursor.DeleteBytes(50, false)  // no revision yet
+
+cursor.SeekByte(200)
+cursor.InsertString("replacement", nil, true)  // still no revision
+
+result, err := g.TransactionCommit()  // single revision for both operations
+// result.Revision is the new revision number
+```
+
+**Nested Example:**
+```go
+g.TransactionStart()  // depth 1
+cursor.InsertString("outer", nil, true)
+
+    g.TransactionStart()  // depth 2
+    cursor.InsertString("inner", nil, true)
+
+    if somethingWentWrong {
+        g.TransactionRollback()  // poisons entire transaction
+    } else {
+        g.TransactionCommit()  // depth back to 1, no revision yet
+    }
+
+result, err := g.TransactionCommit()  // if poisoned: rolls back, err = ErrTransactionPoisoned
+                                       // if not poisoned: creates single revision
+```
+
+---
+
 ## Counts and Status
 
 ```go
@@ -505,6 +584,11 @@ var (
 
     // Region errors
     ErrRegionOverlap = errors.New("optimized regions cannot overlap")
+
+    // Transaction errors
+    ErrTransactionPending  = errors.New("operation not allowed during transaction")
+    ErrTransactionPoisoned = errors.New("transaction was poisoned by inner rollback")
+    ErrNoTransaction       = errors.New("no active transaction")
 )
 ```
 

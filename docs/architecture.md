@@ -128,6 +128,9 @@ type Garland struct {
 
     // Optimized regions
     optimizedRegions []*OptimizedRegionHandle
+
+    // Transaction state
+    transaction *TransactionState
 }
 ```
 
@@ -246,6 +249,33 @@ type DecorationCacheEntry struct {
     NodeID         NodeID
     RelativeOffset int64
     // Note: Must verify on EVERY lookup, this is just a hint
+}
+```
+
+### Transaction State
+
+```go
+type TransactionState struct {
+    // Nesting depth (1 = single transaction, 2+ = nested)
+    depth int
+
+    // Whether any inner transaction has rolled back
+    poisoned bool
+
+    // Snapshot of tree state before transaction started
+    // Used for rollback
+    preTransactionRoot   NodeID
+    preTransactionFork   ForkID
+    preTransactionRev    RevisionID
+
+    // Cursor positions at transaction start (for rollback)
+    preTransactionCursors map[*Cursor]*CursorPosition
+
+    // Pending revision number (assigned on first mutation)
+    pendingRevision RevisionID
+
+    // Whether any mutation has occurred in this transaction
+    hasMutations bool
 }
 ```
 
@@ -486,6 +516,145 @@ func updateCursors(g *Garland, mutationPos int64, delta int64, fork ForkID, rev 
             cursor.lastRevision = rev
         }
     }
+}
+```
+
+### Transaction Management
+
+Transactions batch multiple operations into a single revision.
+
+**TransactionStart:**
+```
+func (g *Garland) TransactionStart() error {
+    if g.transaction == nil {
+        // First level: create new transaction state
+        g.transaction = &TransactionState{
+            depth:                 1,
+            poisoned:              false,
+            preTransactionRoot:    g.root.id,
+            preTransactionFork:    g.currentFork,
+            preTransactionRev:     g.currentRevision,
+            preTransactionCursors: snapshotCursorPositions(g.cursors),
+            hasMutations:          false,
+        }
+    } else {
+        // Nested: just increment depth
+        g.transaction.depth++
+    }
+    return nil
+}
+```
+
+**Mutation during transaction:**
+```
+func (g *Garland) mutate(...) {
+    if g.transaction != nil && !g.transaction.hasMutations {
+        // First mutation: assign pending revision
+        g.transaction.pendingRevision = g.currentRevision + 1
+        g.transaction.hasMutations = true
+    }
+
+    // Use pending revision for all changes during transaction
+    rev := g.currentRevision
+    if g.transaction != nil {
+        rev = g.transaction.pendingRevision
+    }
+
+    // Perform mutation at this revision
+    // (don't increment g.currentRevision yet)
+}
+```
+
+**TransactionCommit:**
+```
+func (g *Garland) TransactionCommit() (ChangeResult, error) {
+    if g.transaction == nil {
+        return ChangeResult{}, ErrNoTransaction
+    }
+
+    g.transaction.depth--
+
+    if g.transaction.depth > 0 {
+        // Inner commit: just decrement, don't finalize
+        return ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}, nil
+    }
+
+    // Outermost commit
+    if g.transaction.poisoned {
+        // Poisoned: rollback instead
+        rollbackToPreTransaction(g)
+        g.transaction = nil
+        return ChangeResult{}, ErrTransactionPoisoned
+    }
+
+    if g.transaction.hasMutations {
+        // Finalize: advance to pending revision
+        g.currentRevision = g.transaction.pendingRevision
+    }
+
+    result := ChangeResult{
+        Fork:     g.currentFork,
+        Revision: g.currentRevision,
+    }
+    g.transaction = nil
+    return result, nil
+}
+```
+
+**TransactionRollback:**
+```
+func (g *Garland) TransactionRollback() error {
+    if g.transaction == nil {
+        return ErrNoTransaction
+    }
+
+    // Poison the transaction
+    g.transaction.poisoned = true
+    g.transaction.depth--
+
+    if g.transaction.depth == 0 {
+        // Outermost level: perform actual rollback
+        rollbackToPreTransaction(g)
+        g.transaction = nil
+    }
+    // Inner level: poison flag will cause outer commit to rollback
+
+    return nil
+}
+
+func rollbackToPreTransaction(g *Garland) {
+    // Restore tree state
+    g.root = g.nodeRegistry[g.transaction.preTransactionRoot]
+    g.currentFork = g.transaction.preTransactionFork
+    g.currentRevision = g.transaction.preTransactionRev
+
+    // Restore cursor positions
+    for cursor, pos := range g.transaction.preTransactionCursors {
+        cursor.bytePos = pos.BytePos
+        cursor.runePos = pos.RunePos
+        cursor.line = pos.Line
+        cursor.lineRune = pos.LineRune
+    }
+
+    // Discard any nodes created during transaction
+    // (They have history entries at pendingRevision that will be orphaned)
+}
+```
+
+**UndoSeek/ForkSeek blocking:**
+```
+func (g *Garland) UndoSeek(revision RevisionID) error {
+    if g.transaction != nil {
+        return ErrTransactionPending
+    }
+    // ... normal UndoSeek logic
+}
+
+func (g *Garland) ForkSeek(fork ForkID) error {
+    if g.transaction != nil {
+        return ErrTransactionPending
+    }
+    // ... normal ForkSeek logic
 }
 ```
 

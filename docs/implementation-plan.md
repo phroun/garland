@@ -18,6 +18,7 @@ garland/
 ├── decoration.go      # Decoration types and cache
 ├── storage.go         # Storage interfaces and implementations
 ├── versioning.go      # Fork/revision management
+├── transaction.go     # Transaction state and operations
 ├── address.go         # Address modes and conversion
 ├── loader.go          # Background loading
 ├── region.go          # Optimized regions
@@ -136,7 +137,18 @@ garland/
 - [ ] Implement divergence point discovery
 - [ ] Return list of ForkDivergence
 
-**Milestone 4**: Full mutation support with undo/redo and forking.
+### 4.7 Transactions
+- [ ] Implement `TransactionState` structure
+- [ ] Implement `TransactionStart()` with nesting support
+- [ ] Implement `TransactionCommit()` with poison detection
+- [ ] Implement `TransactionRollback()` with poison propagation
+- [ ] Implement `TransactionDepth()` and `InTransaction()`
+- [ ] Block `UndoSeek`/`ForkSeek` during transactions
+- [ ] Snapshot cursor positions at transaction start
+- [ ] Restore cursor positions on rollback
+- [ ] Defer revision increment until outermost commit
+
+**Milestone 4**: Full mutation support with undo/redo, forking, and transactions.
 
 ---
 
@@ -320,6 +332,7 @@ garland/
 - [ ] Unit tests for tree navigation
 - [ ] Unit tests for mutations
 - [ ] Unit tests for versioning
+- [ ] Unit tests for transactions (nesting, poison, rollback)
 - [ ] Unit tests for decorations
 - [ ] Unit tests for storage tiers
 - [ ] Unit tests for lazy loading
@@ -369,6 +382,7 @@ node.go            ← errors, address
 cursor.go          ← errors, node
 decoration.go      ← errors, node
 versioning.go      ← errors, node
+transaction.go     ← errors, node, cursor
 storage.go         ← errors, node
 garland.go         ← all above
 loader.go          ← garland, node, storage
