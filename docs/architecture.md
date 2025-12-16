@@ -259,6 +259,9 @@ type TransactionState struct {
     // Nesting depth (1 = single transaction, 2+ = nested)
     depth int
 
+    // Name for this transaction (from outermost TransactionStart)
+    name string
+
     // Whether any inner transaction has rolled back
     poisoned bool
 
@@ -271,11 +274,30 @@ type TransactionState struct {
     // Cursor positions at transaction start (for rollback)
     preTransactionCursors map[*Cursor]*CursorPosition
 
-    // Pending revision number (assigned on first mutation)
+    // Pending revision number (assigned at TransactionStart)
     pendingRevision RevisionID
 
     // Whether any mutation has occurred in this transaction
     hasMutations bool
+}
+```
+
+### Revision Info
+
+```go
+// Stored per revision for undo history display
+type RevisionInfo struct {
+    Revision   RevisionID
+    Name       string  // from TransactionStart
+    HasChanges bool    // true if actual mutations occurred
+}
+
+// Stored in Garland
+type Garland struct {
+    // ... other fields ...
+
+    // Revision metadata indexed by (fork, revision)
+    revisionInfo map[ForkRevision]*RevisionInfo
 }
 ```
 
@@ -525,20 +547,23 @@ Transactions batch multiple operations into a single revision.
 
 **TransactionStart:**
 ```
-func (g *Garland) TransactionStart() error {
+func (g *Garland) TransactionStart(name string) error {
     if g.transaction == nil {
         // First level: create new transaction state
+        // Always assign pending revision upfront (even for empty transactions)
         g.transaction = &TransactionState{
             depth:                 1,
+            name:                  name,
             poisoned:              false,
             preTransactionRoot:    g.root.id,
             preTransactionFork:    g.currentFork,
             preTransactionRev:     g.currentRevision,
             preTransactionCursors: snapshotCursorPositions(g.cursors),
+            pendingRevision:       g.currentRevision + 1,
             hasMutations:          false,
         }
     } else {
-        // Nested: just increment depth
+        // Nested: just increment depth (name ignored for inner transactions)
         g.transaction.depth++
     }
     return nil
@@ -548,9 +573,7 @@ func (g *Garland) TransactionStart() error {
 **Mutation during transaction:**
 ```
 func (g *Garland) mutate(...) {
-    if g.transaction != nil && !g.transaction.hasMutations {
-        // First mutation: assign pending revision
-        g.transaction.pendingRevision = g.currentRevision + 1
+    if g.transaction != nil {
         g.transaction.hasMutations = true
     }
 
@@ -581,15 +604,21 @@ func (g *Garland) TransactionCommit() (ChangeResult, error) {
 
     // Outermost commit
     if g.transaction.poisoned {
-        // Poisoned: rollback instead
+        // Poisoned: rollback instead (no revision created)
         rollbackToPreTransaction(g)
         g.transaction = nil
         return ChangeResult{}, ErrTransactionPoisoned
     }
 
-    if g.transaction.hasMutations {
-        // Finalize: advance to pending revision
-        g.currentRevision = g.transaction.pendingRevision
+    // ALWAYS create a new revision, even if no mutations
+    // This allows external state to sync with garland revisions
+    g.currentRevision = g.transaction.pendingRevision
+
+    // Store revision info for undo history
+    g.revisionInfo[ForkRevision{g.currentFork, g.currentRevision}] = &RevisionInfo{
+        Revision:   g.currentRevision,
+        Name:       g.transaction.name,
+        HasChanges: g.transaction.hasMutations,
     }
 
     result := ChangeResult{

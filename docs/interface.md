@@ -380,14 +380,17 @@ func (g *Garland) FindForksBetween(revisionFirst, revisionLast RevisionID) (
 Transactions group multiple operations into a single revision.
 
 ```go
-// TransactionStart begins a new transaction.
+// TransactionStart begins a new transaction with an optional descriptive name.
 // All mutations until commit/rollback are bundled into one pending revision.
 // Transactions can be nested; the outermost commit creates the revision.
+// The name is associated with the resulting revision for undo history display.
 // UndoSeek and ForkSeek are not allowed while a transaction is pending.
-func (g *Garland) TransactionStart() error
+func (g *Garland) TransactionStart(name string) error
 
 // TransactionCommit commits the current transaction.
 // For nested transactions, only the outermost commit creates a revision.
+// A new revision is ALWAYS created, even if no mutations occurred.
+// This allows external state to be synchronized with garland revisions.
 // Returns ErrTransactionPoisoned if any inner transaction was rolled back.
 func (g *Garland) TransactionCommit() (ChangeResult, error)
 
@@ -403,17 +406,41 @@ func (g *Garland) TransactionDepth() int
 func (g *Garland) InTransaction() bool
 ```
 
+### Revision History
+
+```go
+// RevisionInfo contains metadata about a revision.
+type RevisionInfo struct {
+    Revision    RevisionID
+    Name        string    // from TransactionStart, empty if unnamed
+    HasChanges  bool      // true if revision contains actual mutations
+}
+
+// GetRevisionInfo returns information about a specific revision.
+func (g *Garland) GetRevisionInfo(revision RevisionID) (*RevisionInfo, error)
+
+// GetRevisionRange returns info for revisions in [start, end] inclusive.
+// Useful for displaying undo history.
+func (g *Garland) GetRevisionRange(start, end RevisionID) ([]RevisionInfo, error)
+```
+
 ### Transaction Behavior
 
 **Nesting Rules:**
 - `TransactionStart` increments the nesting depth
-- `TransactionCommit` decrements the nesting depth; revision created only at depth 0→0
+- `TransactionCommit` decrements depth; revision created at outermost commit
 - `TransactionRollback` poisons the transaction and decrements depth
+- Only the outermost transaction's name is used for the revision
+
+**Empty Transactions:**
+- Committing a transaction ALWAYS creates a new revision, even with no mutations
+- `RevisionInfo.HasChanges` indicates whether actual changes were made
+- This allows external application state to sync with revision numbers
 
 **Poisoned Transactions:**
 - Once any inner `TransactionRollback` is called, the transaction is poisoned
 - All subsequent `TransactionCommit` calls at any depth will rollback instead
-- The entire outer transaction's changes are discarded
+- The entire outer transaction's changes are discarded (no revision created)
 
 **Restrictions During Transactions:**
 - `UndoSeek` returns `ErrTransactionPending`
@@ -422,7 +449,7 @@ func (g *Garland) InTransaction() bool
 
 **Example Usage:**
 ```go
-g.TransactionStart()
+g.TransactionStart("Replace header text")
 
 cursor.SeekByte(100)
 cursor.DeleteBytes(50, false)  // no revision yet
@@ -432,14 +459,30 @@ cursor.InsertString("replacement", nil, true)  // still no revision
 
 result, err := g.TransactionCommit()  // single revision for both operations
 // result.Revision is the new revision number
+
+// Later, display undo history:
+info, _ := g.GetRevisionInfo(result.Revision)
+fmt.Println(info.Name)  // "Replace header text"
+```
+
+**Empty Transaction Example:**
+```go
+// Sync external state with garland revision
+g.TransactionStart("Update cursor color to blue")
+// No garland mutations, just external state change
+result, _ := g.TransactionCommit()  // still creates a revision
+
+info, _ := g.GetRevisionInfo(result.Revision)
+// info.HasChanges == false
+// info.Name == "Update cursor color to blue"
 ```
 
 **Nested Example:**
 ```go
-g.TransactionStart()  // depth 1
+g.TransactionStart("Refactor function")  // depth 1, this name is used
 cursor.InsertString("outer", nil, true)
 
-    g.TransactionStart()  // depth 2
+    g.TransactionStart("inner operation")  // depth 2, name ignored
     cursor.InsertString("inner", nil, true)
 
     if somethingWentWrong {
@@ -449,7 +492,7 @@ cursor.InsertString("outer", nil, true)
     }
 
 result, err := g.TransactionCommit()  // if poisoned: rolls back, err = ErrTransactionPoisoned
-                                       // if not poisoned: creates single revision
+                                       // if not poisoned: creates revision named "Refactor function"
 ```
 
 ---

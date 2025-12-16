@@ -138,15 +138,18 @@ garland/
 - [ ] Return list of ForkDivergence
 
 ### 4.7 Transactions
-- [ ] Implement `TransactionState` structure
-- [ ] Implement `TransactionStart()` with nesting support
+- [ ] Implement `TransactionState` structure with name field
+- [ ] Implement `TransactionStart(name)` with nesting support
 - [ ] Implement `TransactionCommit()` with poison detection
 - [ ] Implement `TransactionRollback()` with poison propagation
 - [ ] Implement `TransactionDepth()` and `InTransaction()`
 - [ ] Block `UndoSeek`/`ForkSeek` during transactions
 - [ ] Snapshot cursor positions at transaction start
 - [ ] Restore cursor positions on rollback
-- [ ] Defer revision increment until outermost commit
+- [ ] Always create revision on commit (even for empty transactions)
+- [ ] Implement `RevisionInfo` structure and storage
+- [ ] Implement `GetRevisionInfo(revision)`
+- [ ] Implement `GetRevisionRange(start, end)`
 
 **Milestone 4**: Full mutation support with undo/redo, forking, and transactions.
 
