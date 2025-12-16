@@ -1,5 +1,5 @@
-# Compiled binaries
-garland-repl
+# Compiled binaries (in root directory only)
+/garland-repl
 *.exe
 *.exe~
 *.dll

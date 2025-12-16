@@ -116,11 +116,17 @@ func (r *REPL) handleCommand(input string) bool {
 	case "tx", "transaction":
 		r.cmdTransaction(args)
 
-	case "undo":
-		r.cmdUndo()
+	case "undoseek":
+		r.cmdUndoSeek(args)
 
-	case "fork":
-		r.cmdFork()
+	case "revisions":
+		r.cmdRevisions()
+
+	case "forks":
+		r.cmdForks()
+
+	case "forkswitch":
+		r.cmdForkSwitch(args)
 
 	case "version":
 		r.cmdVersion()
@@ -167,9 +173,14 @@ VERSION CONTROL:
   tx start <name>         Start a transaction with optional name
   tx commit               Commit the current transaction
   tx rollback             Rollback the current transaction
-  undo                    Undo to previous revision (not yet implemented)
-  fork                    Create a new fork
+  undoseek <revision>     Seek to a specific revision in current fork
+  revisions               List revisions in current fork
+  forks                   List all forks
+  forkswitch <fork>       Switch to a different fork
   version                 Show current fork and revision
+
+NOTE: Forks are created automatically when you edit from a non-HEAD revision.
+      Use 'forkswitch' to navigate between existing forks.
 
 OTHER:
   help                    Show this help message
@@ -512,12 +523,109 @@ func (r *REPL) cmdTransaction(args []string) {
 	}
 }
 
-func (r *REPL) cmdUndo() {
-	fmt.Println("Undo not yet implemented")
+func (r *REPL) cmdUndoSeek(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 1 {
+		fmt.Println("Usage: undoseek <revision>")
+		fmt.Printf("Current revision: %d\n", r.garland.CurrentRevision())
+		return
+	}
+
+	rev, err := strconv.ParseUint(args[0], 10, 64)
+	if err != nil {
+		fmt.Printf("Invalid revision number: %v\n", err)
+		return
+	}
+
+	// UndoSeek is not yet implemented in the library
+	// When implemented, it would:
+	// 1. Seek to the specified revision in the current fork
+	// 2. If you then edit, a new fork is automatically created
+	fmt.Printf("UndoSeek to revision %d not yet implemented in library\n", rev)
+	fmt.Println("When implemented: seeking to a non-HEAD revision and editing")
+	fmt.Println("will automatically create a new fork from that point.")
 }
 
-func (r *REPL) cmdFork() {
-	fmt.Println("Fork creation not yet implemented")
+func (r *REPL) cmdRevisions() {
+	if !r.ensureGarland() {
+		return
+	}
+
+	g := r.garland
+	currentRev := g.CurrentRevision()
+	currentFork := g.CurrentFork()
+
+	fmt.Printf("Fork %d - Revisions:\n", currentFork)
+
+	// Get revision range (0 to current)
+	revisions, err := g.GetRevisionRange(0, currentRev)
+	if err != nil {
+		fmt.Printf("Error getting revisions: %v\n", err)
+		return
+	}
+
+	if len(revisions) == 0 {
+		fmt.Println("  (no named revisions yet)")
+		fmt.Printf("  Current: revision %d\n", currentRev)
+		return
+	}
+
+	for _, info := range revisions {
+		marker := "  "
+		if info.Revision == currentRev {
+			marker = "> "
+		}
+		changes := ""
+		if info.HasChanges {
+			changes = " [has changes]"
+		}
+		name := info.Name
+		if name == "" {
+			name = "(unnamed)"
+		}
+		fmt.Printf("%s%d: %s%s\n", marker, info.Revision, name, changes)
+	}
+}
+
+func (r *REPL) cmdForks() {
+	if !r.ensureGarland() {
+		return
+	}
+
+	// List all forks - this requires accessing the forks map
+	// which isn't currently exposed via the public API
+	// For now, show what we can
+	fmt.Println("Forks:")
+	fmt.Printf("  Current fork: %d, revision: %d\n",
+		r.garland.CurrentFork(), r.garland.CurrentRevision())
+	fmt.Println("  (Full fork listing requires ListForks API - not yet implemented)")
+}
+
+func (r *REPL) cmdForkSwitch(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 1 {
+		fmt.Println("Usage: forkswitch <fork_id>")
+		fmt.Printf("Current fork: %d\n", r.garland.CurrentFork())
+		return
+	}
+
+	forkID, err := strconv.ParseUint(args[0], 10, 64)
+	if err != nil {
+		fmt.Printf("Invalid fork ID: %v\n", err)
+		return
+	}
+
+	// ForkSwitch is not yet implemented in the library
+	// When implemented, it would switch the current view to a different fork
+	fmt.Printf("ForkSwitch to fork %d not yet implemented in library\n", forkID)
+	fmt.Println("When implemented: switches to view/edit a different fork")
+	fmt.Println("The content will reflect that fork's state at its HEAD revision")
 }
 
 func (r *REPL) cmdVersion() {
