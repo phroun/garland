@@ -581,18 +581,9 @@ func (g *Garland) UndoSeek(revision RevisionID) error {
 	}
 
 	// Get revision info to restore the correct root
-	revInfo, ok := g.revisionInfo[ForkRevision{g.currentFork, revision}]
-	if !ok {
-		// Try to find the closest revision info going back
-		for r := revision; r >= 0; r-- {
-			if info, exists := g.revisionInfo[ForkRevision{g.currentFork, r}]; exists {
-				revInfo = info
-				break
-			}
-		}
-		if revInfo == nil {
-			return ErrRevisionNotFound
-		}
+	revInfo := g.findRevisionInfo(g.currentFork, revision)
+	if revInfo == nil {
+		return ErrRevisionNotFound
 	}
 
 	// Restore the root to what it was at this revision
@@ -664,16 +655,7 @@ func (g *Garland) ForkSeek(fork ForkID) error {
 	}
 
 	// Get revision info to restore the correct root
-	revInfo, ok := g.revisionInfo[ForkRevision{fork, targetRevision}]
-	if !ok {
-		// Try to find the closest revision info going back
-		for r := targetRevision; r >= 0; r-- {
-			if info, exists := g.revisionInfo[ForkRevision{fork, r}]; exists {
-				revInfo = info
-				break
-			}
-		}
-	}
+	revInfo := g.findRevisionInfo(fork, targetRevision)
 
 	// Restore the root if we found revision info
 	if revInfo != nil && revInfo.RootID != 0 {
@@ -799,6 +781,47 @@ func (g *Garland) updateCountsFromRoot() {
 		g.totalRunes = rootSnap.runeCount
 		g.totalLines = rootSnap.lineCount
 	}
+}
+
+// findRevisionInfo finds the revision info for a given fork and revision.
+// It first looks in the specified fork, walking backwards through revisions.
+// If not found, it follows the parent fork ancestry.
+func (g *Garland) findRevisionInfo(fork ForkID, revision RevisionID) *RevisionInfo {
+	currentFork := fork
+	currentRev := revision
+
+	// Limit iterations to prevent infinite loops
+	maxIterations := 1000
+
+	for i := 0; i < maxIterations; i++ {
+		// Try exact match first
+		if info, ok := g.revisionInfo[ForkRevision{currentFork, currentRev}]; ok {
+			return info
+		}
+
+		// Walk back through revisions in this fork (handle uint64 underflow safely)
+		if currentRev > 0 {
+			currentRev--
+			continue
+		}
+
+		// Reached revision 0 in this fork with no match - check parent fork
+		forkInfo, ok := g.forks[currentFork]
+		if !ok {
+			return nil
+		}
+
+		// If this is the root fork (fork 0) or parent is itself, we're done
+		if forkInfo.ParentFork == currentFork {
+			return nil
+		}
+
+		// Move to parent fork at the point where this fork diverged
+		currentFork = forkInfo.ParentFork
+		currentRev = forkInfo.ParentRevision
+	}
+
+	return nil
 }
 
 // snapshotCursorPositions creates a snapshot of all cursor positions.
