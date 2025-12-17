@@ -109,6 +109,15 @@ func (g *Garland) findLeafByRune(pos int64) (*LeafSearchResult, error) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
+	return g.findLeafByRuneUnlocked(pos)
+}
+
+// findLeafByRuneUnlocked is the internal version that assumes caller holds a lock.
+func (g *Garland) findLeafByRuneUnlocked(pos int64) (*LeafSearchResult, error) {
+	if pos < 0 {
+		return nil, ErrInvalidPosition
+	}
+
 	if g.root == nil {
 		return nil, ErrInvalidPosition
 	}
@@ -192,6 +201,15 @@ func (g *Garland) findLeafByLine(line, runeInLine int64) (*LineSearchResult, err
 
 	g.mu.RLock()
 	defer g.mu.RUnlock()
+
+	return g.findLeafByLineUnlocked(line, runeInLine)
+}
+
+// findLeafByLineUnlocked is the internal version that assumes caller holds a lock.
+func (g *Garland) findLeafByLineUnlocked(line, runeInLine int64) (*LineSearchResult, error) {
+	if line < 0 || runeInLine < 0 {
+		return nil, ErrInvalidPosition
+	}
 
 	if g.root == nil {
 		return nil, ErrInvalidPosition

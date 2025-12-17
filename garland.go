@@ -1531,3 +1531,281 @@ func (g *Garland) findLineEnd(lineStart int64) int64 {
 func formatGarlandID(id uint64) string {
 	return "garland_" + string(rune('0'+id%10))
 }
+
+// Decorate adds, updates, or removes decorations at absolute positions.
+// All changes are applied as a single revision.
+// Pass nil Address in a DecorationEntry to delete that decoration.
+func (g *Garland) Decorate(entries []DecorationEntry) (ChangeResult, error) {
+	if len(entries) == 0 {
+		return ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}, nil
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// Separate deletions from additions/updates
+	var deletions []string
+	var additions []struct {
+		key     string
+		bytePos int64
+	}
+
+	for _, entry := range entries {
+		if entry.Address == nil {
+			// Deletion
+			deletions = append(deletions, entry.Key)
+		} else {
+			// Addition/update - convert address to byte position
+			bytePos, err := g.addressToByteUnlocked(entry.Address)
+			if err != nil {
+				return ChangeResult{}, err
+			}
+			additions = append(additions, struct {
+				key     string
+				bytePos int64
+			}{entry.Key, bytePos})
+		}
+	}
+
+	// Track whether any changes were made
+	changed := false
+
+	// Process deletions first: find and remove decorations by key
+	if len(deletions) > 0 {
+		keySet := make(map[string]bool)
+		for _, key := range deletions {
+			keySet[key] = true
+		}
+
+		// Walk all leaves and remove matching decorations
+		newRootID, didChange, err := g.removeDecorationsInternal(g.root, g.root.snapshotAt(g.currentFork, g.currentRevision), 0, keySet)
+		if err != nil {
+			return ChangeResult{}, err
+		}
+		if didChange {
+			g.root = g.nodeRegistry[newRootID]
+			changed = true
+		}
+	}
+
+	// Process additions/updates: group by leaf node for efficiency
+	if len(additions) > 0 {
+		// Group additions by their target leaf position
+		for _, add := range additions {
+			newRootID, err := g.addDecorationInternal(add.key, add.bytePos)
+			if err != nil {
+				return ChangeResult{}, err
+			}
+			g.root = g.nodeRegistry[newRootID]
+			changed = true
+		}
+	}
+
+	// Record the mutation only once for all changes
+	if changed {
+		return g.recordMutation(), nil
+	}
+
+	return ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}, nil
+}
+
+// addressToByteUnlocked converts an AbsoluteAddress to a byte position.
+// Caller must hold the lock.
+func (g *Garland) addressToByteUnlocked(addr *AbsoluteAddress) (int64, error) {
+	switch addr.Mode {
+	case ByteMode:
+		if addr.Byte < 0 || addr.Byte > g.totalBytes {
+			return 0, ErrInvalidPosition
+		}
+		return addr.Byte, nil
+
+	case RuneMode:
+		if addr.Rune < 0 || addr.Rune > g.totalRunes {
+			return 0, ErrInvalidPosition
+		}
+		return g.runeToByteUnlocked(addr.Rune)
+
+	case LineRuneMode:
+		if addr.Line < 0 || addr.Line > g.totalLines {
+			return 0, ErrInvalidPosition
+		}
+		return g.lineRuneToByteUnlocked(addr.Line, addr.LineRune)
+
+	default:
+		return 0, ErrInvalidPosition
+	}
+}
+
+// runeToByteUnlocked converts a rune position to a byte position.
+// Caller must hold the lock.
+func (g *Garland) runeToByteUnlocked(runePos int64) (int64, error) {
+	if runePos == 0 {
+		return 0, nil
+	}
+
+	result, err := g.findLeafByRuneUnlocked(runePos)
+	if err != nil {
+		return 0, err
+	}
+
+	// Absolute byte position = leaf's byte start + byte offset within leaf
+	return result.LeafByteStart + result.ByteOffset, nil
+}
+
+// lineRuneToByteUnlocked converts a line:rune position to a byte position.
+// Caller must hold the lock.
+func (g *Garland) lineRuneToByteUnlocked(line, runeInLine int64) (int64, error) {
+	result, err := g.findLeafByLineUnlocked(line, runeInLine)
+	if err != nil {
+		return 0, err
+	}
+
+	return result.LeafResult.LeafByteStart + result.LeafResult.ByteOffset, nil
+}
+
+// removeDecorationsInternal recursively walks the tree and removes decorations matching the given keys.
+// Returns the new node ID and whether any changes were made.
+func (g *Garland) removeDecorationsInternal(node *Node, snap *NodeSnapshot, offset int64, keys map[string]bool) (NodeID, bool, error) {
+	if snap == nil {
+		return node.id, false, nil
+	}
+
+	if snap.isLeaf {
+		// Check if this leaf has any decorations to remove
+		var newDecs []Decoration
+		changed := false
+		for _, d := range snap.decorations {
+			if keys[d.Key] {
+				changed = true
+				// Skip this decoration (delete it)
+			} else {
+				newDecs = append(newDecs, d)
+			}
+		}
+
+		if !changed {
+			return node.id, false, nil
+		}
+
+		// Create new leaf with filtered decorations
+		g.nextNodeID++
+		newNode := newNode(g.nextNodeID, g)
+		g.nodeRegistry[newNode.id] = newNode
+		newSnap := createLeafSnapshot(snap.data, newDecs, snap.originalFileOffset)
+		newNode.setSnapshot(g.currentFork, g.currentRevision, newSnap)
+		return newNode.id, true, nil
+	}
+
+	// Internal node - recurse
+	leftNode := g.nodeRegistry[snap.leftID]
+	leftSnap := leftNode.snapshotAt(g.currentFork, g.currentRevision)
+	rightNode := g.nodeRegistry[snap.rightID]
+	rightSnap := rightNode.snapshotAt(g.currentFork, g.currentRevision)
+
+	newLeftID, leftChanged, err := g.removeDecorationsInternal(leftNode, leftSnap, offset, keys)
+	if err != nil {
+		return 0, false, err
+	}
+
+	newRightID, rightChanged, err := g.removeDecorationsInternal(rightNode, rightSnap, offset+leftSnap.byteCount, keys)
+	if err != nil {
+		return 0, false, err
+	}
+
+	if !leftChanged && !rightChanged {
+		return node.id, false, nil
+	}
+
+	// Rebuild internal node with new children
+	newID, err := g.concatenate(newLeftID, newRightID)
+	if err != nil {
+		return 0, false, err
+	}
+	return newID, true, nil
+}
+
+// addDecorationInternal adds a decoration at the given byte position.
+// Returns the new root node ID.
+func (g *Garland) addDecorationInternal(key string, bytePos int64) (NodeID, error) {
+	// Find the leaf containing this position
+	leafResult, err := g.findLeafByByteUnlocked(bytePos)
+	if err != nil {
+		return 0, err
+	}
+
+	// Create new decoration with position relative to the leaf
+	newDec := Decoration{
+		Key:      key,
+		Position: leafResult.ByteOffset,
+	}
+
+	// Build new decorations list - update existing or add new
+	snap := leafResult.Snapshot
+	var newDecs []Decoration
+	found := false
+	for _, d := range snap.decorations {
+		if d.Key == key {
+			// Update existing decoration
+			newDecs = append(newDecs, newDec)
+			found = true
+		} else {
+			newDecs = append(newDecs, d)
+		}
+	}
+	if !found {
+		newDecs = append(newDecs, newDec)
+	}
+
+	// Create new leaf with updated decorations
+	g.nextNodeID++
+	newLeaf := newNode(g.nextNodeID, g)
+	g.nodeRegistry[newLeaf.id] = newLeaf
+	newSnap := createLeafSnapshot(snap.data, newDecs, snap.originalFileOffset)
+	newLeaf.setSnapshot(g.currentFork, g.currentRevision, newSnap)
+
+	// Rebuild the tree from this leaf up to the root
+	return g.rebuildFromLeaf(leafResult, newLeaf.id)
+}
+
+// rebuildFromLeaf rebuilds the tree after a leaf has been replaced.
+// Takes the original leaf search result and the new leaf's ID.
+func (g *Garland) rebuildFromLeaf(leafResult *LeafSearchResult, newLeafID NodeID) (NodeID, error) {
+	// Walk up from the leaf to the root, rebuilding internal nodes
+	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
+	if rootSnap == nil {
+		return 0, ErrInvalidPosition
+	}
+
+	return g.rebuildFromLeafInternal(g.root, rootSnap, leafResult.LeafByteStart, 0, newLeafID)
+}
+
+// rebuildFromLeafInternal recursively rebuilds the tree path to a replaced leaf.
+func (g *Garland) rebuildFromLeafInternal(node *Node, snap *NodeSnapshot, targetByteStart, offset int64, newLeafID NodeID) (NodeID, error) {
+	if snap.isLeaf {
+		// This is the target leaf - return the replacement
+		return newLeafID, nil
+	}
+
+	leftNode := g.nodeRegistry[snap.leftID]
+	leftSnap := leftNode.snapshotAt(g.currentFork, g.currentRevision)
+	leftEnd := offset + leftSnap.byteCount
+
+	if targetByteStart < leftEnd {
+		// Target is in left subtree
+		newLeftID, err := g.rebuildFromLeafInternal(leftNode, leftSnap, targetByteStart, offset, newLeafID)
+		if err != nil {
+			return 0, err
+		}
+		return g.concatenate(newLeftID, snap.rightID)
+	}
+
+	// Target is in right subtree
+	rightNode := g.nodeRegistry[snap.rightID]
+	rightSnap := rightNode.snapshotAt(g.currentFork, g.currentRevision)
+
+	newRightID, err := g.rebuildFromLeafInternal(rightNode, rightSnap, targetByteStart, leftEnd, newLeafID)
+	if err != nil {
+		return 0, err
+	}
+	return g.concatenate(snap.leftID, newRightID)
+}

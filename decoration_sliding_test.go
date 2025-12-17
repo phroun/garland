@@ -824,3 +824,279 @@ func TestDecorationPreservationAcrossMultipleUndoSeeks(t *testing.T) {
 		t.Logf("Rev %d: %q", rev, readContent())
 	}
 }
+
+// TestDecorateFunction tests the Decorate(entries []DecorationEntry) API
+// which applies decorations using absolute positions.
+func TestDecorateFunction(t *testing.T) {
+	lib, err := Init(LibraryOptions{})
+	if err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	t.Run("single decoration with ByteMode", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "Hello World"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		initialRev := g.CurrentRevision()
+
+		// Add a decoration at byte position 5
+		addr := ByteAddress(5)
+		result, err := g.Decorate([]DecorationEntry{
+			{Key: "marker", Address: &addr},
+		})
+		if err != nil {
+			t.Fatalf("Decorate failed: %v", err)
+		}
+
+		// Should have created a new revision
+		if result.Revision <= initialRev {
+			t.Errorf("Expected new revision, got %d (initial was %d)", result.Revision, initialRev)
+		}
+		t.Logf("Added decoration, revision: %d -> %d", initialRev, result.Revision)
+	})
+
+	t.Run("multiple decorations creates single revision", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "ABCDEFGHIJ"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		initialRev := g.CurrentRevision()
+
+		// Add multiple decorations in a single call
+		addr1 := ByteAddress(2)
+		addr2 := ByteAddress(5)
+		addr3 := ByteAddress(8)
+		result, err := g.Decorate([]DecorationEntry{
+			{Key: "mark_C", Address: &addr1},
+			{Key: "mark_F", Address: &addr2},
+			{Key: "mark_I", Address: &addr3},
+		})
+		if err != nil {
+			t.Fatalf("Decorate failed: %v", err)
+		}
+
+		// Should have created exactly ONE new revision
+		expectedRev := initialRev + 1
+		if result.Revision != expectedRev {
+			t.Errorf("Expected revision %d, got %d (should be single increment)", expectedRev, result.Revision)
+		}
+		t.Logf("Added 3 decorations, revision: %d -> %d (single revision)", initialRev, result.Revision)
+	})
+
+	t.Run("delete decoration with nil Address", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "Hello World"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		// First add some decorations
+		addr1 := ByteAddress(0)
+		addr2 := ByteAddress(6)
+		_, err = g.Decorate([]DecorationEntry{
+			{Key: "start", Address: &addr1},
+			{Key: "world", Address: &addr2},
+		})
+		if err != nil {
+			t.Fatalf("Add decorations failed: %v", err)
+		}
+		revAfterAdd := g.CurrentRevision()
+		t.Logf("Added 2 decorations at rev %d", revAfterAdd)
+
+		// Now delete one of them by passing nil Address
+		result, err := g.Decorate([]DecorationEntry{
+			{Key: "start", Address: nil}, // delete "start"
+		})
+		if err != nil {
+			t.Fatalf("Delete decoration failed: %v", err)
+		}
+
+		if result.Revision <= revAfterAdd {
+			t.Errorf("Expected new revision after delete")
+		}
+		t.Logf("Deleted 'start' decoration, revision: %d -> %d", revAfterAdd, result.Revision)
+	})
+
+	t.Run("mixed add and delete in single call", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "ABCDEFGHIJ"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		// First add a decoration to delete later
+		addr := ByteAddress(0)
+		_, err = g.Decorate([]DecorationEntry{
+			{Key: "to_delete", Address: &addr},
+		})
+		if err != nil {
+			t.Fatalf("Initial add failed: %v", err)
+		}
+		initialRev := g.CurrentRevision()
+
+		// Now add new decorations AND delete the old one in a single call
+		addr1 := ByteAddress(3)
+		addr2 := ByteAddress(7)
+		result, err := g.Decorate([]DecorationEntry{
+			{Key: "to_delete", Address: nil},  // delete
+			{Key: "new_D", Address: &addr1},   // add at position 3
+			{Key: "new_H", Address: &addr2},   // add at position 7
+		})
+		if err != nil {
+			t.Fatalf("Mixed operations failed: %v", err)
+		}
+
+		// Should be single revision increment
+		expectedRev := initialRev + 1
+		if result.Revision != expectedRev {
+			t.Errorf("Expected revision %d, got %d", expectedRev, result.Revision)
+		}
+		t.Logf("Mixed add/delete, revision: %d -> %d (single revision)", initialRev, result.Revision)
+	})
+
+	t.Run("decorations on same node create single revision", func(t *testing.T) {
+		// Small content that likely stays in a single node
+		g, err := lib.Open(FileOptions{DataString: "ABC"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		initialRev := g.CurrentRevision()
+
+		// Add multiple decorations to positions in the same leaf node
+		addr0 := ByteAddress(0)
+		addr1 := ByteAddress(1)
+		addr2 := ByteAddress(2)
+		result, err := g.Decorate([]DecorationEntry{
+			{Key: "A", Address: &addr0},
+			{Key: "B", Address: &addr1},
+			{Key: "C", Address: &addr2},
+		})
+		if err != nil {
+			t.Fatalf("Decorate failed: %v", err)
+		}
+
+		// All decorations should result in exactly ONE revision
+		expectedRev := initialRev + 1
+		if result.Revision != expectedRev {
+			t.Errorf("Expected single revision %d, got %d", expectedRev, result.Revision)
+		}
+		t.Logf("3 decorations on same node: revision %d -> %d (single revision)", initialRev, result.Revision)
+	})
+
+	t.Run("RuneMode addressing", func(t *testing.T) {
+		// Content with multi-byte characters: "Hello 世界"
+		g, err := lib.Open(FileOptions{DataString: "Hello 世界"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		// Add decoration at rune position 6 (first Chinese character 世)
+		addr := RuneAddress(6)
+		result, err := g.Decorate([]DecorationEntry{
+			{Key: "chinese_start", Address: &addr},
+		})
+		if err != nil {
+			t.Fatalf("Decorate with RuneMode failed: %v", err)
+		}
+
+		t.Logf("Added decoration at rune 6 (世), revision: %d", result.Revision)
+	})
+
+	t.Run("LineRuneMode addressing", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "Line1\nLine2\nLine3"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		// Add decoration at line 1 (0-indexed), rune 2 (the 'n' in Line2)
+		addr := LineAddress(1, 2)
+		result, err := g.Decorate([]DecorationEntry{
+			{Key: "line2_n", Address: &addr},
+		})
+		if err != nil {
+			t.Fatalf("Decorate with LineRuneMode failed: %v", err)
+		}
+
+		t.Logf("Added decoration at line 1, rune 2, revision: %d", result.Revision)
+	})
+
+	t.Run("update existing decoration", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "ABCDEFGHIJ"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		// Add decoration at position 2
+		addr1 := ByteAddress(2)
+		_, err = g.Decorate([]DecorationEntry{
+			{Key: "movable", Address: &addr1},
+		})
+		if err != nil {
+			t.Fatalf("Initial add failed: %v", err)
+		}
+		revAfterAdd := g.CurrentRevision()
+
+		// Update the same decoration to a new position
+		addr2 := ByteAddress(7)
+		result, err := g.Decorate([]DecorationEntry{
+			{Key: "movable", Address: &addr2},
+		})
+		if err != nil {
+			t.Fatalf("Update failed: %v", err)
+		}
+
+		if result.Revision <= revAfterAdd {
+			t.Errorf("Expected new revision after update")
+		}
+		t.Logf("Updated decoration position 2 -> 7, revision: %d -> %d", revAfterAdd, result.Revision)
+	})
+
+	t.Run("empty entries is no-op", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "Test"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		initialRev := g.CurrentRevision()
+
+		result, err := g.Decorate([]DecorationEntry{})
+		if err != nil {
+			t.Fatalf("Empty Decorate failed: %v", err)
+		}
+
+		// Should NOT create a new revision
+		if result.Revision != initialRev {
+			t.Errorf("Expected no revision change for empty entries, got %d (was %d)", result.Revision, initialRev)
+		}
+		t.Logf("Empty entries: revision unchanged at %d", result.Revision)
+	})
+
+	t.Run("invalid position returns error", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "Short"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		// Try to add decoration past end of content
+		addr := ByteAddress(100)
+		_, err = g.Decorate([]DecorationEntry{
+			{Key: "invalid", Address: &addr},
+		})
+		if err == nil {
+			t.Error("Expected error for invalid position")
+		}
+		t.Logf("Invalid position correctly returned error: %v", err)
+	})
+}
