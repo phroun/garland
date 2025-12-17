@@ -574,6 +574,8 @@ func (g *Garland) Thaw() error {
 }
 
 // ThawRevision restores cold data for a specific revision range in the current fork.
+// WARNING: This thaws ALL data for the revision(s), which could be very large.
+// For large files, prefer ThawRange() to thaw only the bytes you need.
 func (g *Garland) ThawRevision(startRev, endRev RevisionID) error {
 	if g.lib.coldStorageBackend == nil {
 		return nil
@@ -587,6 +589,105 @@ func (g *Garland) ThawRevision(startRev, endRev RevisionID) error {
 	// revisions may reference different nodes
 	for rev := startRev; rev <= endRev; rev++ {
 		g.thawNodesForRevision(g.currentFork, rev)
+	}
+
+	return nil
+}
+
+// ThawRange restores cold data for a specific byte range at the current revision.
+// This is RAM-safe for large files - it only thaws the nodes needed to read the
+// specified byte range instead of the entire file.
+func (g *Garland) ThawRange(startByte, endByte int64) error {
+	if g.lib.coldStorageBackend == nil {
+		return nil
+	}
+
+	if startByte > endByte {
+		startByte, endByte = endByte, startByte
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	return g.thawRangeUnlocked(startByte, endByte)
+}
+
+// thawRangeUnlocked thaws nodes covering a byte range. Caller must hold write lock.
+func (g *Garland) thawRangeUnlocked(startByte, endByte int64) error {
+	if g.root == nil {
+		return nil
+	}
+
+	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
+	if rootSnap == nil {
+		return nil
+	}
+
+	// Clamp to valid range
+	if startByte < 0 {
+		startByte = 0
+	}
+	if endByte > rootSnap.byteCount {
+		endByte = rootSnap.byteCount
+	}
+
+	return g.thawNodeRangeRecursive(g.root, g.currentFork, g.currentRevision, 0, startByte, endByte)
+}
+
+// thawNodeRangeRecursive thaws only the nodes that intersect with [startByte, endByte).
+// nodeStart is the byte offset where this node's content begins in the document.
+func (g *Garland) thawNodeRangeRecursive(node *Node, fork ForkID, rev RevisionID, nodeStart, startByte, endByte int64) error {
+	if node == nil {
+		return nil
+	}
+
+	snap, forkRev := node.snapshotAtWithKey(fork, rev)
+	if snap == nil {
+		return nil
+	}
+
+	nodeEnd := nodeStart + snap.byteCount
+
+	// Check if this node's range intersects with our target range
+	if nodeEnd <= startByte || nodeStart >= endByte {
+		// No intersection - skip this subtree
+		return nil
+	}
+
+	if snap.isLeaf {
+		if snap.storageState == StorageCold {
+			return g.thawSnapshot(node.id, forkRev, snap)
+		}
+		return nil
+	}
+
+	// Internal node - check which children intersect
+	var leftBytes int64 = 0
+	if snap.leftID != 0 {
+		if leftNode := g.nodeRegistry[snap.leftID]; leftNode != nil {
+			leftSnap := leftNode.snapshotAt(fork, rev)
+			if leftSnap != nil {
+				leftBytes = leftSnap.byteCount
+			}
+		}
+	}
+
+	// Recurse into left child if it intersects
+	if snap.leftID != 0 && nodeStart+leftBytes > startByte {
+		if leftNode := g.nodeRegistry[snap.leftID]; leftNode != nil {
+			if err := g.thawNodeRangeRecursive(leftNode, fork, rev, nodeStart, startByte, endByte); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Recurse into right child if it intersects
+	if snap.rightID != 0 && nodeStart+leftBytes < endByte {
+		if rightNode := g.nodeRegistry[snap.rightID]; rightNode != nil {
+			if err := g.thawNodeRangeRecursive(rightNode, fork, rev, nodeStart+leftBytes, startByte, endByte); err != nil {
+				return err
+			}
+		}
 	}
 
 	return nil
@@ -2494,8 +2595,8 @@ func (g *Garland) readBytesAt(pos int64, length int64) ([]byte, error) {
 
 	// If data is not loaded (cold storage), try to thaw and retry
 	if err == ErrDataNotLoaded {
-		// Thaw the current revision
-		if thawErr := g.ThawRevision(g.currentRevision, g.currentRevision); thawErr != nil {
+		// Thaw only the byte range we need - RAM-safe for large files
+		if thawErr := g.ThawRange(pos, pos+readLength); thawErr != nil {
 			return nil, err // Return original error if thaw fails
 		}
 

@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/phroun/garland"
 )
@@ -126,7 +127,10 @@ func (r *REPL) handleCommand(input string) bool {
 		r.cmdTruncate()
 
 	case "delete":
-		r.cmdDelete(args)
+		r.cmdDelete(args, false)
+
+	case "delete+":
+		r.cmdDelete(args, true)
 
 	case "backdelete":
 		r.cmdBackDelete(args)
@@ -167,6 +171,30 @@ func (r *REPL) handleCommand(input string) bool {
 	case "decoration":
 		r.cmdGetDecoration(args)
 
+	case "save":
+		r.cmdSave()
+
+	case "saveas":
+		r.cmdSaveAs(args)
+
+	case "chill":
+		r.cmdChill(args)
+
+	case "thaw":
+		r.cmdThaw(args)
+
+	case "thawrange":
+		r.cmdThawRange(args)
+
+	case "convert":
+		r.cmdConvert(args)
+
+	case "divergences":
+		r.cmdDivergences(args)
+
+	case "dumpdecorations":
+		r.cmdDumpDecorations(args)
+
 	default:
 		fmt.Printf("Unknown command: %s. Type 'help' for available commands.\n", cmd)
 	}
@@ -180,68 +208,94 @@ Available Commands:
 -------------------
 
 FILE OPERATIONS:
-  new <text>              Create a new garland with the given text content
-  open <filepath>         Open a file (not yet implemented)
-  close                   Close the current garland
-  status                  Show current garland status
+  new <text>                Create a new garland with the given text content
+  open <filepath>           Open a file from disk
+  save                      Save to original file path
+  saveas <filepath>         Save to a new file path
+  close                     Close the current garland
+  status                    Show current garland status
 
 CURSOR OPERATIONS:
-  cursor                  Show current cursor position
-  cursor <name>           Switch to (or create) a named cursor
-  cursor list             List all cursors and their positions
-  seek byte <pos>         Move cursor to byte position
-  seek rune <pos>         Move cursor to rune position
-  seek line <line> <rune> Move cursor to line:rune position
-  relseek bytes <delta>   Move cursor relative (+ forward, - backward)
-  relseek runes <delta>   Move cursor relative by runes
+  cursor                    Show current cursor position
+  cursor <name>             Switch to (or create) a named cursor
+  cursor list               List all cursors and their positions
+  cursor delete <name>      Delete a cursor
+  seek byte <pos>           Move cursor to byte position
+  seek rune <pos>           Move cursor to rune position
+  seek line <line> <rune>   Move cursor to line:rune position
+  relseek bytes <delta>     Move cursor relative (+ forward, - backward)
+  relseek runes <delta>     Move cursor relative by runes
 
 READ OPERATIONS:
-  read bytes <length>     Read bytes from cursor position (advances cursor)
-  read string <length>    Read runes from cursor position (advances cursor)
-  readline                Read the entire line at cursor position
+  read bytes <length>       Read bytes from cursor position (advances cursor)
+  read string <length>      Read runes from cursor position (advances cursor)
+  readline                  Read the entire line at cursor position
 
 EDIT OPERATIONS:
-  insert <text>           Insert text at cursor position (advances cursor)
-  insert- <text>          Insert text BEFORE existing content at position
-  overwrite <len> <text>  Replace <len> bytes at cursor with <text>
-  truncate                Delete from cursor to end of file
-  delete bytes <length>   Delete bytes forward from cursor position
-  delete runes <length>   Delete runes forward from cursor position
-  backdelete bytes <len>  Delete bytes backward (like backspace)
-  backdelete runes <len>  Delete runes backward (like backspace)
+  insert "text"             Insert text at cursor position (advances cursor)
+  insert "text", key=5      Insert with decoration at byte offset 5 in content
+  insert- "text"            Insert BEFORE existing content at position
+  overwrite <len> "text"    Replace <len> bytes at cursor with <text>
+  truncate                  Delete from cursor to end of file
+  delete bytes <length>     Delete bytes forward from cursor position
+  delete runes <length>     Delete runes forward from cursor position
+  delete+ bytes <length>    Delete bytes including line-anchored decorations
+  delete+ runes <length>    Delete runes including line-anchored decorations
+  backdelete bytes <len>    Delete bytes backward (like backspace)
+  backdelete runes <len>    Delete runes backward (like backspace)
+
+String arguments use quotes to allow spaces: insert "hello world"
+Escape sequences: \n (newline), \t (tab), \" (quote), \\ (backslash)
 
 INSPECTION:
-  dump                    Dump all content
-  tree                    Show tree structure
+  dump                      Dump all content
+  tree                      Show tree structure
 
 VERSION CONTROL:
-  tx start <name>         Start a transaction with optional name
-  tx commit               Commit the current transaction
-  tx rollback             Rollback the current transaction
-  undoseek <revision>     Seek to a specific revision in current fork
-  revisions               List revisions in current fork
-  forks                   List all forks
-  forkswitch <fork>       Switch to a different fork
-  version                 Show current fork and revision
+  tx start <name>           Start a transaction with optional name
+  tx commit                 Commit the current transaction
+  tx rollback               Rollback the current transaction
+  undoseek <revision>       Seek to a specific revision in current fork
+  revisions                 List revisions in current fork
+  forks                     List all forks
+  forkswitch <fork>         Switch to a different fork
+  divergences               List fork divergence points for entire history
+  divergences <from> <to>   List fork divergences in revision range
+  version                   Show current fork and revision
 
 NOTE: Forks are created automatically when you edit from a non-HEAD revision.
       Use 'forkswitch' to navigate between existing forks.
 
 DECORATIONS:
-  decorate <key>          Add decoration at cursor position
-  decorate k=byte <pos>   Add decoration at byte position
-  decorate k=rune <pos>   Add decoration at rune position
-  decorate k=line <l>:<r> Add decoration at line:rune position
-  decorate k=nil          Remove decoration (same as undecorate)
+  decorate <key>            Add decoration at cursor position
+  decorate k=byte <pos>     Add decoration at byte position
+  decorate k=rune <pos>     Add decoration at rune position
+  decorate k=line <l>:<r>   Add decoration at line:rune position
+  decorate k=nil            Remove decoration (same as undecorate)
   decorate a=byte 5, b=line 1:0   Multiple decorations at once
-  undecorate <key>        Remove a decoration
-  decorations             List all decorations in the file
-  decorations <line>      List decorations on a specific line
-  decoration <key>        Get the position of a specific decoration
+  undecorate <key>          Remove a decoration
+  decorations               List all decorations in the file
+  decorations <line>        List decorations on a specific line
+  decoration <key>          Get the position of a specific decoration
+  dumpdecorations <path>    Export all decorations to INI file
+
+STORAGE TIERS:
+  chill inactive            Chill data from inactive forks
+  chill history             Chill old undo history (keep last 10 revisions)
+  chill unused              Chill data not used at current revision
+  chill all                 Chill all data to cold storage
+  thaw                      Thaw all data for current fork (caution: large files)
+  thaw <start> <end>        Thaw specific revision range (caution: large files)
+  thawrange <start> <end>   Thaw specific byte range (RAM-safe for large files)
+
+POSITION CONVERSION:
+  convert byte <pos>        Convert byte position to rune/line
+  convert rune <pos>        Convert rune position to byte/line
+  convert line <l> <r>      Convert line:rune position to byte/rune
 
 OTHER:
-  help                    Show this help message
-  quit, exit              Exit the REPL
+  help                      Show this help message
+  quit, exit                Exit the REPL
 `
 	fmt.Println(help)
 }
@@ -275,7 +329,30 @@ func (r *REPL) cmdNew(args []string) {
 }
 
 func (r *REPL) cmdOpen(args []string) {
-	fmt.Println("File opening not yet implemented")
+	if len(args) < 1 {
+		fmt.Println("Usage: open <filepath>")
+		return
+	}
+
+	path := strings.Join(args, " ")
+
+	if r.garland != nil {
+		r.garland.Close()
+	}
+
+	g, err := r.lib.Open(garland.FileOptions{
+		FilePath: path,
+	})
+	if err != nil {
+		fmt.Printf("Error opening file: %v\n", err)
+		return
+	}
+
+	r.garland = g
+	r.cursors = make(map[string]*garland.Cursor)
+	r.cursors["default"] = g.NewCursor()
+	r.currentCursor = "default"
+	fmt.Printf("Opened %s (%d bytes)\n", path, g.ByteCount().Value)
 }
 
 func (r *REPL) cmdClose() {
@@ -322,7 +399,7 @@ func (r *REPL) cmdCursor(args []string) {
 		return
 	}
 
-	// Handle subcommands: cursor, cursor <name>, cursor list
+	// Handle subcommands: cursor, cursor <name>, cursor list, cursor delete <name>
 	if len(args) >= 1 {
 		subcmd := strings.ToLower(args[0])
 
@@ -337,6 +414,30 @@ func (r *REPL) cmdCursor(args []string) {
 				fmt.Printf("%s%s: byte=%d, rune=%d, line=%d:%d\n",
 					marker, name, c.BytePos(), c.RunePos(), line, lineRune)
 			}
+			return
+		}
+
+		if subcmd == "delete" {
+			if len(args) < 2 {
+				fmt.Println("Usage: cursor delete <name>")
+				return
+			}
+			name := args[1]
+			if name == "default" {
+				fmt.Println("Cannot delete the default cursor")
+				return
+			}
+			c, exists := r.cursors[name]
+			if !exists {
+				fmt.Printf("Cursor '%s' not found\n", name)
+				return
+			}
+			r.garland.RemoveCursor(c)
+			delete(r.cursors, name)
+			if r.currentCursor == name {
+				r.currentCursor = "default"
+			}
+			fmt.Printf("Deleted cursor '%s'\n", name)
 			return
 		}
 
@@ -509,19 +610,40 @@ func (r *REPL) cmdInsert(args []string, insertBefore bool) {
 		return
 	}
 
-	text := strings.Join(args, " ")
-	if text == "" {
-		fmt.Println("Usage: insert <text>")
-		fmt.Println("       insert- <text>  (insert before existing content at position)")
+	fullInput := strings.Join(args, " ")
+	if fullInput == "" {
+		fmt.Println("Usage: insert \"text\"")
+		fmt.Println("       insert \"text\", key=5, key2=10  (with decorations at byte offsets)")
+		fmt.Println("       insert- \"text\"  (insert before existing content)")
 		return
 	}
 
-	// Handle escape sequences
-	text = strings.ReplaceAll(text, "\\n", "\n")
-	text = strings.ReplaceAll(text, "\\t", "\t")
+	// Parse quoted string and optional decorations
+	text, remainder, err := r.parseQuotedString(fullInput)
+	if err != nil {
+		fmt.Printf("Parse error: %v\n", err)
+		return
+	}
+
+	// Parse optional decorations after the string
+	var decorations []garland.RelativeDecoration
+	if remainder != "" {
+		// Remainder should start with a comma (or just have decorations)
+		remainder = strings.TrimSpace(remainder)
+		if strings.HasPrefix(remainder, ",") {
+			remainder = strings.TrimSpace(remainder[1:])
+		}
+		if remainder != "" {
+			decorations, err = r.parseRelativeDecorations(remainder)
+			if err != nil {
+				fmt.Printf("Decoration parse error: %v\n", err)
+				return
+			}
+		}
+	}
 
 	cursor := r.cursor()
-	result, err := cursor.InsertString(text, nil, insertBefore)
+	result, err := cursor.InsertString(text, decorations, insertBefore)
 	if err != nil {
 		fmt.Printf("Insert error: %v\n", err)
 		return
@@ -530,8 +652,90 @@ func (r *REPL) cmdInsert(args []string, insertBefore bool) {
 	if insertBefore {
 		beforeStr = " (before)"
 	}
-	fmt.Printf("Inserted %d bytes%s. Now at fork=%d, revision=%d\n",
-		len(text), beforeStr, result.Fork, result.Revision)
+	decStr := ""
+	if len(decorations) > 0 {
+		decStr = fmt.Sprintf(" with %d decoration(s)", len(decorations))
+	}
+	fmt.Printf("Inserted %d bytes%s%s. Now at fork=%d, revision=%d\n",
+		len(text), beforeStr, decStr, result.Fork, result.Revision)
+}
+
+// parseQuotedString extracts a quoted string and returns the content and remainder
+func (r *REPL) parseQuotedString(input string) (string, string, error) {
+	input = strings.TrimSpace(input)
+	if len(input) == 0 {
+		return "", "", fmt.Errorf("empty input")
+	}
+
+	if input[0] != '"' {
+		return "", "", fmt.Errorf("expected quoted string (starting with \")")
+	}
+
+	// Parse the quoted string, handling escapes
+	var result []byte
+	i := 1
+	for i < len(input) {
+		if input[i] == '\\' && i+1 < len(input) {
+			// Handle escape sequences
+			switch input[i+1] {
+			case 'n':
+				result = append(result, '\n')
+			case 't':
+				result = append(result, '\t')
+			case '"':
+				result = append(result, '"')
+			case '\\':
+				result = append(result, '\\')
+			default:
+				// Unknown escape, keep as-is
+				result = append(result, input[i], input[i+1])
+			}
+			i += 2
+		} else if input[i] == '"' {
+			// End of string
+			remainder := strings.TrimSpace(input[i+1:])
+			return string(result), remainder, nil
+		} else {
+			result = append(result, input[i])
+			i++
+		}
+	}
+
+	return "", "", fmt.Errorf("unterminated string (missing closing \")")
+}
+
+// parseRelativeDecorations parses decoration specs relative to inserted content
+// Format: key=5, key2=10  (byte offsets within the inserted content)
+func (r *REPL) parseRelativeDecorations(input string) ([]garland.RelativeDecoration, error) {
+	parts := strings.Split(input, ",")
+	var decorations []garland.RelativeDecoration
+
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		idx := strings.Index(part, "=")
+		if idx <= 0 {
+			return nil, fmt.Errorf("invalid decoration spec: %q (expected key=position)", part)
+		}
+
+		key := strings.TrimSpace(part[:idx])
+		posStr := strings.TrimSpace(part[idx+1:])
+
+		pos, err := strconv.ParseInt(posStr, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid position for %q: %v", key, err)
+		}
+
+		decorations = append(decorations, garland.RelativeDecoration{
+			Key:      key,
+			Position: pos,
+		})
+	}
+
+	return decorations, nil
 }
 
 func (r *REPL) cmdOverwrite(args []string) {
@@ -540,7 +744,7 @@ func (r *REPL) cmdOverwrite(args []string) {
 	}
 
 	if len(args) < 2 {
-		fmt.Println("Usage: overwrite <length> <text>")
+		fmt.Println("Usage: overwrite <length> \"text\"")
 		fmt.Println("  Replaces <length> bytes at cursor with <text>")
 		return
 	}
@@ -551,10 +755,13 @@ func (r *REPL) cmdOverwrite(args []string) {
 		return
 	}
 
-	text := strings.Join(args[1:], " ")
-	// Handle escape sequences
-	text = strings.ReplaceAll(text, "\\n", "\n")
-	text = strings.ReplaceAll(text, "\\t", "\t")
+	// Join remaining args and parse quoted string
+	fullInput := strings.Join(args[1:], " ")
+	text, _, err := r.parseQuotedString(fullInput)
+	if err != nil {
+		fmt.Printf("Parse error: %v\n", err)
+		return
+	}
 
 	cursor := r.cursor()
 	_, result, err := cursor.OverwriteBytes(length, []byte(text))
@@ -582,13 +789,14 @@ func (r *REPL) cmdTruncate() {
 	fmt.Printf("File is now %d bytes\n", r.garland.ByteCount().Value)
 }
 
-func (r *REPL) cmdDelete(args []string) {
+func (r *REPL) cmdDelete(args []string, includeLineDecorations bool) {
 	if !r.ensureGarland() {
 		return
 	}
 
 	if len(args) < 2 {
 		fmt.Println("Usage: delete bytes|runes <length>")
+		fmt.Println("       delete+ bytes|runes <length>  (includes line-anchored decorations)")
 		return
 	}
 
@@ -600,24 +808,29 @@ func (r *REPL) cmdDelete(args []string) {
 		return
 	}
 
+	flagStr := ""
+	if includeLineDecorations {
+		flagStr = " (including line decorations)"
+	}
+
 	switch mode {
 	case "bytes":
-		_, result, err := cursor.DeleteBytes(length, false)
+		_, result, err := cursor.DeleteBytes(length, includeLineDecorations)
 		if err != nil {
 			fmt.Printf("Delete error: %v\n", err)
 			return
 		}
-		fmt.Printf("Deleted %d bytes. Now at fork=%d, revision=%d\n",
-			length, result.Fork, result.Revision)
+		fmt.Printf("Deleted %d bytes%s. Now at fork=%d, revision=%d\n",
+			length, flagStr, result.Fork, result.Revision)
 
 	case "runes":
-		_, result, err := cursor.DeleteRunes(length, false)
+		_, result, err := cursor.DeleteRunes(length, includeLineDecorations)
 		if err != nil {
 			fmt.Printf("Delete error: %v\n", err)
 			return
 		}
-		fmt.Printf("Deleted %d runes. Now at fork=%d, revision=%d\n",
-			length, result.Fork, result.Revision)
+		fmt.Printf("Deleted %d runes%s. Now at fork=%d, revision=%d\n",
+			length, flagStr, result.Fork, result.Revision)
 
 	default:
 		fmt.Println("Unknown delete mode. Use: bytes or runes")
@@ -1192,3 +1405,326 @@ func (r *REPL) cmdGetDecoration(args []string) {
 		fmt.Printf("  Line: %d:%d\n", addr.Line, addr.LineRune)
 	}
 }
+
+func (r *REPL) cmdSave() {
+	if !r.ensureGarland() {
+		return
+	}
+
+	err := r.garland.Save()
+	if err != nil {
+		fmt.Printf("Save error: %v\n", err)
+		return
+	}
+
+	fmt.Println("File saved")
+}
+
+func (r *REPL) cmdSaveAs(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 1 {
+		fmt.Println("Usage: saveas <filepath>")
+		return
+	}
+
+	path := strings.Join(args, " ")
+	err := r.garland.SaveAs(nil, path)
+	if err != nil {
+		fmt.Printf("SaveAs error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("File saved to %s\n", path)
+}
+
+func (r *REPL) cmdChill(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 1 {
+		fmt.Println("Usage: chill inactive|history|unused|all")
+		fmt.Println("  inactive  - Chill data from inactive forks")
+		fmt.Println("  history   - Chill old undo history (keep last 10 revisions)")
+		fmt.Println("  unused    - Chill data not used at current revision")
+		fmt.Println("  all       - Chill all data to cold storage")
+		return
+	}
+
+	var level garland.ChillLevel
+	levelName := strings.ToLower(args[0])
+	switch levelName {
+	case "inactive":
+		level = garland.ChillInactiveForks
+	case "history":
+		level = garland.ChillOldHistory
+	case "unused":
+		level = garland.ChillUnusedData
+	case "all":
+		level = garland.ChillEverything
+	default:
+		fmt.Printf("Unknown chill level: %s\n", levelName)
+		fmt.Println("Use: inactive, history, unused, or all")
+		return
+	}
+
+	err := r.garland.Chill(level)
+	if err != nil {
+		fmt.Printf("Chill error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Chilled data with level: %s\n", levelName)
+}
+
+func (r *REPL) cmdThaw(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) == 0 {
+		// Thaw all for current fork
+		err := r.garland.Thaw()
+		if err != nil {
+			fmt.Printf("Thaw error: %v\n", err)
+			return
+		}
+		fmt.Println("Thawed all data for current fork")
+		return
+	}
+
+	if len(args) >= 2 {
+		// Thaw specific revision range
+		startRev, err := strconv.ParseUint(args[0], 10, 64)
+		if err != nil {
+			fmt.Printf("Invalid start revision: %v\n", err)
+			return
+		}
+		endRev, err := strconv.ParseUint(args[1], 10, 64)
+		if err != nil {
+			fmt.Printf("Invalid end revision: %v\n", err)
+			return
+		}
+
+		err = r.garland.ThawRevision(garland.RevisionID(startRev), garland.RevisionID(endRev))
+		if err != nil {
+			fmt.Printf("ThawRevision error: %v\n", err)
+			return
+		}
+		fmt.Printf("Thawed revisions %d to %d\n", startRev, endRev)
+		return
+	}
+
+	fmt.Println("Usage: thaw              - Thaw all data for current fork")
+	fmt.Println("       thaw <start> <end> - Thaw specific revision range")
+}
+
+func (r *REPL) cmdThawRange(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 2 {
+		fmt.Println("Usage: thawrange <start_byte> <end_byte>")
+		fmt.Println("  Thaws only the nodes covering the specified byte range")
+		fmt.Println("  This is RAM-safe for large files")
+		return
+	}
+
+	startByte, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil {
+		fmt.Printf("Invalid start byte: %v\n", err)
+		return
+	}
+	endByte, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil {
+		fmt.Printf("Invalid end byte: %v\n", err)
+		return
+	}
+
+	err = r.garland.ThawRange(startByte, endByte)
+	if err != nil {
+		fmt.Printf("ThawRange error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Thawed byte range %d to %d\n", startByte, endByte)
+}
+
+func (r *REPL) cmdConvert(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 2 {
+		fmt.Println("Usage: convert byte <pos>         - Convert byte to rune/line")
+		fmt.Println("       convert rune <pos>         - Convert rune to byte/line")
+		fmt.Println("       convert line <line> <rune> - Convert line:rune to byte/rune")
+		return
+	}
+
+	mode := strings.ToLower(args[0])
+
+	switch mode {
+	case "byte":
+		pos, err := strconv.ParseInt(args[1], 10, 64)
+		if err != nil {
+			fmt.Printf("Invalid byte position: %v\n", err)
+			return
+		}
+
+		runePos, err := r.garland.ByteToRune(pos)
+		if err != nil {
+			fmt.Printf("Error converting: %v\n", err)
+			return
+		}
+
+		line, lineRune, err := r.garland.ByteToLineRune(pos)
+		if err != nil {
+			fmt.Printf("Error converting: %v\n", err)
+			return
+		}
+
+		fmt.Printf("Byte %d =\n", pos)
+		fmt.Printf("  Rune: %d\n", runePos)
+		fmt.Printf("  Line: %d:%d\n", line, lineRune)
+
+	case "rune":
+		pos, err := strconv.ParseInt(args[1], 10, 64)
+		if err != nil {
+			fmt.Printf("Invalid rune position: %v\n", err)
+			return
+		}
+
+		bytePos, err := r.garland.RuneToByte(pos)
+		if err != nil {
+			fmt.Printf("Error converting: %v\n", err)
+			return
+		}
+
+		line, lineRune, err := r.garland.ByteToLineRune(bytePos)
+		if err != nil {
+			fmt.Printf("Error converting: %v\n", err)
+			return
+		}
+
+		fmt.Printf("Rune %d =\n", pos)
+		fmt.Printf("  Byte: %d\n", bytePos)
+		fmt.Printf("  Line: %d:%d\n", line, lineRune)
+
+	case "line":
+		if len(args) < 3 {
+			fmt.Println("Usage: convert line <line> <rune>")
+			return
+		}
+		line, err := strconv.ParseInt(args[1], 10, 64)
+		if err != nil {
+			fmt.Printf("Invalid line number: %v\n", err)
+			return
+		}
+		runeInLine, err := strconv.ParseInt(args[2], 10, 64)
+		if err != nil {
+			fmt.Printf("Invalid rune position: %v\n", err)
+			return
+		}
+
+		bytePos, err := r.garland.LineRuneToByte(line, runeInLine)
+		if err != nil {
+			fmt.Printf("Error converting: %v\n", err)
+			return
+		}
+
+		runePos, err := r.garland.ByteToRune(bytePos)
+		if err != nil {
+			fmt.Printf("Error converting: %v\n", err)
+			return
+		}
+
+		fmt.Printf("Line %d:%d =\n", line, runeInLine)
+		fmt.Printf("  Byte: %d\n", bytePos)
+		fmt.Printf("  Rune: %d\n", runePos)
+
+	default:
+		fmt.Println("Unknown mode. Use: byte, rune, or line")
+	}
+}
+
+func (r *REPL) cmdDivergences(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	g := r.garland
+	forkInfo, err := g.GetForkInfo(g.CurrentFork())
+	if err != nil {
+		fmt.Printf("Error getting fork info: %v\n", err)
+		return
+	}
+
+	// Default to full revision range
+	startRev := garland.RevisionID(0)
+	endRev := forkInfo.HighestRevision
+
+	// Parse optional revision range
+	if len(args) >= 2 {
+		start, err := strconv.ParseUint(args[0], 10, 64)
+		if err != nil {
+			fmt.Printf("Invalid start revision: %v\n", err)
+			return
+		}
+		end, err := strconv.ParseUint(args[1], 10, 64)
+		if err != nil {
+			fmt.Printf("Invalid end revision: %v\n", err)
+			return
+		}
+		startRev = garland.RevisionID(start)
+		endRev = garland.RevisionID(end)
+	}
+
+	divergences, err := g.FindForksBetween(startRev, endRev)
+	if err != nil {
+		fmt.Printf("Error finding divergences: %v\n", err)
+		return
+	}
+
+	if len(divergences) == 0 {
+		fmt.Printf("No fork divergences in revisions %d to %d\n", startRev, endRev)
+		return
+	}
+
+	fmt.Printf("Fork divergences in revisions %d to %d:\n", startRev, endRev)
+	for _, d := range divergences {
+		dirStr := "branched into"
+		if d.Direction == garland.BranchedFrom {
+			dirStr = "branched from"
+		}
+		fmt.Printf("  Revision %d: %s fork %d\n", d.DivergenceRev, dirStr, d.Fork)
+	}
+}
+
+func (r *REPL) cmdDumpDecorations(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 1 {
+		fmt.Println("Usage: dumpdecorations <filepath>")
+		fmt.Println("  Exports all decorations to an INI file")
+		return
+	}
+
+	path := strings.Join(args, " ")
+	err := r.garland.DumpDecorations(nil, path)
+	if err != nil {
+		fmt.Printf("DumpDecorations error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Decorations exported to %s\n", path)
+}
+
+// Ensure utf8 is used (for future unicode-aware operations)
+var _ = utf8.RuneCountInString
