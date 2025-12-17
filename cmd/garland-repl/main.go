@@ -109,6 +109,15 @@ func (r *REPL) handleCommand(input string) bool {
 	case "relseek":
 		r.cmdRelSeek(args)
 
+	case "word":
+		r.cmdWord(args)
+
+	case "linestart":
+		r.cmdLineStart()
+
+	case "lineend":
+		r.cmdLineEnd()
+
 	case "read":
 		r.cmdRead(args)
 
@@ -661,6 +670,69 @@ func (r *REPL) cmdRelSeek(args []string) {
 
 	if err != nil {
 		fmt.Printf("RelSeek error: %v\n", err)
+		return
+	}
+
+	line, lineRune := cursor.LinePos()
+	fmt.Printf("Cursor moved to byte=%d, rune=%d, line=%d:%d\n",
+		cursor.BytePos(), cursor.RunePos(), line, lineRune)
+}
+
+func (r *REPL) cmdWord(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 1 {
+		fmt.Println("Usage: word <count>")
+		fmt.Println("  count can be positive (forward) or negative (backward)")
+		return
+	}
+
+	cursor := r.cursor()
+	count, err := strconv.Atoi(args[0])
+	if err != nil {
+		fmt.Printf("Invalid count: %v\n", err)
+		return
+	}
+
+	moved, err := cursor.SeekByWord(count)
+	if err != nil {
+		fmt.Printf("Word seek error: %v\n", err)
+		return
+	}
+
+	line, lineRune := cursor.LinePos()
+	fmt.Printf("Moved %d word(s), cursor at byte=%d, rune=%d, line=%d:%d\n",
+		moved, cursor.BytePos(), cursor.RunePos(), line, lineRune)
+}
+
+func (r *REPL) cmdLineStart() {
+	if !r.ensureGarland() {
+		return
+	}
+
+	cursor := r.cursor()
+	err := cursor.SeekLineStart()
+	if err != nil {
+		fmt.Printf("LineStart error: %v\n", err)
+		return
+	}
+
+	line, lineRune := cursor.LinePos()
+	fmt.Printf("Cursor moved to byte=%d, rune=%d, line=%d:%d\n",
+		cursor.BytePos(), cursor.RunePos(), line, lineRune)
+}
+
+func (r *REPL) cmdLineEnd() {
+	if !r.ensureGarland() {
+		return
+	}
+
+	cursor := r.cursor()
+	err := cursor.SeekLineEnd()
+	if err != nil {
+		fmt.Printf("LineEnd error: %v\n", err)
 		return
 	}
 

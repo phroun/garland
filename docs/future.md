@@ -37,28 +37,14 @@ These are features that don't exist yet but would enhance the library:
 
 ### Navigation
 
-#### Word Navigation
-- Move cursor by word boundaries
-- Word selection
+#### Word Selection and Deletion
+- Word selection (currently only navigation is implemented)
 - Word deletion (delete word forward/backward)
 
 #### Bookmarks
 - Named bookmarks separate from decorations
 - Jump to bookmark by name
 - Bookmark list/management
-
-### Selection Ranges
-
-The current model uses point cursors only. Selection ranges would enable:
-- Visual selection of text regions
-- Cut/copy/paste operations on selections
-- Multi-cursor editing with selections
-- Block/column selection mode
-
-**Implementation approach:**
-- Add `SelectionStart` and `SelectionEnd` to Cursor
-- Selection-aware operations (delete selection, replace selection)
-- Consider anchor/head model vs start/end model
 
 ### Diff Between Revisions
 
@@ -92,11 +78,6 @@ The current model uses point cursors only. Selection ranges would enable:
 - Cache statistics and tuning
 
 ### Advanced Editing
-
-#### Macros
-- Record keystroke sequences
-- Playback recorded macros
-- Save/load macro definitions
 
 #### Auto-complete
 - Completion suggestions
@@ -154,18 +135,24 @@ The following features have been implemented:
 - **Find and Replace** - Single, all, and count-limited replacement with regex capture group expansion
 - **Incremental Memory Management** - Soft/hard memory limits with LRU-based auto-chilling; single background worker across all open files; budget-limited per-tick operations for smooth user experience
 - **Incremental Tree Rebalancing** - Path-based rebalancing after mutations with configurable budget; `ForceRebalance()` for full tree rebuild when needed; `NeedsRebalancing()` check
+- **Word Navigation** - `SeekByWord(n)` for bidirectional word navigation; positive n moves forward, negative n moves backward; positions at start of next/previous word
+- **Line Navigation** - `SeekLineStart()` and `SeekLineEnd()` for navigating to beginning/end of current line
+
+## Handled Elsewhere
+
+These features are addressed through other mechanisms:
+
+- **Selection Ranges** - Handled via decorations; applications can use decoration pairs to mark selection start/end positions
+- **Macros** - A separate macro language has been developed independently of this library
 
 ## Priority Recommendations
 
 ### High Priority (Core Functionality)
-1. Selection ranges - fundamental for practical text editing
-2. Word navigation - common editing operation
+1. File change detection - safety feature
 
 ### Medium Priority (Quality of Life)
-3. File change detection - safety feature
-4. Diff between revisions - debugging/comparison feature
-5. Revision pruning - deeper history management (memory limits now handle active data)
+2. Diff between revisions - debugging/comparison feature
+3. Revision pruning - deeper history management (memory limits now handle active data)
 
 ### Lower Priority (Nice to Have)
-6. Clipboard support - platform-specific complexity
-7. Macros - power user feature (note: separate macro language already exists)
+4. Clipboard support - platform-specific complexity

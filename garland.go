@@ -2567,6 +2567,285 @@ func (g *Garland) lineRuneToByteInternal(line, runeInLine int64) (int64, error) 
 	return result.LeafResult.LeafByteStart + result.LeafResult.ByteOffset, nil
 }
 
+// seekByWordAt moves the cursor by n words.
+// Positive n moves forward, negative moves backward.
+// Returns the number of words actually moved.
+func (g *Garland) seekByWordAt(c *Cursor, n int) (int, error) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	if n == 0 {
+		return 0, nil
+	}
+
+	// Read enough content around the cursor to find word boundaries
+	// We need to read character by character to handle word boundaries correctly
+	moved := 0
+
+	if n > 0 {
+		// Moving forward
+		currentBytePos := c.bytePos
+		for moved < n {
+			// Find the next word boundary from currentBytePos
+			nextWordStart, err := g.findNextWordBoundary(currentBytePos, true)
+			if err != nil || nextWordStart == currentBytePos {
+				// No more words or at end
+				break
+			}
+			currentBytePos = nextWordStart
+			moved++
+		}
+		if moved > 0 {
+			runePos, _ := g.byteToRuneInternal(currentBytePos)
+			line, lineRune, _ := g.byteToLineRuneInternal(currentBytePos)
+			c.updatePosition(currentBytePos, runePos, line, lineRune)
+		}
+	} else {
+		// Moving backward (n is negative)
+		wordsToMove := -n
+		currentBytePos := c.bytePos
+		for moved < wordsToMove {
+			// Find the previous word boundary from currentBytePos
+			prevWordStart, err := g.findNextWordBoundary(currentBytePos, false)
+			if err != nil || prevWordStart == currentBytePos {
+				// No more words or at beginning
+				break
+			}
+			currentBytePos = prevWordStart
+			moved++
+		}
+		if moved > 0 {
+			runePos, _ := g.byteToRuneInternal(currentBytePos)
+			line, lineRune, _ := g.byteToLineRuneInternal(currentBytePos)
+			c.updatePosition(currentBytePos, runePos, line, lineRune)
+		}
+	}
+
+	return moved, nil
+}
+
+// findNextWordBoundary finds the byte position of the next/previous word boundary.
+// forward=true finds next word start, forward=false finds previous word start.
+func (g *Garland) findNextWordBoundary(fromByte int64, forward bool) (int64, error) {
+	totalBytes := g.totalBytes
+
+	if forward {
+		if fromByte >= totalBytes {
+			return fromByte, nil
+		}
+
+		// Skip current word (if in one), then skip whitespace, then find word start
+		pos := fromByte
+		inWord := false
+
+		// First, determine if we're in a word and skip to its end
+		for pos < totalBytes {
+			r, size, err := g.runeAtByte(pos)
+			if err != nil {
+				break
+			}
+			if isWordChar(r) {
+				inWord = true
+				pos += int64(size)
+			} else if inWord {
+				// We've reached the end of current word
+				break
+			} else {
+				pos += int64(size)
+			}
+		}
+
+		// Now skip whitespace/non-word to find next word start
+		for pos < totalBytes {
+			r, size, err := g.runeAtByte(pos)
+			if err != nil {
+				break
+			}
+			if isWordChar(r) {
+				// Found start of next word
+				return pos, nil
+			}
+			pos += int64(size)
+		}
+
+		return pos, nil
+	}
+
+	// Moving backward
+	if fromByte <= 0 {
+		return 0, nil
+	}
+
+	pos := fromByte
+
+	// First, move back to skip any whitespace/non-word chars before cursor
+	for pos > 0 {
+		r, size, err := g.runeBeforeByte(pos)
+		if err != nil {
+			break
+		}
+		if isWordChar(r) {
+			break
+		}
+		pos -= int64(size)
+	}
+
+	// Now move back through the word to find its start
+	for pos > 0 {
+		r, size, err := g.runeBeforeByte(pos)
+		if err != nil {
+			break
+		}
+		if !isWordChar(r) {
+			// Found start of word
+			return pos, nil
+		}
+		pos -= int64(size)
+	}
+
+	return pos, nil
+}
+
+// runeAtByte returns the rune starting at the given byte position and its size.
+func (g *Garland) runeAtByte(bytePos int64) (rune, int, error) {
+	if bytePos >= g.totalBytes {
+		return 0, 0, ErrInvalidPosition
+	}
+
+	// Read a small chunk to decode the rune (max 4 bytes for UTF-8)
+	readLen := int64(4)
+	if bytePos+readLen > g.totalBytes {
+		readLen = g.totalBytes - bytePos
+	}
+
+	data, err := g.readBytesRangeInternal(bytePos, readLen)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	if len(data) == 0 {
+		return 0, 0, ErrInvalidPosition
+	}
+
+	r, size := decodeRune(data)
+	return r, size, nil
+}
+
+// runeBeforeByte returns the rune ending at the given byte position and its size.
+func (g *Garland) runeBeforeByte(bytePos int64) (rune, int, error) {
+	if bytePos <= 0 {
+		return 0, 0, ErrInvalidPosition
+	}
+
+	// Read up to 4 bytes before the position
+	startPos := bytePos - 4
+	if startPos < 0 {
+		startPos = 0
+	}
+
+	data, err := g.readBytesRangeInternal(startPos, bytePos-startPos)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	if len(data) == 0 {
+		return 0, 0, ErrInvalidPosition
+	}
+
+	// Decode the last rune in the data
+	r, size := decodeLastRune(data)
+	return r, size, nil
+}
+
+// decodeRune decodes a single UTF-8 rune from the start of data.
+func decodeRune(data []byte) (rune, int) {
+	if len(data) == 0 {
+		return 0, 0
+	}
+
+	// Simple UTF-8 decode
+	b0 := data[0]
+	if b0 < 0x80 {
+		return rune(b0), 1
+	}
+
+	if b0 < 0xC0 {
+		return rune(b0), 1 // Invalid, treat as single byte
+	}
+
+	if b0 < 0xE0 {
+		if len(data) < 2 {
+			return rune(b0), 1
+		}
+		return rune(b0&0x1F)<<6 | rune(data[1]&0x3F), 2
+	}
+
+	if b0 < 0xF0 {
+		if len(data) < 3 {
+			return rune(b0), 1
+		}
+		return rune(b0&0x0F)<<12 | rune(data[1]&0x3F)<<6 | rune(data[2]&0x3F), 3
+	}
+
+	if len(data) < 4 {
+		return rune(b0), 1
+	}
+	return rune(b0&0x07)<<18 | rune(data[1]&0x3F)<<12 | rune(data[2]&0x3F)<<6 | rune(data[3]&0x3F), 4
+}
+
+// decodeLastRune decodes the last UTF-8 rune from data.
+func decodeLastRune(data []byte) (rune, int) {
+	if len(data) == 0 {
+		return 0, 0
+	}
+
+	// Find the start of the last rune by looking for a non-continuation byte
+	for i := len(data) - 1; i >= 0 && i >= len(data)-4; i-- {
+		b := data[i]
+		if b < 0x80 || b >= 0xC0 {
+			// This is the start of a rune
+			r, size := decodeRune(data[i:])
+			return r, size
+		}
+	}
+
+	// Fallback: treat last byte as single-byte rune
+	return rune(data[len(data)-1]), 1
+}
+
+// seekLineEndAt moves the cursor to the end of its current line.
+func (g *Garland) seekLineEndAt(c *Cursor) error {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	currentLine := c.line
+
+	// Try to find the start of the next line
+	nextLine := currentLine + 1
+	nextLineBytePos, err := g.lineRuneToByteInternal(nextLine, 0)
+
+	if err == nil && nextLineBytePos > 0 {
+		// Next line exists - position just before the newline
+		// The newline is at nextLineBytePos - 1 (assuming single-byte newline)
+		endPos := nextLineBytePos - 1
+		if endPos < 0 {
+			endPos = 0
+		}
+
+		runePos, _ := g.byteToRuneInternal(endPos)
+		_, lineRune, _ := g.byteToLineRuneInternal(endPos)
+		c.updatePosition(endPos, runePos, currentLine, lineRune)
+		return nil
+	}
+
+	// We're on the last line - go to EOF
+	endPos := g.totalBytes
+	runePos, _ := g.byteToRuneInternal(endPos)
+	_, lineRune, _ := g.byteToLineRuneInternal(endPos)
+	c.updatePosition(endPos, runePos, currentLine, lineRune)
+	return nil
+}
+
 // countLinesBeforeLeaf counts the total lines in all leaves before the one starting at byteStart.
 func (g *Garland) countLinesBeforeLeaf(byteStart int64) int64 {
 	if byteStart == 0 {

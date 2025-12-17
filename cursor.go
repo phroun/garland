@@ -260,6 +260,36 @@ func (c *Cursor) SeekRelativeRunes(delta int64) error {
 	return c.SeekRune(newPos)
 }
 
+// SeekByWord moves the cursor by n words.
+// Positive n moves forward, negative n moves backward.
+// A word is defined as a sequence of alphanumeric/underscore characters,
+// or a sequence of non-whitespace non-word characters.
+// Returns the number of words actually moved (may be less than requested at boundaries).
+func (c *Cursor) SeekByWord(n int) (int, error) {
+	if c.garland == nil {
+		return 0, ErrCursorNotFound
+	}
+	return c.garland.seekByWordAt(c, n)
+}
+
+// SeekLineStart moves the cursor to the beginning of the current line.
+func (c *Cursor) SeekLineStart() error {
+	if c.garland == nil {
+		return ErrCursorNotFound
+	}
+	// Simply set lineRune to 0 and recalculate byte/rune positions
+	return c.SeekLine(c.line, 0)
+}
+
+// SeekLineEnd moves the cursor to the end of the current line.
+// The cursor is positioned after the last character before the newline (or at EOF).
+func (c *Cursor) SeekLineEnd() error {
+	if c.garland == nil {
+		return ErrCursorNotFound
+	}
+	return c.garland.seekLineEndAt(c)
+}
+
 // updatePosition updates the cursor's position and records history if needed.
 func (c *Cursor) updatePosition(bytePos, runePos, line, lineRune int64) {
 	c.bytePos = bytePos
