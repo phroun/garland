@@ -495,3 +495,133 @@ func TestSaveAsNilFS(t *testing.T) {
 		t.Errorf("SaveAs with nil fs returned %v, want ErrNotSupported", err)
 	}
 }
+
+func TestAutoThawOnRead(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// Initialize library with cold storage
+	lib, err := Init(LibraryOptions{
+		ColdStoragePath: tempDir,
+	})
+	if err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	// Create a garland with some content
+	g, err := lib.Open(FileOptions{DataString: "Hello World! This is a test of auto-thaw."})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer g.Close()
+
+	// Make an edit to create revision 1
+	cursor := g.NewCursor()
+	cursor.InsertString(" More content.", nil, false)
+
+	// Read content before chill
+	cursor.SeekByte(0)
+	beforeChill, err := cursor.ReadBytes(g.ByteCount().Value)
+	if err != nil {
+		t.Fatalf("ReadBytes before chill failed: %v", err)
+	}
+	t.Logf("Before chill: %q (%d bytes)", string(beforeChill), len(beforeChill))
+
+	// Chill everything to cold storage
+	err = g.Chill(ChillEverything)
+	if err != nil {
+		t.Fatalf("Chill failed: %v", err)
+	}
+	t.Log("Chilled everything to cold storage")
+
+	// Verify cold storage files were created
+	files, _ := filepath.Glob(filepath.Join(tempDir, "*", "*"))
+	t.Logf("Cold storage files: %d", len(files))
+	if len(files) == 0 {
+		t.Error("Expected cold storage files to be created")
+	}
+
+	// Reading should auto-thaw
+	cursor.SeekByte(0)
+	afterChill, err := cursor.ReadBytes(g.ByteCount().Value)
+	if err != nil {
+		t.Fatalf("ReadBytes after chill failed: %v", err)
+	}
+	t.Logf("After chill (auto-thawed): %q (%d bytes)", string(afterChill), len(afterChill))
+
+	// Verify content is the same
+	if string(beforeChill) != string(afterChill) {
+		t.Errorf("Content mismatch after chill/thaw:\nbefore: %q\nafter: %q", string(beforeChill), string(afterChill))
+	}
+}
+
+func TestThawRevisionRange(t *testing.T) {
+	tempDir := t.TempDir()
+
+	lib, err := Init(LibraryOptions{
+		ColdStoragePath: tempDir,
+	})
+	if err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	g, err := lib.Open(FileOptions{DataString: "Base"})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer g.Close()
+
+	cursor := g.NewCursor()
+
+	// Create revisions
+	cursor.InsertString("A", nil, false) // Rev 1
+	cursor.InsertString("B", nil, false) // Rev 2
+	cursor.InsertString("C", nil, false) // Rev 3
+
+	// Chill everything
+	err = g.Chill(ChillEverything)
+	if err != nil {
+		t.Fatalf("Chill failed: %v", err)
+	}
+
+	// Thaw only revision 2
+	err = g.ThawRevision(2, 2)
+	if err != nil {
+		t.Fatalf("ThawRevision failed: %v", err)
+	}
+
+	// Verify we can read current content (should auto-thaw if needed)
+	cursor.SeekByte(0)
+	content, err := cursor.ReadBytes(g.ByteCount().Value)
+	if err != nil {
+		t.Fatalf("ReadBytes failed: %v", err)
+	}
+	t.Logf("Content after ThawRevision: %q", string(content))
+}
+
+func TestDecorationEncodeDecode(t *testing.T) {
+	// Test encoding
+	decs := []Decoration{
+		{Key: "mark1", Position: 5},
+		{Key: "mark2", Position: 10},
+		{Key: "bookmark-long-name", Position: 12345},
+	}
+
+	encoded := encodeDecorations(decs)
+	t.Logf("Encoded decorations: %d bytes", len(encoded))
+
+	// Test decoding
+	decoded := decodeDecorations(encoded)
+	if len(decoded) != len(decs) {
+		t.Fatalf("Decoded count mismatch: got %d, want %d", len(decoded), len(decs))
+	}
+
+	for i, d := range decoded {
+		if d.Key != decs[i].Key {
+			t.Errorf("Key mismatch at %d: got %q, want %q", i, d.Key, decs[i].Key)
+		}
+		if d.Position != decs[i].Position {
+			t.Errorf("Position mismatch at %d: got %d, want %d", i, d.Position, decs[i].Position)
+		}
+	}
+}
+

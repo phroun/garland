@@ -96,31 +96,42 @@ func (n *Node) ID() NodeID {
 // It searches backwards through revisions if an exact match isn't found,
 // and follows parent forks as needed.
 func (n *Node) snapshotAt(fork ForkID, rev RevisionID) *NodeSnapshot {
+	snap, _ := n.snapshotAtWithKey(fork, rev)
+	return snap
+}
+
+// snapshotAtWithKey returns the node's snapshot and its actual ForkRevision key.
+// It searches backwards through revisions if an exact match isn't found,
+// and follows parent forks as needed.
+func (n *Node) snapshotAtWithKey(fork ForkID, rev RevisionID) (*NodeSnapshot, ForkRevision) {
 	// Try exact match first
-	if snap, ok := n.history[ForkRevision{fork, rev}]; ok {
-		return snap
+	key := ForkRevision{fork, rev}
+	if snap, ok := n.history[key]; ok {
+		return snap, key
 	}
 
 	// Walk back through revisions in this fork
 	for r := rev; r > 0; r-- {
-		if snap, ok := n.history[ForkRevision{fork, r - 1}]; ok {
-			return snap
+		key = ForkRevision{fork, r - 1}
+		if snap, ok := n.history[key]; ok {
+			return snap, key
 		}
 	}
 
 	// Check revision 0
-	if snap, ok := n.history[ForkRevision{fork, 0}]; ok {
-		return snap
+	key = ForkRevision{fork, 0}
+	if snap, ok := n.history[key]; ok {
+		return snap, key
 	}
 
 	// If fork has a parent, try parent fork
 	if n.file != nil {
 		if forkInfo, ok := n.file.forks[fork]; ok && forkInfo.ParentFork != fork {
-			return n.snapshotAt(forkInfo.ParentFork, forkInfo.ParentRevision)
+			return n.snapshotAtWithKey(forkInfo.ParentFork, forkInfo.ParentRevision)
 		}
 	}
 
-	return nil // node didn't exist at this version
+	return nil, ForkRevision{} // node didn't exist at this version
 }
 
 // setSnapshot sets the node's snapshot for the given fork and revision.

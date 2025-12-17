@@ -542,6 +542,96 @@ func (g *Garland) Chill(level ChillLevel) error {
 	return nil
 }
 
+// Thaw restores data from cold storage to memory for the current fork.
+// This is the inverse of Chill - it loads data back from cold storage.
+func (g *Garland) Thaw() error {
+	if g.lib.coldStorageBackend == nil {
+		return nil // No cold storage configured
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	thawedCount := 0
+	for _, node := range g.nodeRegistry {
+		for forkRev, snap := range node.history {
+			// Only thaw for current fork
+			if forkRev.Fork != g.currentFork {
+				continue
+			}
+			if snap.isLeaf && snap.storageState == StorageCold {
+				err := g.thawSnapshot(node.id, forkRev, snap)
+				if err != nil {
+					// Log error but continue thawing other nodes
+					continue
+				}
+				thawedCount++
+			}
+		}
+	}
+
+	return nil
+}
+
+// ThawRevision restores cold data for a specific revision range in the current fork.
+func (g *Garland) ThawRevision(startRev, endRev RevisionID) error {
+	if g.lib.coldStorageBackend == nil {
+		return nil
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// Traverse the tree and thaw all reachable cold snapshots
+	// We need to walk the tree for each revision in the range, as different
+	// revisions may reference different nodes
+	for rev := startRev; rev <= endRev; rev++ {
+		g.thawNodesForRevision(g.currentFork, rev)
+	}
+
+	return nil
+}
+
+// thawNodesForRevision thaws all cold snapshots reachable from the tree root
+// at the specified fork/revision.
+func (g *Garland) thawNodesForRevision(fork ForkID, rev RevisionID) {
+	if g.root == nil {
+		return
+	}
+	g.thawNodeRecursive(g.root, fork, rev)
+}
+
+// thawNodeRecursive recursively thaws a node and its children.
+func (g *Garland) thawNodeRecursive(node *Node, fork ForkID, rev RevisionID) {
+	if node == nil {
+		return
+	}
+
+	// Find the actual snapshot and its ForkRevision key
+	snap, forkRev := node.snapshotAtWithKey(fork, rev)
+	if snap == nil {
+		return
+	}
+
+	if snap.isLeaf {
+		if snap.storageState == StorageCold {
+			g.thawSnapshot(node.id, forkRev, snap)
+		}
+	} else {
+		// Internal node - recurse into children
+		if snap.leftID != 0 {
+			if leftNode := g.nodeRegistry[snap.leftID]; leftNode != nil {
+				g.thawNodeRecursive(leftNode, fork, rev)
+			}
+		}
+		if snap.rightID != 0 {
+			if rightNode := g.nodeRegistry[snap.rightID]; rightNode != nil {
+				g.thawNodeRecursive(rightNode, fork, rev)
+			}
+		}
+	}
+}
+
 // chillSnapshot moves a snapshot's data to cold storage.
 func (g *Garland) chillSnapshot(nodeID NodeID, forkRev ForkRevision, snap *NodeSnapshot) error {
 	// Compute hash if not already present
@@ -684,6 +774,182 @@ func encodeDecorations(decs []Decoration) []byte {
 		buf = append(buf, '\n')
 	}
 	return buf
+}
+
+// decodeDecorations parses decorations from the cold storage format.
+func decodeDecorations(data []byte) []Decoration {
+	if len(data) == 0 {
+		return nil
+	}
+
+	var decs []Decoration
+	i := 0
+	for i < len(data) {
+		// Find null terminator (end of key)
+		keyEnd := i
+		for keyEnd < len(data) && data[keyEnd] != 0 {
+			keyEnd++
+		}
+		if keyEnd >= len(data) {
+			break // Malformed data
+		}
+		key := string(data[i:keyEnd])
+
+		// Find newline (end of position)
+		posStart := keyEnd + 1
+		posEnd := posStart
+		for posEnd < len(data) && data[posEnd] != '\n' {
+			posEnd++
+		}
+		if posEnd > posStart {
+			posStr := string(data[posStart:posEnd])
+			pos := parseUint64(posStr)
+			decs = append(decs, Decoration{Key: key, Position: int64(pos)})
+		}
+
+		i = posEnd + 1
+	}
+	return decs
+}
+
+// parseUint64 parses a uint64 from a base-10 encoded string.
+func parseUint64(s string) uint64 {
+	var result uint64
+	for _, c := range s {
+		if c >= '0' && c <= '9' {
+			result = result*10 + uint64(c-'0')
+		}
+	}
+	return result
+}
+
+// thawSnapshot restores a snapshot's data from cold storage.
+func (g *Garland) thawSnapshot(nodeID NodeID, forkRev ForkRevision, snap *NodeSnapshot) error {
+	if g.lib.coldStorageBackend == nil {
+		return ErrNoColdStorage
+	}
+
+	// Retrieve data from cold storage
+	blockName := formatBlockName(nodeID, forkRev)
+	data, err := g.lib.coldStorageBackend.Get(g.id, blockName)
+	if err != nil {
+		snap.storageState = StoragePlaceholder
+		return err
+	}
+
+	// Verify hash if present
+	if len(snap.dataHash) > 0 {
+		actualHash := computeHash(data)
+		if !hashesEqual(snap.dataHash, actualHash) {
+			snap.storageState = StoragePlaceholder
+			return ErrColdStorageFailure
+		}
+	}
+
+	// Restore data
+	snap.data = data
+	snap.storageState = StorageMemory
+
+	// Try to restore decorations if they were stored
+	decBlockName := blockName + ".dec"
+	decData, err := g.lib.coldStorageBackend.Get(g.id, decBlockName)
+	if err == nil && len(decData) > 0 {
+		// Verify decoration hash if present
+		if len(snap.decorationHash) > 0 {
+			actualHash := computeHash(decData)
+			if hashesEqual(snap.decorationHash, actualHash) {
+				snap.decorations = decodeDecorations(decData)
+			}
+		} else {
+			snap.decorations = decodeDecorations(decData)
+		}
+	}
+
+	return nil
+}
+
+// hashesEqual compares two hash slices for equality.
+func hashesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// ensureSnapshotData ensures that a snapshot's data is loaded into memory.
+// If the data is in cold storage, it will be thawed.
+// If the data is in warm storage, it will be read from the source file.
+// Caller must hold the write lock.
+func (g *Garland) ensureSnapshotData(node *Node, forkRev ForkRevision, snap *NodeSnapshot) error {
+	if snap == nil || !snap.isLeaf {
+		return nil
+	}
+
+	switch snap.storageState {
+	case StorageMemory:
+		// Data is already in memory
+		return nil
+
+	case StorageCold:
+		// Thaw from cold storage
+		return g.thawSnapshot(node.id, forkRev, snap)
+
+	case StorageWarm:
+		// Read from warm storage (original file)
+		return g.readFromWarmStorage(snap)
+
+	case StoragePlaceholder:
+		// Data is unavailable
+		return ErrColdStorageFailure
+	}
+
+	return nil
+}
+
+// readFromWarmStorage reads data from the original file for warm storage.
+func (g *Garland) readFromWarmStorage(snap *NodeSnapshot) error {
+	if g.sourceHandle == nil || g.sourceFS == nil {
+		return ErrWarmStorageMismatch
+	}
+
+	// Seek to the original position
+	err := g.sourceFS.SeekByte(g.sourceHandle, snap.originalFileOffset)
+	if err != nil {
+		snap.storageState = StoragePlaceholder
+		return err
+	}
+
+	// Read the data
+	data, err := g.sourceFS.ReadBytes(g.sourceHandle, int(snap.byteCount))
+	if err != nil {
+		snap.storageState = StoragePlaceholder
+		return err
+	}
+
+	// Verify hash if present
+	if len(snap.dataHash) > 0 {
+		actualHash := computeHash(data)
+		if !hashesEqual(snap.dataHash, actualHash) {
+			// Warm storage mismatch - file was modified
+			// Try cold storage as fallback if available
+			if g.lib.coldStorageBackend != nil && snap.storageState == StorageWarm {
+				// Can't thaw without nodeID and forkRev - mark as placeholder
+				snap.storageState = StoragePlaceholder
+				return ErrWarmStorageMismatch
+			}
+			snap.storageState = StoragePlaceholder
+			return ErrWarmStorageMismatch
+		}
+	}
+
+	snap.data = data
+	snap.storageState = StorageMemory
+	return nil
 }
 
 // NewCursor creates a new cursor at position 0.
@@ -1236,6 +1502,16 @@ func (g *Garland) findRevisionInfo(fork ForkID, revision RevisionID) *RevisionIn
 			return info
 		}
 
+		// Check if we should jump to parent fork
+		// If revision is at or before the divergence point, check parent directly
+		forkInfo, ok := g.forks[currentFork]
+		if ok && forkInfo.ParentFork != currentFork && currentRev <= forkInfo.ParentRevision {
+			// This revision predates this fork - look in parent
+			currentFork = forkInfo.ParentFork
+			// Keep currentRev the same - we want the same revision in parent
+			continue
+		}
+
 		// Walk back through revisions in this fork (handle uint64 underflow safely)
 		if currentRev > 0 {
 			currentRev--
@@ -1243,7 +1519,6 @@ func (g *Garland) findRevisionInfo(fork ForkID, revision RevisionID) *RevisionIn
 		}
 
 		// Reached revision 0 in this fork with no match - check parent fork
-		forkInfo, ok := g.forks[currentFork]
 		if !ok {
 			return nil
 		}
@@ -1253,7 +1528,7 @@ func (g *Garland) findRevisionInfo(fork ForkID, revision RevisionID) *RevisionIn
 			return nil
 		}
 
-		// Move to parent fork at the point where this fork diverged
+		// Move to parent fork
 		currentFork = forkInfo.ParentFork
 		currentRev = forkInfo.ParentRevision
 	}
@@ -2101,8 +2376,8 @@ func (g *Garland) recordMutation() ChangeResult {
 		if !g.isAtHead() && !g.transaction.hasMutations {
 			// First mutation in this transaction while not at HEAD - create fork
 			g.createForkFromCurrent()
-			// Update pending revision to 1 (first revision in new fork)
-			g.transaction.pendingRevision = 1
+			// Update pending revision (fork preserves revision numbers, so increment)
+			g.transaction.pendingRevision = g.currentRevision + 1
 		}
 		// Mark as having mutations
 		g.transaction.hasMutations = true
@@ -2112,7 +2387,7 @@ func (g *Garland) recordMutation() ChangeResult {
 	// Not in transaction - check if we need to fork first
 	if !g.isAtHead() {
 		g.createForkFromCurrent()
-		// After forking, we're at revision 0 of new fork, increment to 1
+		// Fork preserves revision number, increment below will create next revision
 	}
 
 	// Create new revision
@@ -2167,21 +2442,24 @@ func (g *Garland) createForkFromCurrent() {
 	newForkID := g.nextForkID
 
 	// Create new fork info
+	// The new fork inherits the revision number from the parent - this allows
+	// UndoSeek to navigate to any revision from 0 to HighestRevision, including
+	// revisions that logically came from the parent fork.
 	g.forks[newForkID] = &ForkInfo{
 		ID:              newForkID,
 		ParentFork:      g.currentFork,
 		ParentRevision:  g.currentRevision,
-		HighestRevision: 0, // will be incremented by recordMutation
+		HighestRevision: g.currentRevision, // Start with parent's revision
 	}
 
-	// Switch to the new fork
+	// Switch to the new fork, keeping the current revision number
 	g.currentFork = newForkID
-	g.currentRevision = 0
+	// Keep currentRevision as-is - recordMutation will increment it
 
 	// Update cursor tracking
 	for _, cursor := range g.cursors {
 		cursor.lastFork = newForkID
-		cursor.lastRevision = 0
+		cursor.lastRevision = g.currentRevision
 	}
 }
 
@@ -2196,22 +2474,38 @@ func (g *Garland) readBytesAt(pos int64, length int64) ([]byte, error) {
 		return nil, nil
 	}
 
+	// Try read with read lock first (fast path)
 	g.mu.RLock()
-	defer g.mu.RUnlock()
-
-	// Calculate the actual total bytes for this revision (including streaming remainder)
 	totalBytesForRevision := g.calculateTotalBytesUnlocked()
 
 	if pos > totalBytesForRevision {
+		g.mu.RUnlock()
 		return nil, ErrInvalidPosition
 	}
 
 	// Clamp length to available data
-	if pos+length > totalBytesForRevision {
-		length = totalBytesForRevision - pos
+	readLength := length
+	if pos+readLength > totalBytesForRevision {
+		readLength = totalBytesForRevision - pos
 	}
 
-	return g.readBytesRangeInternal(pos, length)
+	result, err := g.readBytesRangeInternal(pos, readLength)
+	g.mu.RUnlock()
+
+	// If data is not loaded (cold storage), try to thaw and retry
+	if err == ErrDataNotLoaded {
+		// Thaw the current revision
+		if thawErr := g.ThawRevision(g.currentRevision, g.currentRevision); thawErr != nil {
+			return nil, err // Return original error if thaw fails
+		}
+
+		// Retry with read lock
+		g.mu.RLock()
+		result, err = g.readBytesRangeInternal(pos, readLength)
+		g.mu.RUnlock()
+	}
+
+	return result, err
 }
 
 // calculateTotalBytesUnlocked returns the total bytes for the current revision,
@@ -2368,6 +2662,11 @@ func (g *Garland) readBytesRangeInternal(pos int64, length int64) ([]byte, error
 
 		snap := leafResult.Snapshot
 
+		// Check if data is loaded (may be in cold/warm storage)
+		if snap.storageState != StorageMemory || snap.data == nil {
+			return nil, ErrDataNotLoaded
+		}
+
 		// Calculate how much we can read from this leaf
 		availableInLeaf := snap.byteCount - leafResult.ByteOffset
 		toRead := remaining
@@ -2423,6 +2722,11 @@ func (g *Garland) readFromStreamingTree(pos int64, length int64) ([]byte, error)
 		}
 
 		snap := leafResult.Snapshot
+
+		// Check if data is loaded (may be in cold/warm storage)
+		if snap.storageState != StorageMemory || snap.data == nil {
+			return nil, ErrDataNotLoaded
+		}
 
 		// Calculate how much we can read from this leaf
 		availableInLeaf := snap.byteCount - leafResult.ByteOffset

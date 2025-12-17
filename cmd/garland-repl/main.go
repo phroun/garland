@@ -114,7 +114,16 @@ func (r *REPL) handleCommand(input string) bool {
 		r.cmdReadLine()
 
 	case "insert":
-		r.cmdInsert(args)
+		r.cmdInsert(args, false)
+
+	case "insert-":
+		r.cmdInsert(args, true)
+
+	case "overwrite":
+		r.cmdOverwrite(args)
+
+	case "truncate":
+		r.cmdTruncate()
 
 	case "delete":
 		r.cmdDelete(args)
@@ -145,6 +154,18 @@ func (r *REPL) handleCommand(input string) bool {
 
 	case "version":
 		r.cmdVersion()
+
+	case "decorate":
+		r.cmdDecorate(args)
+
+	case "undecorate":
+		r.cmdUndecorate(args)
+
+	case "decorations":
+		r.cmdDecorations(args)
+
+	case "decoration":
+		r.cmdGetDecoration(args)
 
 	default:
 		fmt.Printf("Unknown command: %s. Type 'help' for available commands.\n", cmd)
@@ -181,6 +202,9 @@ READ OPERATIONS:
 
 EDIT OPERATIONS:
   insert <text>           Insert text at cursor position (advances cursor)
+  insert- <text>          Insert text BEFORE existing content at position
+  overwrite <len> <text>  Replace <len> bytes at cursor with <text>
+  truncate                Delete from cursor to end of file
   delete bytes <length>   Delete bytes forward from cursor position
   delete runes <length>   Delete runes forward from cursor position
   backdelete bytes <len>  Delete bytes backward (like backspace)
@@ -202,6 +226,13 @@ VERSION CONTROL:
 
 NOTE: Forks are created automatically when you edit from a non-HEAD revision.
       Use 'forkswitch' to navigate between existing forks.
+
+DECORATIONS:
+  decorate <key>          Add a decoration at cursor position
+  undecorate <key>        Remove a decoration
+  decorations             List all decorations in the file
+  decorations <line>      List decorations on a specific line
+  decoration <key>        Get the position of a specific decoration
 
 OTHER:
   help                    Show this help message
@@ -468,7 +499,7 @@ func (r *REPL) cmdReadLine() {
 	fmt.Printf("Line content: %q\n", data)
 }
 
-func (r *REPL) cmdInsert(args []string) {
+func (r *REPL) cmdInsert(args []string, insertBefore bool) {
 	if !r.ensureGarland() {
 		return
 	}
@@ -476,6 +507,7 @@ func (r *REPL) cmdInsert(args []string) {
 	text := strings.Join(args, " ")
 	if text == "" {
 		fmt.Println("Usage: insert <text>")
+		fmt.Println("       insert- <text>  (insert before existing content at position)")
 		return
 	}
 
@@ -484,13 +516,65 @@ func (r *REPL) cmdInsert(args []string) {
 	text = strings.ReplaceAll(text, "\\t", "\t")
 
 	cursor := r.cursor()
-	result, err := cursor.InsertString(text, nil, false)
+	result, err := cursor.InsertString(text, nil, insertBefore)
 	if err != nil {
 		fmt.Printf("Insert error: %v\n", err)
 		return
 	}
-	fmt.Printf("Inserted %d bytes. Now at fork=%d, revision=%d\n",
-		len(text), result.Fork, result.Revision)
+	beforeStr := ""
+	if insertBefore {
+		beforeStr = " (before)"
+	}
+	fmt.Printf("Inserted %d bytes%s. Now at fork=%d, revision=%d\n",
+		len(text), beforeStr, result.Fork, result.Revision)
+}
+
+func (r *REPL) cmdOverwrite(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 2 {
+		fmt.Println("Usage: overwrite <length> <text>")
+		fmt.Println("  Replaces <length> bytes at cursor with <text>")
+		return
+	}
+
+	length, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil {
+		fmt.Printf("Invalid length: %v\n", err)
+		return
+	}
+
+	text := strings.Join(args[1:], " ")
+	// Handle escape sequences
+	text = strings.ReplaceAll(text, "\\n", "\n")
+	text = strings.ReplaceAll(text, "\\t", "\t")
+
+	cursor := r.cursor()
+	_, result, err := cursor.OverwriteBytes(length, []byte(text))
+	if err != nil {
+		fmt.Printf("Overwrite error: %v\n", err)
+		return
+	}
+	fmt.Printf("Overwrote %d bytes with %d bytes. Now at fork=%d, revision=%d\n",
+		length, len(text), result.Fork, result.Revision)
+}
+
+func (r *REPL) cmdTruncate() {
+	if !r.ensureGarland() {
+		return
+	}
+
+	cursor := r.cursor()
+	result, err := cursor.TruncateToEOF()
+	if err != nil {
+		fmt.Printf("Truncate error: %v\n", err)
+		return
+	}
+	fmt.Printf("Truncated from cursor to EOF. Now at fork=%d, revision=%d\n",
+		result.Fork, result.Revision)
+	fmt.Printf("File is now %d bytes\n", r.garland.ByteCount().Value)
 }
 
 func (r *REPL) cmdDelete(args []string) {
@@ -862,4 +946,146 @@ func (r *REPL) ensureGarland() bool {
 		return false
 	}
 	return true
+}
+
+func (r *REPL) cmdDecorate(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 1 {
+		fmt.Println("Usage: decorate <key>")
+		fmt.Println("  Adds a decoration with the given key at the current cursor position")
+		return
+	}
+
+	key := args[0]
+	cursor := r.cursor()
+	bytePos := cursor.BytePos()
+
+	entry := garland.DecorationEntry{
+		Key:     key,
+		Address: &garland.AbsoluteAddress{Mode: garland.ByteMode, Byte: bytePos},
+	}
+
+	result, err := r.garland.Decorate([]garland.DecorationEntry{entry})
+	if err != nil {
+		fmt.Printf("Decorate error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Added decoration '%s' at byte %d. Fork=%d, revision=%d\n",
+		key, bytePos, result.Fork, result.Revision)
+}
+
+func (r *REPL) cmdUndecorate(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 1 {
+		fmt.Println("Usage: undecorate <key>")
+		fmt.Println("  Removes the decoration with the given key")
+		return
+	}
+
+	key := args[0]
+
+	entry := garland.DecorationEntry{
+		Key:     key,
+		Address: nil, // nil address means delete
+	}
+
+	result, err := r.garland.Decorate([]garland.DecorationEntry{entry})
+	if err != nil {
+		fmt.Printf("Undecorate error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Removed decoration '%s'. Fork=%d, revision=%d\n",
+		key, result.Fork, result.Revision)
+}
+
+func (r *REPL) cmdDecorations(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	// If a line number is provided, show decorations on that line
+	if len(args) >= 1 {
+		line, err := strconv.ParseInt(args[0], 10, 64)
+		if err != nil {
+			fmt.Printf("Invalid line number: %v\n", err)
+			return
+		}
+
+		decs, err := r.garland.GetDecorationsOnLine(line)
+		if err != nil {
+			fmt.Printf("Error getting decorations: %v\n", err)
+			return
+		}
+
+		if len(decs) == 0 {
+			fmt.Printf("No decorations on line %d\n", line)
+			return
+		}
+
+		fmt.Printf("Decorations on line %d:\n", line)
+		for _, dec := range decs {
+			fmt.Printf("  '%s' at byte %d\n", dec.Key, dec.Address.Byte)
+		}
+		return
+	}
+
+	// Otherwise show all decorations in the file
+	byteCount := r.garland.ByteCount().Value
+	decs, err := r.garland.GetDecorationsInByteRange(0, byteCount)
+	if err != nil {
+		fmt.Printf("Error getting decorations: %v\n", err)
+		return
+	}
+
+	if len(decs) == 0 {
+		fmt.Println("No decorations in file")
+		return
+	}
+
+	fmt.Printf("Decorations (%d total):\n", len(decs))
+	for _, dec := range decs {
+		fmt.Printf("  '%s' at byte %d\n", dec.Key, dec.Address.Byte)
+	}
+}
+
+func (r *REPL) cmdGetDecoration(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 1 {
+		fmt.Println("Usage: decoration <key>")
+		fmt.Println("  Gets the position of a specific decoration")
+		return
+	}
+
+	key := args[0]
+
+	addr, err := r.garland.GetDecorationPosition(key)
+	if err != nil {
+		if err == garland.ErrDecorationNotFound {
+			fmt.Printf("Decoration '%s' not found\n", key)
+		} else {
+			fmt.Printf("Error getting decoration: %v\n", err)
+		}
+		return
+	}
+
+	fmt.Printf("Decoration '%s' is at:\n", key)
+	switch addr.Mode {
+	case garland.ByteMode:
+		fmt.Printf("  Byte: %d\n", addr.Byte)
+	case garland.RuneMode:
+		fmt.Printf("  Rune: %d\n", addr.Rune)
+	case garland.LineRuneMode:
+		fmt.Printf("  Line: %d:%d\n", addr.Line, addr.LineRune)
+	}
 }

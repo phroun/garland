@@ -101,4 +101,7 @@ var (
 
 	// ErrNoColdStorage indicates that cold storage is required but not configured.
 	ErrNoColdStorage = errors.New("cold storage not configured")
+
+	// ErrDataNotLoaded indicates that data is in cold/warm storage and needs to be thawed.
+	ErrDataNotLoaded = errors.New("data not loaded - call Thaw() first")
 )
