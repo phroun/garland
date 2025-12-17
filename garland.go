@@ -810,6 +810,10 @@ func (g *Garland) TransactionDepth() int {
 // TransactionStart begins a new transaction with an optional descriptive name.
 func (g *Garland) TransactionStart(name string) error {
 	if g.transaction == nil {
+		// Record cursor positions in history before starting transaction
+		// This allows UndoSeek to restore positions from before the transaction
+		g.recordCursorPositionsInHistory()
+
 		// First level: create new transaction state
 		g.transaction = &TransactionState{
 			depth:                 1,
@@ -1629,6 +1633,21 @@ func (g *Garland) byteToRuneInternal(bytePos int64) (int64, error) {
 	return result.LeafRuneStart + result.RuneOffset, nil
 }
 
+// byteToRuneInternalUnlocked is the unlocked version for use when caller already holds the lock.
+func (g *Garland) byteToRuneInternalUnlocked(bytePos int64) (int64, error) {
+	if bytePos == 0 {
+		return 0, nil
+	}
+
+	result, err := g.findLeafByByteUnlocked(bytePos)
+	if err != nil {
+		return 0, err
+	}
+
+	// Absolute rune position = leaf's rune start + rune offset within leaf
+	return result.LeafRuneStart + result.RuneOffset, nil
+}
+
 func (g *Garland) runeToByteInternal(runePos int64) (int64, error) {
 	if runePos == 0 {
 		return 0, nil
@@ -1649,6 +1668,40 @@ func (g *Garland) byteToLineRuneInternal(bytePos int64) (int64, int64, error) {
 	}
 
 	result, err := g.findLeafByByte(bytePos)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// Find which line within the leaf
+	snap := result.Snapshot
+	line := int64(0)
+	lineRuneStart := int64(0)
+
+	// Find the line that contains our byte offset
+	for i := len(snap.lineStarts) - 1; i >= 0; i-- {
+		if snap.lineStarts[i].ByteOffset <= result.ByteOffset {
+			line = int64(i)
+			lineRuneStart = snap.lineStarts[i].RuneOffset
+			break
+		}
+	}
+
+	// Calculate absolute line number
+	absoluteLine := g.countLinesBeforeLeaf(result.LeafByteStart) + line
+
+	// Calculate rune position within the line
+	runeInLine := result.RuneOffset - lineRuneStart
+
+	return absoluteLine, runeInLine, nil
+}
+
+// byteToLineRuneInternalUnlocked is the unlocked version for use when caller already holds the lock.
+func (g *Garland) byteToLineRuneInternalUnlocked(bytePos int64) (int64, int64, error) {
+	if bytePos == 0 {
+		return 0, 0, nil
+	}
+
+	result, err := g.findLeafByByteUnlocked(bytePos)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -1736,6 +1789,12 @@ func (g *Garland) insertBytesAt(c *Cursor, pos int64, data []byte, decorations [
 		return ChangeResult{}, ErrInvalidPosition
 	}
 
+	// Record cursor positions BEFORE any changes (for undo history)
+	// Only if not in transaction (transactions record at TransactionStart)
+	if g.transaction == nil {
+		g.recordCursorPositionsInHistory()
+	}
+
 	// Perform the insertion by recursively rebuilding the tree
 	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
 	if rootSnap == nil {
@@ -1793,6 +1852,11 @@ func (g *Garland) deleteBytesAt(c *Cursor, pos int64, length int64, includeLineD
 		return nil, ChangeResult{}, ErrInvalidPosition
 	}
 
+	// Record cursor positions BEFORE any changes (for undo history)
+	if g.transaction == nil {
+		g.recordCursorPositionsInHistory()
+	}
+
 	// Clamp length to available data
 	if pos+length > g.totalBytes {
 		length = g.totalBytes - pos
@@ -1837,9 +1901,9 @@ func (g *Garland) deleteBytesAt(c *Cursor, pos int64, length int64, includeLineD
 			} else if cursor.bytePos > pos {
 				// Cursor is within deleted range - move to deletion point
 				cursor.bytePos = pos
-				// Recalculate other coordinates
-				cursor.runePos, _ = g.byteToRuneInternal(pos)
-				cursor.line, cursor.lineRune, _ = g.byteToLineRuneInternal(pos)
+				// Recalculate other coordinates (use unlocked versions since we hold the lock)
+				cursor.runePos, _ = g.byteToRuneInternalUnlocked(pos)
+				cursor.line, cursor.lineRune, _ = g.byteToLineRuneInternalUnlocked(pos)
 			}
 		}
 	}
@@ -1872,6 +1936,11 @@ func (g *Garland) overwriteBytesAt(c *Cursor, pos int64, length int64, newData [
 	// Validate position
 	if pos < 0 || pos > g.totalBytes {
 		return nil, ChangeResult{}, ErrInvalidPosition
+	}
+
+	// Record cursor positions BEFORE any changes (for undo history)
+	if g.transaction == nil {
+		g.recordCursorPositionsInHistory()
 	}
 
 	// Clamp length to available data
@@ -1955,8 +2024,9 @@ func (g *Garland) overwriteBytesAt(c *Cursor, pos int64, length int64, newData [
 			} else if cursor.bytePos > pos {
 				// Cursor is within overwritten range - move to start of range
 				cursor.bytePos = pos
-				cursor.runePos, _ = g.byteToRuneInternal(pos)
-				cursor.line, cursor.lineRune, _ = g.byteToLineRuneInternal(pos)
+				// Use unlocked versions since we hold the lock
+				cursor.runePos, _ = g.byteToRuneInternalUnlocked(pos)
+				cursor.line, cursor.lineRune, _ = g.byteToLineRuneInternalUnlocked(pos)
 			}
 		}
 	}
@@ -2066,7 +2136,29 @@ func (g *Garland) recordMutation() ChangeResult {
 		StreamKnownBytes: streamKnown,
 	}
 
+	// Update cursor version tracking to new revision
+	for _, cursor := range g.cursors {
+		cursor.lastFork = g.currentFork
+		cursor.lastRevision = g.currentRevision
+	}
+
 	return ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}
+}
+
+// recordCursorPositionsInHistory records all cursor positions in their history maps.
+// Called before creating a new revision so positions can be restored on undo.
+func (g *Garland) recordCursorPositionsInHistory() {
+	key := ForkRevision{g.currentFork, g.currentRevision}
+	for _, cursor := range g.cursors {
+		// Always update position - cursor may have moved since last record
+		// This captures the position just before the mutation occurs
+		cursor.positionHistory[key] = &CursorPosition{
+			BytePos:  cursor.bytePos,
+			RunePos:  cursor.runePos,
+			Line:     cursor.line,
+			LineRune: cursor.lineRune,
+		}
+	}
 }
 
 // createForkFromCurrent creates a new fork branching from the current fork/revision.
@@ -2453,6 +2545,12 @@ func (g *Garland) Decorate(entries []DecorationEntry) (ChangeResult, error) {
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
+
+	// Record cursor positions BEFORE any changes (for undo history)
+	// Only if not in transaction (transactions record at TransactionStart)
+	if g.transaction == nil {
+		g.recordCursorPositionsInHistory()
+	}
 
 	// Separate deletions from additions/updates
 	var deletions []string
