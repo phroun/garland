@@ -674,9 +674,16 @@ func (r *REPL) cmdUndoSeek(args []string) {
 		return
 	}
 
+	g := r.garland
+
 	if len(args) < 1 {
 		fmt.Println("Usage: undoseek <revision>")
-		fmt.Printf("Current revision: %d\n", r.garland.CurrentRevision())
+		fmt.Printf("Current revision: %d\n", g.CurrentRevision())
+		// Show revision range
+		forkInfo, err := g.GetForkInfo(g.CurrentFork())
+		if err == nil {
+			fmt.Printf("Valid range: 0 to %d (highest in this fork)\n", forkInfo.HighestRevision)
+		}
 		return
 	}
 
@@ -686,13 +693,31 @@ func (r *REPL) cmdUndoSeek(args []string) {
 		return
 	}
 
-	// UndoSeek is not yet implemented in the library
-	// When implemented, it would:
-	// 1. Seek to the specified revision in the current fork
-	// 2. If you then edit, a new fork is automatically created
-	fmt.Printf("UndoSeek to revision %d not yet implemented in library\n", rev)
-	fmt.Println("When implemented: seeking to a non-HEAD revision and editing")
-	fmt.Println("will automatically create a new fork from that point.")
+	prevFork := g.CurrentFork()
+	prevRev := g.CurrentRevision()
+
+	err = g.UndoSeek(garland.RevisionID(rev))
+	if err != nil {
+		fmt.Printf("UndoSeek error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Moved from fork=%d/rev=%d to fork=%d/rev=%d\n",
+		prevFork, prevRev, g.CurrentFork(), g.CurrentRevision())
+	fmt.Printf("Content is now %d bytes\n", g.ByteCount().Value)
+
+	// Show cursor position update
+	if cursor := r.cursor(); cursor != nil {
+		line, lineRune := cursor.LinePos()
+		fmt.Printf("Cursor '%s' now at: byte=%d, line=%d:%d\n",
+			r.currentCursor, cursor.BytePos(), line, lineRune)
+	}
+
+	// Warn about fork creation on edit
+	forkInfo, err := g.GetForkInfo(g.CurrentFork())
+	if err == nil && g.CurrentRevision() < forkInfo.HighestRevision {
+		fmt.Println("Note: Editing from here will create a new fork!")
+	}
 }
 
 func (r *REPL) cmdRevisions() {
@@ -704,18 +729,27 @@ func (r *REPL) cmdRevisions() {
 	currentRev := g.CurrentRevision()
 	currentFork := g.CurrentFork()
 
-	fmt.Printf("Fork %d - Revisions:\n", currentFork)
+	// Get fork info to know the highest revision
+	forkInfo, err := g.GetForkInfo(currentFork)
+	if err != nil {
+		fmt.Printf("Error getting fork info: %v\n", err)
+		return
+	}
 
-	// Get revision range (0 to current)
-	revisions, err := g.GetRevisionRange(0, currentRev)
+	highestRev := forkInfo.HighestRevision
+
+	fmt.Printf("Fork %d - Revisions (0 to %d):\n", currentFork, highestRev)
+
+	// Get revision range (0 to highest)
+	revisions, err := g.GetRevisionRange(0, highestRev)
 	if err != nil {
 		fmt.Printf("Error getting revisions: %v\n", err)
 		return
 	}
 
 	if len(revisions) == 0 {
-		fmt.Println("  (no named revisions yet)")
-		fmt.Printf("  Current: revision %d\n", currentRev)
+		fmt.Println("  (no recorded revisions yet)")
+		fmt.Printf("  Current position: revision %d\n", currentRev)
 		return
 	}
 
@@ -734,6 +768,11 @@ func (r *REPL) cmdRevisions() {
 		}
 		fmt.Printf("%s%d: %s%s\n", marker, info.Revision, name, changes)
 	}
+
+	if currentRev < highestRev {
+		fmt.Printf("\nNote: Not at HEAD (current=%d, HEAD=%d). Editing will create a new fork.\n",
+			currentRev, highestRev)
+	}
 }
 
 func (r *REPL) cmdForks() {
@@ -741,13 +780,22 @@ func (r *REPL) cmdForks() {
 		return
 	}
 
-	// List all forks - this requires accessing the forks map
-	// which isn't currently exposed via the public API
-	// For now, show what we can
-	fmt.Println("Forks:")
-	fmt.Printf("  Current fork: %d, revision: %d\n",
-		r.garland.CurrentFork(), r.garland.CurrentRevision())
-	fmt.Println("  (Full fork listing requires ListForks API - not yet implemented)")
+	g := r.garland
+	forks := g.ListForks()
+	currentFork := g.CurrentFork()
+
+	fmt.Printf("Forks (%d total):\n", len(forks))
+	for _, info := range forks {
+		marker := "  "
+		if info.ID == currentFork {
+			marker = "> "
+		}
+		parentInfo := ""
+		if info.ParentFork != info.ID {
+			parentInfo = fmt.Sprintf(" (parent: fork=%d@rev=%d)", info.ParentFork, info.ParentRevision)
+		}
+		fmt.Printf("%s%d: highest revision %d%s\n", marker, info.ID, info.HighestRevision, parentInfo)
+	}
 }
 
 func (r *REPL) cmdForkSwitch(args []string) {
@@ -755,9 +803,12 @@ func (r *REPL) cmdForkSwitch(args []string) {
 		return
 	}
 
+	g := r.garland
+
 	if len(args) < 1 {
 		fmt.Println("Usage: forkswitch <fork_id>")
-		fmt.Printf("Current fork: %d\n", r.garland.CurrentFork())
+		fmt.Printf("Current fork: %d\n", g.CurrentFork())
+		fmt.Println("Use 'forks' to see available forks.")
 		return
 	}
 
@@ -767,11 +818,25 @@ func (r *REPL) cmdForkSwitch(args []string) {
 		return
 	}
 
-	// ForkSwitch is not yet implemented in the library
-	// When implemented, it would switch the current view to a different fork
-	fmt.Printf("ForkSwitch to fork %d not yet implemented in library\n", forkID)
-	fmt.Println("When implemented: switches to view/edit a different fork")
-	fmt.Println("The content will reflect that fork's state at its HEAD revision")
+	prevFork := g.CurrentFork()
+	prevRev := g.CurrentRevision()
+
+	err = g.ForkSeek(garland.ForkID(forkID))
+	if err != nil {
+		fmt.Printf("ForkSwitch error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Switched from fork=%d/rev=%d to fork=%d/rev=%d\n",
+		prevFork, prevRev, g.CurrentFork(), g.CurrentRevision())
+	fmt.Printf("Content is now %d bytes\n", g.ByteCount().Value)
+
+	// Show cursor position update
+	if cursor := r.cursor(); cursor != nil {
+		line, lineRune := cursor.LinePos()
+		fmt.Printf("Cursor '%s' now at: byte=%d, line=%d:%d\n",
+			r.currentCursor, cursor.BytePos(), line, lineRune)
+	}
 }
 
 func (r *REPL) cmdVersion() {

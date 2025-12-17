@@ -493,11 +493,12 @@ func (g *Garland) TransactionCommit() (ChangeResult, error) {
 		}
 	}
 
-	// Store revision info for undo history
+	// Store revision info for undo history with current root ID
 	g.revisionInfo[ForkRevision{g.currentFork, g.currentRevision}] = &RevisionInfo{
 		Revision:   g.currentRevision,
 		Name:       g.transaction.name,
 		HasChanges: g.transaction.hasMutations,
+		RootID:     g.root.id,
 	}
 
 	result := ChangeResult{
@@ -545,6 +546,255 @@ func (g *Garland) GetRevisionRange(start, end RevisionID) ([]RevisionInfo, error
 		}
 	}
 	return result, nil
+}
+
+// UndoSeek navigates to a specific revision within the current fork.
+// Cannot seek forward past the highest revision in this fork.
+// Seeking backwards then making a change creates a new fork.
+func (g *Garland) UndoSeek(revision RevisionID) error {
+	// Block during transactions
+	if g.transaction != nil {
+		return ErrTransactionPending
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// Get current fork info
+	forkInfo, ok := g.forks[g.currentFork]
+	if !ok {
+		return ErrForkNotFound
+	}
+
+	// Validate revision is within this fork's range
+	if revision > forkInfo.HighestRevision {
+		return ErrRevisionNotFound
+	}
+
+	// If already at this revision, nothing to do
+	if revision == g.currentRevision {
+		return nil
+	}
+
+	// Get revision info to restore the correct root
+	revInfo, ok := g.revisionInfo[ForkRevision{g.currentFork, revision}]
+	if !ok {
+		// Try to find the closest revision info going back
+		for r := revision; r >= 0; r-- {
+			if info, exists := g.revisionInfo[ForkRevision{g.currentFork, r}]; exists {
+				revInfo = info
+				break
+			}
+		}
+		if revInfo == nil {
+			return ErrRevisionNotFound
+		}
+	}
+
+	// Restore the root to what it was at this revision
+	if revInfo.RootID != 0 {
+		if rootNode, ok := g.nodeRegistry[revInfo.RootID]; ok {
+			g.root = rootNode
+		}
+	}
+
+	// Update current revision
+	g.currentRevision = revision
+
+	// Update counts from the root snapshot at this revision
+	g.updateCountsFromRoot()
+
+	// Restore cursor positions if they have recorded positions for this version
+	for _, cursor := range g.cursors {
+		if pos, ok := cursor.positionHistory[ForkRevision{g.currentFork, revision}]; ok {
+			cursor.restorePosition(pos)
+		} else {
+			// Cursor didn't exist at this revision or hasn't moved since - clamp to valid range
+			if cursor.bytePos > g.totalBytes {
+				cursor.bytePos = g.totalBytes
+				// Recalculate other coordinates
+				cursor.runePos = g.totalRunes
+				cursor.line = g.totalLines
+				cursor.lineRune = 0
+			}
+		}
+		// Update cursor's last known fork/revision
+		cursor.lastFork = g.currentFork
+		cursor.lastRevision = g.currentRevision
+	}
+
+	return nil
+}
+
+// ForkSeek switches to a different fork.
+// Retains current revision if it exists in both forks,
+// otherwise retreats to the last common revision.
+func (g *Garland) ForkSeek(fork ForkID) error {
+	// Block during transactions
+	if g.transaction != nil {
+		return ErrTransactionPending
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// Validate fork exists
+	targetForkInfo, ok := g.forks[fork]
+	if !ok {
+		return ErrForkNotFound
+	}
+
+	// If already on this fork, nothing to do
+	if fork == g.currentFork {
+		return nil
+	}
+
+	// Find the revision to use in the target fork
+	// If current revision exists in target fork (it's a common ancestor), use it
+	// Otherwise, find the common ancestor
+	targetRevision := g.findCommonRevision(g.currentFork, g.currentRevision, fork)
+
+	// Clamp to target fork's highest revision
+	if targetRevision > targetForkInfo.HighestRevision {
+		targetRevision = targetForkInfo.HighestRevision
+	}
+
+	// Get revision info to restore the correct root
+	revInfo, ok := g.revisionInfo[ForkRevision{fork, targetRevision}]
+	if !ok {
+		// Try to find the closest revision info going back
+		for r := targetRevision; r >= 0; r-- {
+			if info, exists := g.revisionInfo[ForkRevision{fork, r}]; exists {
+				revInfo = info
+				break
+			}
+		}
+	}
+
+	// Restore the root if we found revision info
+	if revInfo != nil && revInfo.RootID != 0 {
+		if rootNode, ok := g.nodeRegistry[revInfo.RootID]; ok {
+			g.root = rootNode
+		}
+	}
+
+	// Switch to the new fork and revision
+	g.currentFork = fork
+	g.currentRevision = targetRevision
+
+	// Update counts from the root snapshot at this version
+	g.updateCountsFromRoot()
+
+	// Update cursor positions
+	for _, cursor := range g.cursors {
+		if pos, ok := cursor.positionHistory[ForkRevision{fork, targetRevision}]; ok {
+			cursor.restorePosition(pos)
+		} else {
+			// Clamp cursor to valid range
+			if cursor.bytePos > g.totalBytes {
+				cursor.bytePos = g.totalBytes
+				cursor.runePos = g.totalRunes
+				cursor.line = g.totalLines
+				cursor.lineRune = 0
+			}
+		}
+		cursor.lastFork = fork
+		cursor.lastRevision = targetRevision
+	}
+
+	return nil
+}
+
+// GetForkInfo returns information about a specific fork.
+func (g *Garland) GetForkInfo(fork ForkID) (*ForkInfo, error) {
+	forkInfo, ok := g.forks[fork]
+	if !ok {
+		return nil, ErrForkNotFound
+	}
+	return forkInfo, nil
+}
+
+// ListForks returns information about all forks.
+func (g *Garland) ListForks() []ForkInfo {
+	result := make([]ForkInfo, 0, len(g.forks))
+	for _, info := range g.forks {
+		result = append(result, *info)
+	}
+	return result
+}
+
+// isAtHead returns true if the current revision is the highest in this fork.
+func (g *Garland) isAtHead() bool {
+	forkInfo, ok := g.forks[g.currentFork]
+	if !ok {
+		return true // shouldn't happen, but default to head behavior
+	}
+	return g.currentRevision >= forkInfo.HighestRevision
+}
+
+// findCommonRevision finds a common revision between two forks.
+// Returns the revision in the target fork that corresponds to the source position.
+func (g *Garland) findCommonRevision(sourceFork ForkID, sourceRev RevisionID, targetFork ForkID) RevisionID {
+	// Walk up the ancestry of both forks to find common ancestor
+	// For now, simple approach: if target fork is descendant of source, use sourceRev
+	// If source fork is descendant of target, find where source forked from target
+
+	targetInfo := g.forks[targetFork]
+
+	// Check if target fork descended from source fork
+	current := targetFork
+	for current != 0 {
+		info := g.forks[current]
+		if info.ParentFork == sourceFork {
+			// Target descended from source at info.ParentRevision
+			if sourceRev <= info.ParentRevision {
+				return sourceRev
+			}
+			return info.ParentRevision
+		}
+		if current == info.ParentFork {
+			break // reached root
+		}
+		current = info.ParentFork
+	}
+
+	// Check if source fork descended from target fork
+	sourceInfo := g.forks[sourceFork]
+	current = sourceFork
+	for current != 0 {
+		info := g.forks[current]
+		if info.ParentFork == targetFork {
+			// Source descended from target at info.ParentRevision
+			return info.ParentRevision
+		}
+		if current == info.ParentFork {
+			break
+		}
+		current = info.ParentFork
+	}
+
+	// Both forks share a common ancestor - find it
+	// Use targetInfo's parent revision as a safe fallback
+	if targetInfo.ParentFork == sourceInfo.ParentFork {
+		// Siblings - use the earlier of the two divergence points
+		if targetInfo.ParentRevision < sourceInfo.ParentRevision {
+			return targetInfo.ParentRevision
+		}
+		return sourceInfo.ParentRevision
+	}
+
+	// Default: start of target fork
+	return 0
+}
+
+// updateCountsFromRoot updates totalBytes/Runes/Lines from the root snapshot.
+func (g *Garland) updateCountsFromRoot() {
+	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
+	if rootSnap != nil {
+		g.totalBytes = rootSnap.byteCount
+		g.totalRunes = rootSnap.runeCount
+		g.totalLines = rootSnap.lineCount
+	}
 }
 
 // snapshotCursorPositions creates a snapshot of all cursor positions.
@@ -613,6 +863,14 @@ func (g *Garland) buildInitialTree(data []byte) {
 	g.totalRunes = snap.runeCount
 	g.totalLines = snap.lineCount
 	g.countComplete = true
+
+	// Record initial revision (revision 0 with the initial tree)
+	g.revisionInfo[ForkRevision{0, 0}] = &RevisionInfo{
+		Revision:   0,
+		Name:       "(initial)",
+		HasChanges: false,
+		RootID:     g.root.id,
+	}
 }
 
 func (g *Garland) buildEmptyTree() {
@@ -1003,14 +1261,28 @@ func (g *Garland) truncateAt(c *Cursor, pos int64) (ChangeResult, error) {
 // recordMutation handles versioning after a mutation.
 // If in a transaction, marks it as having mutations.
 // Otherwise, creates a new revision.
+// If not at HEAD revision, creates a new fork first.
 func (g *Garland) recordMutation() ChangeResult {
 	if g.transaction != nil {
-		// In transaction - mark as having mutations but don't bump revision yet
+		// In transaction - check if we need to fork
+		if !g.isAtHead() && !g.transaction.hasMutations {
+			// First mutation in this transaction while not at HEAD - create fork
+			g.createForkFromCurrent()
+			// Update pending revision to 1 (first revision in new fork)
+			g.transaction.pendingRevision = 1
+		}
+		// Mark as having mutations
 		g.transaction.hasMutations = true
 		return ChangeResult{Fork: g.currentFork, Revision: g.transaction.pendingRevision}
 	}
 
-	// Not in transaction - create implicit single-operation revision
+	// Not in transaction - check if we need to fork first
+	if !g.isAtHead() {
+		g.createForkFromCurrent()
+		// After forking, we're at revision 0 of new fork, increment to 1
+	}
+
+	// Create new revision
 	g.currentRevision++
 	if forkInfo, ok := g.forks[g.currentFork]; ok {
 		if g.currentRevision > forkInfo.HighestRevision {
@@ -1018,14 +1290,39 @@ func (g *Garland) recordMutation() ChangeResult {
 		}
 	}
 
-	// Store revision info (unnamed)
+	// Store revision info (unnamed) with current root ID
 	g.revisionInfo[ForkRevision{g.currentFork, g.currentRevision}] = &RevisionInfo{
 		Revision:   g.currentRevision,
 		Name:       "",
 		HasChanges: true,
+		RootID:     g.root.id,
 	}
 
 	return ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}
+}
+
+// createForkFromCurrent creates a new fork branching from the current fork/revision.
+func (g *Garland) createForkFromCurrent() {
+	g.nextForkID++
+	newForkID := g.nextForkID
+
+	// Create new fork info
+	g.forks[newForkID] = &ForkInfo{
+		ID:              newForkID,
+		ParentFork:      g.currentFork,
+		ParentRevision:  g.currentRevision,
+		HighestRevision: 0, // will be incremented by recordMutation
+	}
+
+	// Switch to the new fork
+	g.currentFork = newForkID
+	g.currentRevision = 0
+
+	// Update cursor tracking
+	for _, cursor := range g.cursors {
+		cursor.lastFork = newForkID
+		cursor.lastRevision = 0
+	}
 }
 
 // Read operations

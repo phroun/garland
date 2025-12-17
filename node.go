@@ -274,4 +274,5 @@ type RevisionInfo struct {
 	Revision   RevisionID
 	Name       string // from TransactionStart
 	HasChanges bool   // true if actual mutations occurred
+	RootID     NodeID // root node ID at this revision (for UndoSeek)
 }

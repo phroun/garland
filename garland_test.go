@@ -319,3 +319,192 @@ func TestAbsoluteAddress(t *testing.T) {
 		t.Error("LineAddress incorrect")
 	}
 }
+
+func TestUndoSeek(t *testing.T) {
+	lib, err := Init(LibraryOptions{})
+	if err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	g, err := lib.Open(FileOptions{DataString: "Hello World"})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer g.Close()
+
+	// Check initial state
+	if g.CurrentRevision() != 0 {
+		t.Errorf("Expected initial revision 0, got %d", g.CurrentRevision())
+	}
+	if g.ByteCount().Value != 11 {
+		t.Errorf("Expected 11 bytes, got %d", g.ByteCount().Value)
+	}
+
+	// Make a change
+	cursor := g.NewCursor()
+	_, err = cursor.InsertString("MORE", nil, false)
+	if err != nil {
+		t.Fatalf("Insert failed: %v", err)
+	}
+
+	// Check after insert
+	if g.CurrentRevision() != 1 {
+		t.Errorf("Expected revision 1, got %d", g.CurrentRevision())
+	}
+	if g.ByteCount().Value != 15 {
+		t.Errorf("Expected 15 bytes after insert, got %d", g.ByteCount().Value)
+	}
+
+	// UndoSeek back to revision 0
+	err = g.UndoSeek(0)
+	if err != nil {
+		t.Fatalf("UndoSeek failed: %v", err)
+	}
+
+	// Check after undo
+	if g.CurrentRevision() != 0 {
+		t.Errorf("Expected revision 0 after undo, got %d", g.CurrentRevision())
+	}
+	if g.ByteCount().Value != 11 {
+		t.Errorf("Expected 11 bytes after undo, got %d", g.ByteCount().Value)
+	}
+
+	// Read content to verify
+	cursor.SeekByte(0)
+	data, err := cursor.ReadBytes(g.ByteCount().Value)
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	if string(data) != "Hello World" {
+		t.Errorf("Expected 'Hello World', got '%s'", string(data))
+	}
+}
+
+func TestForkCreation(t *testing.T) {
+	lib, err := Init(LibraryOptions{})
+	if err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	g, err := lib.Open(FileOptions{DataString: "Hello"})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer g.Close()
+
+	// Make a change to create revision 1
+	cursor := g.NewCursor()
+	_, err = cursor.InsertString("X", nil, false)
+	if err != nil {
+		t.Fatalf("Insert failed: %v", err)
+	}
+
+	// Go back to revision 0
+	err = g.UndoSeek(0)
+	if err != nil {
+		t.Fatalf("UndoSeek failed: %v", err)
+	}
+
+	// Make a different change - should create a new fork
+	_, err = cursor.InsertString("Y", nil, false)
+	if err != nil {
+		t.Fatalf("Insert failed: %v", err)
+	}
+
+	// Should now be on fork 1
+	if g.CurrentFork() != 1 {
+		t.Errorf("Expected fork 1, got %d", g.CurrentFork())
+	}
+
+	// Read content
+	cursor.SeekByte(0)
+	data, err := cursor.ReadBytes(g.ByteCount().Value)
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	if string(data) != "YHello" {
+		t.Errorf("Expected 'YHello', got '%s'", string(data))
+	}
+
+	// Switch back to fork 0
+	err = g.ForkSeek(0)
+	if err != nil {
+		t.Fatalf("ForkSeek failed: %v", err)
+	}
+
+	// Check we're on fork 0 revision 0 (common ancestor)
+	if g.CurrentFork() != 0 {
+		t.Errorf("Expected fork 0, got %d", g.CurrentFork())
+	}
+
+	// Read content at fork 0
+	cursor.SeekByte(0)
+	data, err = cursor.ReadBytes(g.ByteCount().Value)
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	if string(data) != "Hello" {
+		t.Errorf("Expected 'Hello' on fork 0, got '%s'", string(data))
+	}
+}
+
+func TestForkSeek(t *testing.T) {
+	lib, err := Init(LibraryOptions{})
+	if err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	g, err := lib.Open(FileOptions{DataString: "Base"})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer g.Close()
+
+	cursor := g.NewCursor()
+
+	// Create fork 0 revision 1: "ABase"
+	cursor.SeekByte(0)
+	_, err = cursor.InsertString("A", nil, false)
+	if err != nil {
+		t.Fatalf("Insert A failed: %v", err)
+	}
+
+	// Go back and create fork 1: "BBase"
+	err = g.UndoSeek(0)
+	if err != nil {
+		t.Fatalf("UndoSeek failed: %v", err)
+	}
+	cursor.SeekByte(0)
+	_, err = cursor.InsertString("B", nil, false)
+	if err != nil {
+		t.Fatalf("Insert B failed: %v", err)
+	}
+
+	// Verify we're on fork 1 with "BBase"
+	if g.CurrentFork() != 1 {
+		t.Errorf("Expected fork 1, got %d", g.CurrentFork())
+	}
+	cursor.SeekByte(0)
+	data, _ := cursor.ReadBytes(g.ByteCount().Value)
+	if string(data) != "BBase" {
+		t.Errorf("Expected 'BBase', got '%s'", string(data))
+	}
+
+	// Switch to fork 0 revision 1 (should have "ABase")
+	err = g.ForkSeek(0)
+	if err != nil {
+		t.Fatalf("ForkSeek to 0 failed: %v", err)
+	}
+	
+	// Need to seek to revision 1 in fork 0 to see "ABase"
+	err = g.UndoSeek(1)
+	if err != nil {
+		t.Fatalf("UndoSeek to rev 1 failed: %v", err)
+	}
+
+	cursor.SeekByte(0)
+	data, _ = cursor.ReadBytes(g.ByteCount().Value)
+	if string(data) != "ABase" {
+		t.Errorf("Expected 'ABase' on fork 0 rev 1, got '%s'", string(data))
+	}
+}
