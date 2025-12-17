@@ -39,6 +39,9 @@ type FileSystemInterface interface {
 	BlockChecksum(handle FileHandle, start, length int64) ([]byte, error)
 	WriteBytes(handle FileHandle, data []byte) error
 	Truncate(handle FileHandle, size int64) error
+
+	// Convenience method for writing entire files
+	WriteFile(name string, data []byte) error
 }
 
 // localFileHandle wraps an os.File for the local file system.
@@ -150,6 +153,10 @@ func (fs *localFileSystem) Truncate(handle FileHandle, size int64) error {
 		return ErrFileNotOpen
 	}
 	return h.file.Truncate(size)
+}
+
+func (fs *localFileSystem) WriteFile(name string, data []byte) error {
+	return os.WriteFile(name, data, 0644)
 }
 
 // fileColdStorage implements ColdStorageInterface using the local file system.

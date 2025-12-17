@@ -630,3 +630,199 @@ func TestCursorPositionAcrossVersions(t *testing.T) {
 	}
 	t.Logf("After UndoSeek, cursor at: %d (content: %d bytes)", cursor.BytePos(), g.ByteCount().Value)
 }
+
+// TestFindForksBetween tests the FindForksBetween function for fork analysis
+func TestFindForksBetween(t *testing.T) {
+	lib, err := Init(LibraryOptions{})
+	if err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	t.Run("no forks in range", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "Test"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		cursor := g.NewCursor()
+		cursor.InsertString("A", nil, false)
+		cursor.InsertString("B", nil, false)
+
+		// Query range with no fork divergences
+		divergences, err := g.FindForksBetween(0, 2)
+		if err != nil {
+			t.Fatalf("FindForksBetween failed: %v", err)
+		}
+
+		if len(divergences) != 0 {
+			t.Errorf("Expected 0 divergences, got %d", len(divergences))
+		}
+		t.Log("Correctly found no divergences in simple linear history")
+	})
+
+	t.Run("child fork BranchedInto", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "Test"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		cursor := g.NewCursor()
+
+		// Create revisions 1, 2, 3 on fork 0
+		cursor.InsertString("A", nil, false) // rev 1
+		cursor.InsertString("B", nil, false) // rev 2
+		cursor.InsertString("C", nil, false) // rev 3
+
+		// Go back to rev 1 and create a new fork
+		err = g.UndoSeek(1)
+		if err != nil {
+			t.Fatalf("UndoSeek failed: %v", err)
+		}
+
+		cursor.InsertString("X", nil, false) // Creates fork 1, rev 2
+
+		// Return to fork 0
+		err = g.ForkSeek(0)
+		if err != nil {
+			t.Fatalf("ForkSeek failed: %v", err)
+		}
+
+		// From fork 0's perspective, find divergences in range [0, 3]
+		divergences, err := g.FindForksBetween(0, 3)
+		if err != nil {
+			t.Fatalf("FindForksBetween failed: %v", err)
+		}
+
+		if len(divergences) != 1 {
+			t.Errorf("Expected 1 divergence, got %d", len(divergences))
+		}
+
+		if len(divergences) > 0 {
+			d := divergences[0]
+			if d.Fork != 1 {
+				t.Errorf("Expected fork 1, got %d", d.Fork)
+			}
+			if d.DivergenceRev != 1 {
+				t.Errorf("Expected divergence at rev 1, got %d", d.DivergenceRev)
+			}
+			if d.Direction != BranchedInto {
+				t.Errorf("Expected BranchedInto, got %v", d.Direction)
+			}
+			t.Logf("Found divergence: fork=%d at rev=%d direction=%v", d.Fork, d.DivergenceRev, d.Direction)
+		}
+	})
+
+	t.Run("parent fork BranchedFrom", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "Test"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		cursor := g.NewCursor()
+
+		// Create revisions on fork 0
+		cursor.InsertString("A", nil, false) // rev 1
+		cursor.InsertString("B", nil, false) // rev 2
+
+		t.Logf("After creating fork 0: fork=%d, rev=%d", g.CurrentFork(), g.CurrentRevision())
+
+		// Go back and create fork 1
+		err = g.UndoSeek(1)
+		if err != nil {
+			t.Fatalf("UndoSeek failed: %v", err)
+		}
+
+		cursor.InsertString("X", nil, false) // Fork 1, rev 2
+		cursor.InsertString("Y", nil, false) // Fork 1, rev 3
+
+		t.Logf("After creating fork 1: fork=%d, rev=%d", g.CurrentFork(), g.CurrentRevision())
+
+		// We are now on fork 1
+		if g.CurrentFork() != 1 {
+			t.Fatalf("Expected fork 1, got %d", g.CurrentFork())
+		}
+
+		// Get fork info
+		forkInfo, _ := g.GetForkInfo(1)
+		t.Logf("Fork 1 info: highest=%d, parent=%d, parentRev=%d", forkInfo.HighestRevision, forkInfo.ParentFork, forkInfo.ParentRevision)
+
+		// From fork 1's perspective, find divergences
+		// This should show we BranchedFrom fork 0 at rev 1
+		divergences, err := g.FindForksBetween(0, forkInfo.HighestRevision)
+		if err != nil {
+			t.Fatalf("FindForksBetween failed: %v", err)
+		}
+
+		if len(divergences) != 1 {
+			t.Errorf("Expected 1 divergence, got %d", len(divergences))
+		}
+
+		if len(divergences) > 0 {
+			d := divergences[0]
+			if d.Fork != 0 {
+				t.Errorf("Expected parent fork 0, got %d", d.Fork)
+			}
+			if d.DivergenceRev != 1 {
+				t.Errorf("Expected divergence at rev 1, got %d", d.DivergenceRev)
+			}
+			if d.Direction != BranchedFrom {
+				t.Errorf("Expected BranchedFrom, got %v", d.Direction)
+			}
+			t.Logf("Found divergence: fork=%d at rev=%d direction=%v", d.Fork, d.DivergenceRev, d.Direction)
+		}
+	})
+
+	t.Run("multiple divergences", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "Test"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		cursor := g.NewCursor()
+
+		// Create revisions on fork 0
+		cursor.InsertString("A", nil, false) // rev 1
+		cursor.InsertString("B", nil, false) // rev 2
+		cursor.InsertString("C", nil, false) // rev 3
+		cursor.InsertString("D", nil, false) // rev 4
+
+		// Create fork 1 from rev 1
+		g.UndoSeek(1)
+		cursor.InsertString("X1", nil, false) // fork 1
+
+		// Go back to fork 0
+		g.ForkSeek(0)
+
+		// Create fork 2 from rev 3
+		g.UndoSeek(3)
+		cursor.InsertString("X2", nil, false) // fork 2
+
+		// Go back to fork 0
+		g.ForkSeek(0)
+
+		// From fork 0, find all divergences in [0, 4]
+		divergences, err := g.FindForksBetween(0, 4)
+		if err != nil {
+			t.Fatalf("FindForksBetween failed: %v", err)
+		}
+
+		if len(divergences) != 2 {
+			t.Errorf("Expected 2 divergences, got %d", len(divergences))
+		}
+
+		// Should be sorted by revision
+		for i, d := range divergences {
+			t.Logf("Divergence %d: fork=%d at rev=%d direction=%v", i, d.Fork, d.DivergenceRev, d.Direction)
+		}
+
+		if len(divergences) >= 2 {
+			if divergences[0].DivergenceRev > divergences[1].DivergenceRev {
+				t.Error("Expected divergences sorted by revision")
+			}
+		}
+	})
+}

@@ -134,6 +134,23 @@ type CountResult struct {
 	Complete bool // true if EOF has been reached
 }
 
+// DivergenceDirection indicates the relationship of a fork to the current fork.
+type DivergenceDirection int
+
+const (
+	// BranchedFrom means the current fork split off from the specified fork.
+	BranchedFrom DivergenceDirection = iota
+	// BranchedInto means the specified fork split off from the current fork.
+	BranchedInto
+)
+
+// ForkDivergence describes where a fork split occurred.
+type ForkDivergence struct {
+	Fork          ForkID
+	DivergenceRev RevisionID          // revision at which split occurred
+	Direction     DivergenceDirection // relationship to current fork
+}
+
 // DecorationCacheEntry is a hint for finding a decoration quickly.
 type DecorationCacheEntry struct {
 	NodeID         NodeID
@@ -709,6 +726,71 @@ func (g *Garland) ListForks() []ForkInfo {
 	return result
 }
 
+// FindForksBetween returns all fork divergence points between two revisions
+// from the perspective of the current fork.
+func (g *Garland) FindForksBetween(revisionFirst, revisionLast RevisionID) ([]ForkDivergence, error) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	if revisionFirst > revisionLast {
+		revisionFirst, revisionLast = revisionLast, revisionFirst
+	}
+
+	currentForkInfo := g.forks[g.currentFork]
+	if currentForkInfo == nil {
+		return nil, ErrForkNotFound
+	}
+
+	// Validate revision range
+	if revisionLast > currentForkInfo.HighestRevision {
+		return nil, ErrRevisionNotFound
+	}
+
+	var divergences []ForkDivergence
+
+	// Find child forks that branched from current fork in the range
+	for forkID, forkInfo := range g.forks {
+		if forkID == g.currentFork {
+			continue
+		}
+
+		// Check if this fork branched off from the current fork
+		if forkInfo.ParentFork == g.currentFork {
+			// Check if the divergence point is within our range
+			if forkInfo.ParentRevision >= revisionFirst && forkInfo.ParentRevision <= revisionLast {
+				divergences = append(divergences, ForkDivergence{
+					Fork:          forkID,
+					DivergenceRev: forkInfo.ParentRevision,
+					Direction:     BranchedInto, // This fork split off from current
+				})
+			}
+		}
+	}
+
+	// If current fork has a parent, check if we branched from it within the range
+	if currentForkInfo.ParentFork != g.currentFork {
+		// Check if current fork's branching point is within the range
+		if currentForkInfo.ParentRevision >= revisionFirst && currentForkInfo.ParentRevision <= revisionLast {
+			divergences = append(divergences, ForkDivergence{
+				Fork:          currentForkInfo.ParentFork,
+				DivergenceRev: currentForkInfo.ParentRevision,
+				Direction:     BranchedFrom, // Current fork split from parent
+			})
+		}
+	}
+
+	// Sort by revision
+	for i := 0; i < len(divergences)-1; i++ {
+		for j := i + 1; j < len(divergences); j++ {
+			if divergences[j].DivergenceRev < divergences[i].DivergenceRev {
+				divergences[i], divergences[j] = divergences[j], divergences[i]
+			}
+		}
+	}
+
+	return divergences, nil
+}
+
 // isAtHead returns true if the current revision is the highest in this fork.
 func (g *Garland) isAtHead() bool {
 	forkInfo, ok := g.forks[g.currentFork]
@@ -1004,6 +1086,38 @@ func (g *Garland) waitForLine(line int64) error {
 }
 
 // Address conversion functions
+
+// ByteToRune converts a byte position to a rune position.
+func (g *Garland) ByteToRune(bytePos int64) (int64, error) {
+	if bytePos < 0 {
+		return 0, ErrInvalidPosition
+	}
+	return g.byteToRuneInternal(bytePos)
+}
+
+// RuneToByte converts a rune position to a byte position.
+func (g *Garland) RuneToByte(runePos int64) (int64, error) {
+	if runePos < 0 {
+		return 0, ErrInvalidPosition
+	}
+	return g.runeToByteInternal(runePos)
+}
+
+// LineRuneToByte converts a line:rune position to a byte position.
+func (g *Garland) LineRuneToByte(line, runeInLine int64) (int64, error) {
+	if line < 0 || runeInLine < 0 {
+		return 0, ErrInvalidPosition
+	}
+	return g.lineRuneToByteInternal(line, runeInLine)
+}
+
+// ByteToLineRune converts a byte position to a line:rune position.
+func (g *Garland) ByteToLineRune(bytePos int64) (line, runeInLine int64, err error) {
+	if bytePos < 0 {
+		return 0, 0, ErrInvalidPosition
+	}
+	return g.byteToLineRuneInternal(bytePos)
+}
 
 func (g *Garland) byteToRuneInternal(bytePos int64) (int64, error) {
 	if bytePos == 0 {
@@ -1607,6 +1721,242 @@ func (g *Garland) Decorate(entries []DecorationEntry) (ChangeResult, error) {
 	}
 
 	return ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}, nil
+}
+
+// GetDecorationPosition returns the current position of a decoration by key.
+func (g *Garland) GetDecorationPosition(key string) (AbsoluteAddress, error) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
+	if rootSnap == nil {
+		return AbsoluteAddress{}, ErrDecorationNotFound
+	}
+
+	bytePos, found := g.findDecorationByKeyInternal(g.root, rootSnap, key, 0)
+	if !found {
+		return AbsoluteAddress{}, ErrDecorationNotFound
+	}
+
+	return ByteAddress(bytePos), nil
+}
+
+// findDecorationByKeyInternal recursively searches for a decoration by key.
+// Returns the absolute byte position and whether it was found.
+func (g *Garland) findDecorationByKeyInternal(node *Node, snap *NodeSnapshot, key string, offset int64) (int64, bool) {
+	if snap == nil {
+		return 0, false
+	}
+
+	if snap.isLeaf {
+		for _, d := range snap.decorations {
+			if d.Key == key {
+				return offset + d.Position, true
+			}
+		}
+		return 0, false
+	}
+
+	// Internal node - search both children
+	leftNode := g.nodeRegistry[snap.leftID]
+	leftSnap := leftNode.snapshotAt(g.currentFork, g.currentRevision)
+
+	if pos, found := g.findDecorationByKeyInternal(leftNode, leftSnap, key, offset); found {
+		return pos, true
+	}
+
+	rightNode := g.nodeRegistry[snap.rightID]
+	rightSnap := rightNode.snapshotAt(g.currentFork, g.currentRevision)
+
+	return g.findDecorationByKeyInternal(rightNode, rightSnap, key, offset+leftSnap.byteCount)
+}
+
+// GetDecorationsInByteRange returns all decorations within [start, end).
+func (g *Garland) GetDecorationsInByteRange(start, end int64) ([]DecorationEntry, error) {
+	if start < 0 || end < start {
+		return nil, ErrInvalidPosition
+	}
+
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	if start > g.totalBytes {
+		return nil, ErrInvalidPosition
+	}
+	if end > g.totalBytes {
+		end = g.totalBytes
+	}
+
+	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
+	if rootSnap == nil {
+		return nil, nil
+	}
+
+	var result []DecorationEntry
+	g.collectDecorationsInRangeInternal(g.root, rootSnap, start, end, 0, &result)
+	return result, nil
+}
+
+// collectDecorationsInRangeInternal recursively collects decorations in the given byte range.
+func (g *Garland) collectDecorationsInRangeInternal(node *Node, snap *NodeSnapshot, start, end, offset int64, result *[]DecorationEntry) {
+	if snap == nil {
+		return
+	}
+
+	nodeEnd := offset + snap.byteCount
+
+	// Skip if this node is entirely outside the range
+	if nodeEnd <= start || offset >= end {
+		return
+	}
+
+	if snap.isLeaf {
+		for _, d := range snap.decorations {
+			absPos := offset + d.Position
+			if absPos >= start && absPos < end {
+				addr := ByteAddress(absPos)
+				*result = append(*result, DecorationEntry{
+					Key:     d.Key,
+					Address: &addr,
+				})
+			}
+		}
+		return
+	}
+
+	// Internal node - recurse into children
+	leftNode := g.nodeRegistry[snap.leftID]
+	leftSnap := leftNode.snapshotAt(g.currentFork, g.currentRevision)
+
+	g.collectDecorationsInRangeInternal(leftNode, leftSnap, start, end, offset, result)
+
+	rightNode := g.nodeRegistry[snap.rightID]
+	rightSnap := rightNode.snapshotAt(g.currentFork, g.currentRevision)
+
+	g.collectDecorationsInRangeInternal(rightNode, rightSnap, start, end, offset+leftSnap.byteCount, result)
+}
+
+// GetDecorationsOnLine returns all decorations on the specified line.
+func (g *Garland) GetDecorationsOnLine(line int64) ([]DecorationEntry, error) {
+	if line < 0 {
+		return nil, ErrInvalidPosition
+	}
+
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	if line > g.totalLines {
+		return nil, ErrInvalidPosition
+	}
+
+	// Find byte range for this line
+	lineResult, err := g.findLeafByLineUnlocked(line, 0)
+	if err != nil {
+		return nil, err
+	}
+	lineStart := lineResult.LineByteStart
+
+	// Find end of line (next newline or EOF)
+	lineEnd := g.findLineEndUnlocked(lineStart)
+
+	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
+	if rootSnap == nil {
+		return nil, nil
+	}
+
+	var result []DecorationEntry
+	g.collectDecorationsInRangeInternal(g.root, rootSnap, lineStart, lineEnd, 0, &result)
+	return result, nil
+}
+
+// findLineEndUnlocked finds the byte position of the end of the line.
+// Caller must hold at least a read lock.
+func (g *Garland) findLineEndUnlocked(lineStart int64) int64 {
+	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
+	if rootSnap == nil {
+		return lineStart
+	}
+
+	currentPos := lineStart
+	totalBytes := rootSnap.byteCount
+
+	for currentPos < totalBytes {
+		leafResult, err := g.findLeafByByteUnlocked(currentPos)
+		if err != nil {
+			return currentPos
+		}
+
+		snap := leafResult.Snapshot
+
+		// Search for newline in this leaf starting from our offset
+		for i := leafResult.ByteOffset; i < snap.byteCount; i++ {
+			if snap.data[i] == '\n' {
+				return currentPos + (i - leafResult.ByteOffset) + 1 // include the newline
+			}
+		}
+
+		// Move to next leaf
+		currentPos += snap.byteCount - leafResult.ByteOffset
+	}
+
+	return totalBytes
+}
+
+// DumpDecorations writes all decorations to a file in INI-like format.
+// If fs is nil, uses the Garland's source filesystem.
+func (g *Garland) DumpDecorations(fs FileSystemInterface, path string) error {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
+	if rootSnap == nil {
+		return nil
+	}
+
+	// Collect all decorations
+	var decorations []DecorationEntry
+	g.collectDecorationsInRangeInternal(g.root, rootSnap, 0, g.totalBytes+1, 0, &decorations)
+
+	// Build INI content
+	var content string
+	content = "[decorations]\n"
+	for _, d := range decorations {
+		if d.Address != nil {
+			content += d.Key + "=" + formatInt64(d.Address.Byte) + "\n"
+		}
+	}
+
+	// Use provided fs or default to sourceFS
+	targetFS := fs
+	if targetFS == nil {
+		targetFS = g.sourceFS
+	}
+
+	// Write to file
+	return targetFS.WriteFile(path, []byte(content))
+}
+
+// formatInt64 converts an int64 to a string.
+func formatInt64(n int64) string {
+	if n == 0 {
+		return "0"
+	}
+
+	negative := n < 0
+	if negative {
+		n = -n
+	}
+
+	var digits []byte
+	for n > 0 {
+		digits = append([]byte{byte('0' + n%10)}, digits...)
+		n /= 10
+	}
+
+	if negative {
+		digits = append([]byte{'-'}, digits...)
+	}
+	return string(digits)
 }
 
 // addressToByteUnlocked converts an AbsoluteAddress to a byte position.

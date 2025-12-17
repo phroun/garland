@@ -1100,3 +1100,258 @@ func TestDecorateFunction(t *testing.T) {
 		t.Logf("Invalid position correctly returned error: %v", err)
 	})
 }
+
+// TestDecorationQueryFunctions tests GetDecorationPosition, GetDecorationsInByteRange, and GetDecorationsOnLine
+func TestDecorationQueryFunctions(t *testing.T) {
+	lib, err := Init(LibraryOptions{})
+	if err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	t.Run("GetDecorationPosition - found", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "Hello World"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		// Add decoration at position 6
+		addr := ByteAddress(6)
+		_, err = g.Decorate([]DecorationEntry{
+			{Key: "world_start", Address: &addr},
+		})
+		if err != nil {
+			t.Fatalf("Decorate failed: %v", err)
+		}
+
+		// Query the decoration position
+		pos, err := g.GetDecorationPosition("world_start")
+		if err != nil {
+			t.Fatalf("GetDecorationPosition failed: %v", err)
+		}
+
+		if pos.Mode != ByteMode || pos.Byte != 6 {
+			t.Errorf("Expected ByteMode position 6, got mode=%d byte=%d", pos.Mode, pos.Byte)
+		}
+		t.Logf("Found decoration 'world_start' at byte position %d", pos.Byte)
+	})
+
+	t.Run("GetDecorationPosition - not found", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "Hello World"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		_, err = g.GetDecorationPosition("nonexistent")
+		if err == nil {
+			t.Error("Expected error for nonexistent decoration")
+		}
+		t.Logf("Correctly returned error for nonexistent: %v", err)
+	})
+
+	t.Run("GetDecorationsInByteRange", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "ABCDEFGHIJ"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		// Add decorations at various positions
+		addr0 := ByteAddress(0)
+		addr3 := ByteAddress(3)
+		addr5 := ByteAddress(5)
+		addr8 := ByteAddress(8)
+		_, err = g.Decorate([]DecorationEntry{
+			{Key: "A", Address: &addr0},
+			{Key: "D", Address: &addr3},
+			{Key: "F", Address: &addr5},
+			{Key: "I", Address: &addr8},
+		})
+		if err != nil {
+			t.Fatalf("Decorate failed: %v", err)
+		}
+
+		// Query range [2, 7) - should include D@3 and F@5
+		decorations, err := g.GetDecorationsInByteRange(2, 7)
+		if err != nil {
+			t.Fatalf("GetDecorationsInByteRange failed: %v", err)
+		}
+
+		if len(decorations) != 2 {
+			t.Errorf("Expected 2 decorations in range [2,7), got %d", len(decorations))
+		}
+
+		// Check we got the right ones
+		keys := make(map[string]bool)
+		for _, d := range decorations {
+			keys[d.Key] = true
+			t.Logf("Found decoration '%s' at %d", d.Key, d.Address.Byte)
+		}
+
+		if !keys["D"] || !keys["F"] {
+			t.Errorf("Expected decorations D and F, got keys: %v", keys)
+		}
+	})
+
+	t.Run("GetDecorationsInByteRange - empty", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "Hello World"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		// No decorations added, query should return empty
+		decorations, err := g.GetDecorationsInByteRange(0, 5)
+		if err != nil {
+			t.Fatalf("GetDecorationsInByteRange failed: %v", err)
+		}
+
+		if len(decorations) != 0 {
+			t.Errorf("Expected 0 decorations, got %d", len(decorations))
+		}
+		t.Log("Correctly returned empty slice for no decorations")
+	})
+
+	t.Run("GetDecorationsOnLine", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "Line0\nLine1\nLine2"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		// Add decorations on different lines
+		addr0 := ByteAddress(2)  // On line 0
+		addr1 := ByteAddress(8)  // On line 1
+		addr2 := ByteAddress(14) // On line 2
+		_, err = g.Decorate([]DecorationEntry{
+			{Key: "line0_mark", Address: &addr0},
+			{Key: "line1_mark", Address: &addr1},
+			{Key: "line2_mark", Address: &addr2},
+		})
+		if err != nil {
+			t.Fatalf("Decorate failed: %v", err)
+		}
+
+		// Query line 1
+		decorations, err := g.GetDecorationsOnLine(1)
+		if err != nil {
+			t.Fatalf("GetDecorationsOnLine failed: %v", err)
+		}
+
+		if len(decorations) != 1 {
+			t.Errorf("Expected 1 decoration on line 1, got %d", len(decorations))
+		}
+
+		if len(decorations) > 0 && decorations[0].Key != "line1_mark" {
+			t.Errorf("Expected 'line1_mark', got '%s'", decorations[0].Key)
+		}
+		t.Logf("Found %d decoration(s) on line 1", len(decorations))
+	})
+
+	t.Run("GetDecorationsOnLine - multiple on same line", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "ABCDEF\nGHIJKL"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		// Add multiple decorations on line 0
+		addr0 := ByteAddress(0)
+		addr2 := ByteAddress(2)
+		addr5 := ByteAddress(5)
+		_, err = g.Decorate([]DecorationEntry{
+			{Key: "A", Address: &addr0},
+			{Key: "C", Address: &addr2},
+			{Key: "F", Address: &addr5},
+		})
+		if err != nil {
+			t.Fatalf("Decorate failed: %v", err)
+		}
+
+		// Query line 0
+		decorations, err := g.GetDecorationsOnLine(0)
+		if err != nil {
+			t.Fatalf("GetDecorationsOnLine failed: %v", err)
+		}
+
+		if len(decorations) != 3 {
+			t.Errorf("Expected 3 decorations on line 0, got %d", len(decorations))
+		}
+		t.Logf("Found %d decorations on line 0", len(decorations))
+	})
+}
+
+// TestAddressConversion tests the public address conversion functions
+func TestAddressConversion(t *testing.T) {
+	lib, err := Init(LibraryOptions{})
+	if err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	t.Run("ByteToRune and RuneToByte", func(t *testing.T) {
+		// "Hello 世界" - 6 ASCII + 2 Chinese (3 bytes each)
+		g, err := lib.Open(FileOptions{DataString: "Hello 世界"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		// Byte 6 is '世' (first Chinese char), rune 6
+		runePos, err := g.ByteToRune(6)
+		if err != nil {
+			t.Fatalf("ByteToRune failed: %v", err)
+		}
+		if runePos != 6 {
+			t.Errorf("Expected rune pos 6, got %d", runePos)
+		}
+
+		// Rune 6 is at byte 6 (start of '世')
+		bytePos, err := g.RuneToByte(6)
+		if err != nil {
+			t.Fatalf("RuneToByte failed: %v", err)
+		}
+		if bytePos != 6 {
+			t.Errorf("Expected byte pos 6, got %d", bytePos)
+		}
+
+		// Rune 7 (second Chinese '界') is at byte 9
+		bytePos7, err := g.RuneToByte(7)
+		if err != nil {
+			t.Fatalf("RuneToByte(7) failed: %v", err)
+		}
+		if bytePos7 != 9 {
+			t.Errorf("Expected byte pos 9 for rune 7, got %d", bytePos7)
+		}
+
+		t.Logf("ByteToRune(6)=%d, RuneToByte(6)=%d, RuneToByte(7)=%d", runePos, bytePos, bytePos7)
+	})
+
+	t.Run("ByteToLineRune and LineRuneToByte", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "AB\nCD\nEF"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		// Byte 4 (second 'C') should be line 1, rune 1
+		line, runeInLine, err := g.ByteToLineRune(4)
+		if err != nil {
+			t.Fatalf("ByteToLineRune failed: %v", err)
+		}
+		if line != 1 || runeInLine != 1 {
+			t.Errorf("Expected line=1 rune=1, got line=%d rune=%d", line, runeInLine)
+		}
+
+		// Line 2, rune 0 should be byte 6 ('E')
+		bytePos, err := g.LineRuneToByte(2, 0)
+		if err != nil {
+			t.Fatalf("LineRuneToByte failed: %v", err)
+		}
+		if bytePos != 6 {
+			t.Errorf("Expected byte 6, got %d", bytePos)
+		}
+
+		t.Logf("ByteToLineRune(4)=(%d,%d), LineRuneToByte(2,0)=%d", line, runeInLine, bytePos)
+	})
+}
