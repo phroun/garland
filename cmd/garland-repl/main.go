@@ -1213,16 +1213,7 @@ func (r *REPL) cmdDump() {
 	// Save cursor position
 	savedPos := cursor.BytePos()
 
-	// Read all content
-	cursor.SeekByte(0)
-	byteCount := r.garland.ByteCount().Value
-	data, err := cursor.ReadBytes(byteCount)
-	if err != nil {
-		fmt.Printf("Read error: %v\n", err)
-		return
-	}
-
-	// Collect cursor positions and sort by byte position
+	// Collect cursor positions BEFORE reading (reading advances cursors)
 	type cursorPos struct {
 		name string
 		pos  int64
@@ -1234,6 +1225,15 @@ func (r *REPL) cmdDump() {
 	sort.Slice(cursorPositions, func(i, j int) bool {
 		return cursorPositions[i].pos < cursorPositions[j].pos
 	})
+
+	// Read all content
+	cursor.SeekByte(0)
+	byteCount := r.garland.ByteCount().Value
+	data, err := cursor.ReadBytes(byteCount)
+	if err != nil {
+		fmt.Printf("Read error: %v\n", err)
+		return
+	}
 
 	// Build output with cursor markers inserted at their positions
 	// ANSI: \x1b[1;32m = bold green, \x1b[0m = reset
