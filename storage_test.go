@@ -406,3 +406,92 @@ func TestLoaderStruct(t *testing.T) {
 		t.Error("eofReached should be false")
 	}
 }
+
+func TestSave(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalPath := filepath.Join(tmpDir, "test.txt")
+
+	// Create initial file
+	if err := os.WriteFile(originalPath, []byte("Hello World"), 0644); err != nil {
+		t.Fatalf("Failed to create test file: %v", err)
+	}
+
+	// Open file with garland
+	lib, _ := Init(LibraryOptions{})
+	g, err := lib.Open(FileOptions{FilePath: originalPath})
+	if err != nil {
+		t.Fatalf("Failed to open file: %v", err)
+	}
+
+	// Modify content
+	cursor := g.NewCursor()
+	cursor.SeekByte(5)
+	cursor.DeleteRunes(1, false) // Delete space
+	cursor.InsertString("-", nil, true)
+
+	// Save
+	err = g.Save()
+	if err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+
+	g.Close()
+
+	// Verify file was modified
+	data, err := os.ReadFile(originalPath)
+	if err != nil {
+		t.Fatalf("Failed to read file: %v", err)
+	}
+	if string(data) != "Hello-World" {
+		t.Errorf("After save: %q, want %q", string(data), "Hello-World")
+	}
+}
+
+func TestSaveNoSource(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	g, _ := lib.Open(FileOptions{DataString: "Hello World"})
+
+	err := g.Save()
+	if err != ErrNoDataSource {
+		t.Errorf("Save with no source returned %v, want ErrNoDataSource", err)
+	}
+}
+
+func TestSaveAs(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	lib, _ := Init(LibraryOptions{})
+	g, _ := lib.Open(FileOptions{DataString: "Hello World"})
+
+	// Modify content
+	cursor := g.NewCursor()
+	cursor.SeekByte(11)
+	cursor.InsertString("!", nil, true)
+
+	// SaveAs
+	fs := &localFileSystem{}
+	newPath := filepath.Join(tmpDir, "saved.txt")
+	err := g.SaveAs(fs, newPath)
+	if err != nil {
+		t.Fatalf("SaveAs failed: %v", err)
+	}
+
+	// Verify new file
+	data, err := os.ReadFile(newPath)
+	if err != nil {
+		t.Fatalf("Failed to read saved file: %v", err)
+	}
+	if string(data) != "Hello World!" {
+		t.Errorf("After SaveAs: %q, want %q", string(data), "Hello World!")
+	}
+}
+
+func TestSaveAsNilFS(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	g, _ := lib.Open(FileOptions{DataString: "Hello World"})
+
+	err := g.SaveAs(nil, "/tmp/test.txt")
+	if err != ErrNotSupported {
+		t.Errorf("SaveAs with nil fs returned %v, want ErrNotSupported", err)
+	}
+}

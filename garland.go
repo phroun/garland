@@ -369,6 +369,62 @@ func (g *Garland) Close() error {
 	return nil
 }
 
+// Save overwrites the original file with the current content.
+// Caller asserts that this replaces any warm storage source.
+// Returns ErrNoDataSource if there is no original file path.
+func (g *Garland) Save() error {
+	if g.sourcePath == "" {
+		return ErrNoDataSource
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// Collect all data from the tree
+	data := g.collectLeaves(g.root.id)
+
+	// Determine which filesystem to use
+	fs := g.sourceFS
+	if fs == nil {
+		fs = g.lib.defaultFS
+	}
+
+	// Close warm storage handle if open
+	if g.sourceHandle != nil {
+		fs.Close(g.sourceHandle)
+		g.sourceHandle = nil
+	}
+
+	// Write the file
+	if err := fs.WriteFile(g.sourcePath, data); err != nil {
+		return err
+	}
+
+	// Reopen for warm storage if needed
+	if g.loadingStyle == AllStorage {
+		handle, err := fs.Open(g.sourcePath, OpenModeRead)
+		if err == nil {
+			g.sourceHandle = handle
+		}
+	}
+
+	return nil
+}
+
+// SaveAs writes the current content to a new location.
+// Warm storage remains pointing to the original file (if any).
+func (g *Garland) SaveAs(fs FileSystemInterface, name string) error {
+	if fs == nil {
+		return ErrNotSupported
+	}
+
+	g.mu.RLock()
+	data := g.collectLeaves(g.root.id)
+	g.mu.RUnlock()
+
+	return fs.WriteFile(name, data)
+}
+
 // NewCursor creates a new cursor at position 0.
 func (g *Garland) NewCursor() *Cursor {
 	c := newCursor(g)
@@ -942,8 +998,28 @@ func (g *Garland) rollbackToPreTransaction() {
 // Helper functions (stubs to be implemented)
 
 func (g *Garland) loadFromFile(path string) ([]byte, error) {
-	// TODO: Implement file loading
-	return nil, ErrNotSupported
+	// Use the source filesystem to load the file
+	fs := g.sourceFS
+	if fs == nil {
+		fs = g.lib.defaultFS
+	}
+
+	// Read the entire file
+	data, err := fs.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	// Open file handle for warm storage if needed
+	if g.loadingStyle == AllStorage {
+		handle, err := fs.Open(path, OpenModeRead)
+		if err == nil {
+			g.sourceHandle = handle
+		}
+	}
+
+	g.countComplete = true
+	return data, nil
 }
 
 func (g *Garland) startChannelLoader(ch chan []byte) {
