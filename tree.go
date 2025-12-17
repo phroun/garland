@@ -14,6 +14,7 @@ type LeafSearchResult struct {
 
 // findLeafByByte navigates the tree to find the leaf containing the given byte position.
 // Returns the leaf node and the offset within that leaf.
+// This version acquires a read lock - use findLeafByByteUnlocked if already holding a lock.
 func (g *Garland) findLeafByByte(pos int64) (*LeafSearchResult, error) {
 	if pos < 0 {
 		return nil, ErrInvalidPosition
@@ -21,6 +22,15 @@ func (g *Garland) findLeafByByte(pos int64) (*LeafSearchResult, error) {
 
 	g.mu.RLock()
 	defer g.mu.RUnlock()
+
+	return g.findLeafByByteUnlocked(pos)
+}
+
+// findLeafByByteUnlocked is the internal version that assumes caller holds a lock.
+func (g *Garland) findLeafByByteUnlocked(pos int64) (*LeafSearchResult, error) {
+	if pos < 0 {
+		return nil, ErrInvalidPosition
+	}
 
 	if g.root == nil {
 		return nil, ErrInvalidPosition
@@ -63,10 +73,10 @@ func (g *Garland) findLeafByByteInternal(node *Node, snap *NodeSnapshot, pos int
 		return nil, ErrInvalidPosition
 	}
 
-	// Use <= to include the end position in the left subtree
-	// This ensures "end of content" stays in content node, not EOF node
-	if pos <= leftSnap.byteCount {
-		// Target is in left subtree (or at its end)
+	// Use < so that when pos equals left's byte count, we go to right subtree
+	// This ensures proper leaf boundary handling when reading across leaves
+	if pos < leftSnap.byteCount {
+		// Target is in left subtree
 		return g.findLeafByByteInternal(leftNode, leftSnap, pos, byteStart, runeStart)
 	}
 
@@ -141,9 +151,9 @@ func (g *Garland) findLeafByRuneInternal(node *Node, snap *NodeSnapshot, pos int
 		return nil, ErrInvalidPosition
 	}
 
-	// Use <= to include the end position in the left subtree
-	if pos <= leftSnap.runeCount {
-		// Target is in left subtree (or at its end)
+	// Use < so that when pos equals left's rune count, we go to right subtree
+	if pos < leftSnap.runeCount {
+		// Target is in left subtree
 		return g.findLeafByRuneInternal(leftNode, leftSnap, pos, byteStart, runeStart)
 	}
 
@@ -358,8 +368,10 @@ func (g *Garland) splitLeaf(node *Node, snap *NodeSnapshot, bytePos int64) (Node
 	return leftNode.id, rightNode.id, nil
 }
 
-// concatenate creates a new internal node joining two subtrees.
-// Returns the ID of the new internal node.
+// concatenate creates or reuses an internal node joining two subtrees.
+// If a node with the same (leftID, rightID) structure exists, reuses it
+// and adds a new snapshot. Otherwise creates a new node.
+// Returns the ID of the internal node.
 func (g *Garland) concatenate(leftID, rightID NodeID) (NodeID, error) {
 	leftNode := g.nodeRegistry[leftID]
 	rightNode := g.nodeRegistry[rightID]
@@ -375,27 +387,102 @@ func (g *Garland) concatenate(leftID, rightID NodeID) (NodeID, error) {
 		return 0, ErrInvalidPosition
 	}
 
+	// Create the new snapshot for this version
+	internalSnap := createInternalSnapshot(leftID, rightID, leftSnap, rightSnap)
+
+	// Check if we already have an internal node with this structure
+	key := [2]NodeID{leftID, rightID}
+	if existingID, ok := g.internalNodesByChildren[key]; ok {
+		// Reuse existing node - just add a new snapshot
+		existingNode := g.nodeRegistry[existingID]
+		if existingNode != nil {
+			existingNode.setSnapshot(g.currentFork, g.currentRevision, internalSnap)
+			return existingID, nil
+		}
+	}
+
 	// Create new internal node
 	g.nextNodeID++
 	internalNode := newNode(g.nextNodeID, g)
 	g.nodeRegistry[internalNode.id] = internalNode
+	g.internalNodesByChildren[key] = internalNode.id
 
-	internalSnap := createInternalSnapshot(leftID, rightID, leftSnap, rightSnap)
 	internalNode.setSnapshot(g.currentFork, g.currentRevision, internalSnap)
 
 	return internalNode.id, nil
 }
 
-// insertAtLeaf handles insertion within or at a leaf boundary.
-// Returns the ID of the new subtree root.
-func (g *Garland) insertAtLeaf(
-	result *LeafSearchResult,
+// insertInternal recursively navigates to the insertion point and rebuilds the tree.
+// This properly preserves the entire tree structure including siblings like EOF nodes.
+func (g *Garland) insertInternal(
+	node *Node,
+	snap *NodeSnapshot,
+	insertPos int64,
+	offset int64,
 	data []byte,
 	decorations []RelativeDecoration,
 	insertBefore bool,
 ) (NodeID, error) {
-	snap := result.Snapshot
+	if snap.isLeaf {
+		// We've found the leaf to insert into
+		localPos := insertPos - offset
+		return g.insertIntoLeaf(snap, localPos, data, decorations, insertBefore)
+	}
 
+	// Internal node: determine which child contains the insertion point
+	leftNode := g.nodeRegistry[snap.leftID]
+	if leftNode == nil {
+		return 0, ErrInvalidPosition
+	}
+
+	leftSnap := leftNode.snapshotAt(g.currentFork, g.currentRevision)
+	if leftSnap == nil {
+		return 0, ErrInvalidPosition
+	}
+
+	leftEnd := offset + leftSnap.byteCount
+
+	// Use < so insertion at exact boundary goes to right subtree (start of next node)
+	if insertPos < leftEnd {
+		// Insert into left subtree
+		newLeftID, err := g.insertInternal(leftNode, leftSnap, insertPos, offset, data, decorations, insertBefore)
+		if err != nil {
+			return 0, err
+		}
+
+		// Rebuild this internal node with new left child, keeping right child
+		return g.concatenate(newLeftID, snap.rightID)
+	}
+
+	// Insert into right subtree
+	rightNode := g.nodeRegistry[snap.rightID]
+	if rightNode == nil {
+		return 0, ErrInvalidPosition
+	}
+
+	rightSnap := rightNode.snapshotAt(g.currentFork, g.currentRevision)
+	if rightSnap == nil {
+		return 0, ErrInvalidPosition
+	}
+
+	newRightID, err := g.insertInternal(rightNode, rightSnap, insertPos, leftEnd, data, decorations, insertBefore)
+	if err != nil {
+		return 0, err
+	}
+
+	// Rebuild this internal node with new right child, keeping left child
+	return g.concatenate(snap.leftID, newRightID)
+}
+
+// insertIntoLeaf handles insertion within a leaf node.
+// Returns the ID of the new subtree (which may be a single leaf or internal nodes).
+func (g *Garland) insertIntoLeaf(
+	snap *NodeSnapshot,
+	localPos int64,
+	data []byte,
+	decorations []RelativeDecoration,
+	insertBefore bool,
+) (NodeID, error) {
 	// Convert relative decorations to absolute (within new data)
 	absoluteDecs := make([]Decoration, len(decorations))
 	for i, rd := range decorations {
@@ -406,7 +493,14 @@ func (g *Garland) insertAtLeaf(
 	}
 
 	// Split at insertion point
-	splitPos := result.ByteOffset
+	splitPos := localPos
+	if splitPos < 0 {
+		splitPos = 0
+	}
+	if splitPos > int64(len(snap.data)) {
+		splitPos = int64(len(snap.data))
+	}
+
 	leftData := snap.data[:splitPos]
 	rightData := snap.data[splitPos:]
 
@@ -453,9 +547,6 @@ func (g *Garland) insertAtLeaf(
 	var resultID NodeID
 	var err error
 
-	// Handle insertBefore semantics (for decoration/cursor ordering)
-	// Note: The actual data order is the same; insertBefore affects
-	// how same-position items are ordered
 	if leftID == 0 && rightID == 0 {
 		// Just the inserted content
 		resultID = middleID

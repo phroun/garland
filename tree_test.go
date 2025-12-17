@@ -18,7 +18,9 @@ func TestFindLeafByByte(t *testing.T) {
 	}{
 		{"start", 0, false, 0},
 		{"middle", 7, false, 7},
-		{"end", 13, false, 13},
+		// At exact content length, we go to EOF node with offset 0
+		// This is correct behavior for reading across leaf boundaries
+		{"end", 13, false, 0},
 		{"negative", -1, true, 0},
 		{"past_end", 20, true, 0},
 	}
@@ -87,7 +89,8 @@ func TestFindLeafByRune(t *testing.T) {
 	}{
 		{"start", 0, false, 0},
 		{"middle", 7, false, 7},
-		{"end", 13, false, 13},
+		// At exact content length, we go to EOF node with offset 0
+		{"end", 13, false, 0},
 		{"negative", -1, true, 0},
 		{"past_end", 20, true, 0},
 	}
@@ -720,31 +723,33 @@ func TestFindLeafByByteAtEOF(t *testing.T) {
 	defer g.Close()
 
 	// Position at EOF (byte 5) should be valid
+	// With the boundary fix, EOF position goes to EOF node with offset 0
 	result, err := g.findLeafByByte(5)
 	if err != nil {
 		t.Fatalf("findLeafByByte at EOF: unexpected error: %v", err)
 	}
 
-	if result.ByteOffset != 5 {
-		t.Errorf("ByteOffset = %d, want 5", result.ByteOffset)
+	// At exact content length, we go to EOF node with offset 0
+	if result.ByteOffset != 0 {
+		t.Errorf("ByteOffset = %d, want 0 (EOF node)", result.ByteOffset)
 	}
 }
 
-func TestInsertAtLeaf(t *testing.T) {
+func TestInsertInternal(t *testing.T) {
 	lib, _ := Init(LibraryOptions{})
 	g, _ := lib.Open(FileOptions{DataString: "HelloWorld"})
 	defer g.Close()
 
-	// Find position to insert
-	result, err := g.findLeafByByte(5)
-	if err != nil {
-		t.Fatalf("findLeafByByte failed: %v", err)
+	// Get root snapshot
+	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
+	if rootSnap == nil {
+		t.Fatal("root snapshot is nil")
 	}
 
-	// Insert ", " at position 5
-	newRootID, err := g.insertAtLeaf(result, []byte(", "), nil, false)
+	// Insert ", " at position 5 using insertInternal
+	newRootID, err := g.insertInternal(g.root, rootSnap, 5, 0, []byte(", "), nil, false)
 	if err != nil {
-		t.Fatalf("insertAtLeaf failed: %v", err)
+		t.Fatalf("insertInternal failed: %v", err)
 	}
 
 	// Verify the result
