@@ -228,7 +228,12 @@ NOTE: Forks are created automatically when you edit from a non-HEAD revision.
       Use 'forkswitch' to navigate between existing forks.
 
 DECORATIONS:
-  decorate <key>          Add a decoration at cursor position
+  decorate <key>          Add decoration at cursor position
+  decorate k=byte <pos>   Add decoration at byte position
+  decorate k=rune <pos>   Add decoration at rune position
+  decorate k=line <l>:<r> Add decoration at line:rune position
+  decorate k=nil          Remove decoration (same as undecorate)
+  decorate a=byte 5, b=line 1:0   Multiple decorations at once
   undecorate <key>        Remove a decoration
   decorations             List all decorations in the file
   decorations <line>      List decorations on a specific line
@@ -954,28 +959,126 @@ func (r *REPL) cmdDecorate(args []string) {
 	}
 
 	if len(args) < 1 {
-		fmt.Println("Usage: decorate <key>")
-		fmt.Println("  Adds a decoration with the given key at the current cursor position")
+		fmt.Println("Usage: decorate <key>                    - at cursor position")
+		fmt.Println("       decorate key=byte <pos>           - at byte position")
+		fmt.Println("       decorate key=rune <pos>           - at rune position")
+		fmt.Println("       decorate key=line <line>:<rune>   - at line:rune position")
+		fmt.Println("       decorate key=nil                  - remove decoration")
+		fmt.Println("       decorate k1=byte 5, k2=line 1:0   - multiple decorations")
 		return
 	}
 
-	key := args[0]
-	cursor := r.cursor()
-	bytePos := cursor.BytePos()
+	// Join args and split by comma to handle multiple decorations
+	fullInput := strings.Join(args, " ")
+	parts := strings.Split(fullInput, ",")
 
-	entry := garland.DecorationEntry{
-		Key:     key,
-		Address: &garland.AbsoluteAddress{Mode: garland.ByteMode, Byte: bytePos},
+	var entries []garland.DecorationEntry
+
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		entry, desc, err := r.parseDecorationSpec(part)
+		if err != nil {
+			fmt.Printf("Error parsing '%s': %v\n", part, err)
+			return
+		}
+		entries = append(entries, entry)
+		fmt.Printf("  %s: %s\n", entry.Key, desc)
 	}
 
-	result, err := r.garland.Decorate([]garland.DecorationEntry{entry})
+	if len(entries) == 0 {
+		fmt.Println("No decorations specified")
+		return
+	}
+
+	result, err := r.garland.Decorate(entries)
 	if err != nil {
 		fmt.Printf("Decorate error: %v\n", err)
 		return
 	}
 
-	fmt.Printf("Added decoration '%s' at byte %d. Fork=%d, revision=%d\n",
-		key, bytePos, result.Fork, result.Revision)
+	fmt.Printf("Applied %d decoration(s). Fork=%d, revision=%d\n",
+		len(entries), result.Fork, result.Revision)
+}
+
+// parseDecorationSpec parses a decoration specification like "key=byte 120" or "key" (cursor pos)
+func (r *REPL) parseDecorationSpec(spec string) (garland.DecorationEntry, string, error) {
+	// Check for key=value format
+	if idx := strings.Index(spec, "="); idx > 0 {
+		key := strings.TrimSpace(spec[:idx])
+		value := strings.TrimSpace(spec[idx+1:])
+
+		// Handle nil (deletion)
+		if value == "nil" {
+			return garland.DecorationEntry{Key: key, Address: nil}, "removed", nil
+		}
+
+		// Parse address type and value
+		valueParts := strings.Fields(value)
+		if len(valueParts) < 2 {
+			return garland.DecorationEntry{}, "", fmt.Errorf("expected 'type position', got %q", value)
+		}
+
+		addrType := strings.ToLower(valueParts[0])
+		posStr := valueParts[1]
+
+		switch addrType {
+		case "byte":
+			pos, err := strconv.ParseInt(posStr, 10, 64)
+			if err != nil {
+				return garland.DecorationEntry{}, "", fmt.Errorf("invalid byte position: %v", err)
+			}
+			return garland.DecorationEntry{
+				Key:     key,
+				Address: &garland.AbsoluteAddress{Mode: garland.ByteMode, Byte: pos},
+			}, fmt.Sprintf("byte %d", pos), nil
+
+		case "rune":
+			pos, err := strconv.ParseInt(posStr, 10, 64)
+			if err != nil {
+				return garland.DecorationEntry{}, "", fmt.Errorf("invalid rune position: %v", err)
+			}
+			return garland.DecorationEntry{
+				Key:     key,
+				Address: &garland.AbsoluteAddress{Mode: garland.RuneMode, Rune: pos},
+			}, fmt.Sprintf("rune %d", pos), nil
+
+		case "line":
+			// Parse line:rune format
+			lineParts := strings.Split(posStr, ":")
+			if len(lineParts) != 2 {
+				return garland.DecorationEntry{}, "", fmt.Errorf("line position must be 'line:rune', got %q", posStr)
+			}
+			line, err := strconv.ParseInt(lineParts[0], 10, 64)
+			if err != nil {
+				return garland.DecorationEntry{}, "", fmt.Errorf("invalid line number: %v", err)
+			}
+			runeInLine, err := strconv.ParseInt(lineParts[1], 10, 64)
+			if err != nil {
+				return garland.DecorationEntry{}, "", fmt.Errorf("invalid rune in line: %v", err)
+			}
+			return garland.DecorationEntry{
+				Key:     key,
+				Address: &garland.AbsoluteAddress{Mode: garland.LineRuneMode, Line: line, LineRune: runeInLine},
+			}, fmt.Sprintf("line %d:%d", line, runeInLine), nil
+
+		default:
+			return garland.DecorationEntry{}, "", fmt.Errorf("unknown address type %q (use byte, rune, or line)", addrType)
+		}
+	}
+
+	// Simple form: just key, use cursor position
+	key := spec
+	cursor := r.cursor()
+	bytePos := cursor.BytePos()
+
+	return garland.DecorationEntry{
+		Key:     key,
+		Address: &garland.AbsoluteAddress{Mode: garland.ByteMode, Byte: bytePos},
+	}, fmt.Sprintf("byte %d (cursor)", bytePos), nil
 }
 
 func (r *REPL) cmdUndecorate(args []string) {
