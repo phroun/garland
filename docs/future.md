@@ -21,16 +21,6 @@ The `HasChanged()` method on `localFileSystem` returns `ErrNotSupported`.
 - Compare against current values in `HasChanged()`
 - Consider inode checking on Unix systems
 
-### 2. Decoration Loading from Files
-
-**Location:** `garland.go` line ~2073
-
-The `loadInitialDecorations()` function exists but isn't fully wired to load decorations from files.
-
-**Current behavior:** Decorations must be programmatically added after opening a file.
-
-**Desired behavior:** Support loading decorations from a companion file (e.g., `.decorations` or embedded format) when opening a file.
-
 ## Missing Features
 
 These are features that don't exist yet but would enhance the library:
@@ -49,12 +39,6 @@ These are features that don't exist yet but would enhance the library:
 - Unified diff format export
 
 ### History Management
-
-#### Revision Pruning/Garbage Collection
-- Limit maximum revision history depth
-- Prune old revisions to save memory
-- Configurable retention policies
-- Squash multiple revisions into one
 
 #### History Compression
 - Compress old revision data
@@ -122,6 +106,9 @@ The following features have been implemented:
 - **Incremental Tree Rebalancing** - Path-based rebalancing after mutations with configurable budget; `ForceRebalance()` for full tree rebuild when needed; `NeedsRebalancing()` check
 - **Word Navigation** - `SeekByWord(n)` for bidirectional word navigation; positive n moves forward, negative n moves backward; positions at start of next/previous word
 - **Line Navigation** - `SeekLineStart()` and `SeekLineEnd()` for navigating to beginning/end of current line
+- **Decoration Loading from Files** - `LoadDecorations(fs, path)` and `LoadDecorationsFromString(content)` for loading decorations from INI-format files with comment support
+- **Revision Pruning** - `Prune(keepFromRevision)` for per-fork history pruning; shared revisions only deleted when all dependent forks have pruned past them; cursor history cleaned up automatically
+- **Fork Deletion** - `DeleteFork(fork)` for soft-deleting forks; keeps shared data for child forks; prevents switching to deleted forks
 
 ## Handled Elsewhere
 
@@ -145,4 +132,3 @@ These are application-layer concerns, not appropriate for a backend text buffer 
 
 ### Medium Priority (Quality of Life)
 2. Diff between revisions - debugging/comparison feature
-3. Revision pruning - deeper history management (memory limits now handle active data)

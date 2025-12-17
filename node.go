@@ -284,6 +284,8 @@ type ForkInfo struct {
 	ParentFork      ForkID
 	ParentRevision  RevisionID // revision at which this fork split from parent
 	HighestRevision RevisionID
+	PrunedUpTo      RevisionID // revisions < this have been pruned from this fork's view
+	Deleted         bool       // true if fork is soft-deleted (data may still exist for child forks)
 }
 
 // RevisionInfo contains metadata about a revision for undo history display.

@@ -178,6 +178,12 @@ func (r *REPL) handleCommand(input string) bool {
 	case "forkswitch":
 		r.cmdForkSwitch(args)
 
+	case "prune":
+		r.cmdPrune(args)
+
+	case "deletefork":
+		r.cmdDeleteFork(args)
+
 	case "version":
 		r.cmdVersion()
 
@@ -216,6 +222,9 @@ func (r *REPL) handleCommand(input string) bool {
 
 	case "dumpdecorations":
 		r.cmdDumpDecorations(args)
+
+	case "loaddecorations":
+		r.cmdLoadDecorations(args)
 
 	// Search commands
 	case "find":
@@ -1535,7 +1544,15 @@ func (r *REPL) cmdForks() {
 		if info.ParentFork != info.ID {
 			parentInfo = fmt.Sprintf(" (parent: fork=%d@rev=%d)", info.ParentFork, info.ParentRevision)
 		}
-		fmt.Printf("%s%d: highest revision %d%s\n", marker, info.ID, info.HighestRevision, parentInfo)
+		prunedInfo := ""
+		if info.PrunedUpTo > 0 {
+			prunedInfo = fmt.Sprintf(" [pruned<%d]", info.PrunedUpTo)
+		}
+		deletedInfo := ""
+		if info.Deleted {
+			deletedInfo = " [DELETED]"
+		}
+		fmt.Printf("%s%d: highest revision %d%s%s%s\n", marker, info.ID, info.HighestRevision, parentInfo, prunedInfo, deletedInfo)
 	}
 }
 
@@ -1578,6 +1595,71 @@ func (r *REPL) cmdForkSwitch(args []string) {
 		fmt.Printf("Cursor '%s' now at: byte=%d, line=%d:%d\n",
 			r.currentCursor, cursor.BytePos(), line, lineRune)
 	}
+}
+
+func (r *REPL) cmdPrune(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	g := r.garland
+
+	if len(args) < 1 {
+		fmt.Println("Usage: prune <keep_from_revision>")
+		fmt.Println("  Removes revision history before keep_from_revision in current fork")
+		fmt.Println("  Revisions >= keep_from_revision are kept")
+		forkInfo, err := g.GetForkInfo(g.CurrentFork())
+		if err == nil {
+			fmt.Printf("Current fork: %d (revision %d, pruned up to %d)\n",
+				g.CurrentFork(), g.CurrentRevision(), forkInfo.PrunedUpTo)
+		}
+		return
+	}
+
+	keepFrom, err := strconv.ParseUint(args[0], 10, 64)
+	if err != nil {
+		fmt.Printf("Invalid revision: %v\n", err)
+		return
+	}
+
+	err = g.Prune(garland.RevisionID(keepFrom))
+	if err != nil {
+		fmt.Printf("Prune error: %v\n", err)
+		return
+	}
+
+	forkInfo, _ := g.GetForkInfo(g.CurrentFork())
+	fmt.Printf("Fork %d pruned: revisions before %d removed\n", g.CurrentFork(), forkInfo.PrunedUpTo)
+}
+
+func (r *REPL) cmdDeleteFork(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	g := r.garland
+
+	if len(args) < 1 {
+		fmt.Println("Usage: deletefork <fork_id>")
+		fmt.Println("  Soft-deletes a fork (cannot switch to it anymore)")
+		fmt.Println("  Cannot delete fork 0 or current fork")
+		fmt.Printf("Current fork: %d\n", g.CurrentFork())
+		return
+	}
+
+	forkID, err := strconv.ParseUint(args[0], 10, 64)
+	if err != nil {
+		fmt.Printf("Invalid fork ID: %v\n", err)
+		return
+	}
+
+	err = g.DeleteFork(garland.ForkID(forkID))
+	if err != nil {
+		fmt.Printf("DeleteFork error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Fork %d deleted\n", forkID)
 }
 
 func (r *REPL) cmdVersion() {
@@ -2163,6 +2245,28 @@ func (r *REPL) cmdDumpDecorations(args []string) {
 	}
 
 	fmt.Printf("Decorations exported to %s\n", path)
+}
+
+func (r *REPL) cmdLoadDecorations(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 1 {
+		fmt.Println("Usage: loaddecorations <filepath>")
+		fmt.Println("  Loads decorations from an INI file")
+		fmt.Println("  Format: [decorations] section with key=byteposition entries")
+		return
+	}
+
+	path := strings.Join(args, " ")
+	err := r.garland.LoadDecorations(nil, path)
+	if err != nil {
+		fmt.Printf("LoadDecorations error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Decorations loaded from %s\n", path)
 }
 
 // parseSearchFlags parses flags from args: -i (case insensitive), -w (whole word), -b (backward)

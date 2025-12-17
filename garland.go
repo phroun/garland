@@ -1451,6 +1451,11 @@ func (g *Garland) UndoSeek(revision RevisionID) error {
 		return ErrRevisionNotFound
 	}
 
+	// Can't seek to pruned revisions
+	if revision < forkInfo.PrunedUpTo {
+		return ErrRevisionNotFound
+	}
+
 	// If already at this revision, nothing to do
 	if revision == g.currentRevision {
 		return nil
@@ -1512,6 +1517,11 @@ func (g *Garland) ForkSeek(fork ForkID) error {
 	// Validate fork exists
 	targetForkInfo, ok := g.forks[fork]
 	if !ok {
+		return ErrForkNotFound
+	}
+
+	// Can't switch to a deleted fork
+	if targetForkInfo.Deleted {
 		return ErrForkNotFound
 	}
 
@@ -1583,6 +1593,263 @@ func (g *Garland) ListForks() []ForkInfo {
 		result = append(result, *info)
 	}
 	return result
+}
+
+// Prune removes revision history before keepFromRevision in the current fork.
+// Revisions >= keepFromRevision are kept.
+// This sets the fork's PrunedUpTo watermark and cleans up:
+// - RevisionInfo entries for pruned revisions
+// - Cursor position history for pruned revisions
+// - Node snapshots that are no longer needed by any fork
+//
+// Shared revisions (inherited from parent forks) are only truly deleted
+// when all forks that share them have pruned past that point.
+func (g *Garland) Prune(keepFromRevision RevisionID) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	forkInfo := g.forks[g.currentFork]
+	if forkInfo == nil {
+		return ErrForkNotFound
+	}
+
+	// Validate revision
+	if keepFromRevision > forkInfo.HighestRevision {
+		return ErrRevisionNotFound
+	}
+
+	// Can't prune to before where we already pruned
+	if keepFromRevision <= forkInfo.PrunedUpTo {
+		return nil // Nothing to do
+	}
+
+	// Can't prune past current revision (would leave us with no valid state)
+	if keepFromRevision > g.currentRevision {
+		return ErrInvalidPosition
+	}
+
+	// Set the watermark
+	forkInfo.PrunedUpTo = keepFromRevision
+
+	// Clean up revisionInfo for this fork
+	for forkRev := range g.revisionInfo {
+		if forkRev.Fork == g.currentFork && forkRev.Revision < keepFromRevision {
+			delete(g.revisionInfo, forkRev)
+		}
+	}
+
+	// Clean up cursor history for this fork
+	for _, cursor := range g.cursors {
+		if cursor != nil {
+			g.pruneCursorHistory(cursor, g.currentFork, keepFromRevision)
+		}
+	}
+
+	// Garbage collect node snapshots that are no longer needed
+	g.garbageCollectSnapshots()
+
+	return nil
+}
+
+// pruneCursorHistory removes position history entries for pruned revisions.
+func (g *Garland) pruneCursorHistory(cursor *Cursor, fork ForkID, prunedUpTo RevisionID) {
+	for forkRev := range cursor.positionHistory {
+		if forkRev.Fork == fork && forkRev.Revision < prunedUpTo {
+			delete(cursor.positionHistory, forkRev)
+		}
+	}
+}
+
+// DeleteFork soft-deletes a fork, preventing further navigation to it.
+// The fork's data remains until no other forks depend on it.
+// Cannot delete the current fork or fork 0.
+func (g *Garland) DeleteFork(fork ForkID) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// Can't delete fork 0
+	if fork == 0 {
+		return ErrInvalidPosition
+	}
+
+	// Can't delete current fork
+	if fork == g.currentFork {
+		return ErrInvalidPosition
+	}
+
+	forkInfo := g.forks[fork]
+	if forkInfo == nil {
+		return ErrForkNotFound
+	}
+
+	// Already deleted?
+	if forkInfo.Deleted {
+		return nil
+	}
+
+	// Mark as deleted
+	forkInfo.Deleted = true
+
+	// Clean up cursor history for this fork
+	for _, cursor := range g.cursors {
+		if cursor != nil {
+			for forkRev := range cursor.positionHistory {
+				if forkRev.Fork == fork {
+					delete(cursor.positionHistory, forkRev)
+				}
+			}
+		}
+	}
+
+	// Clean up revisionInfo for this fork
+	for forkRev := range g.revisionInfo {
+		if forkRev.Fork == fork {
+			delete(g.revisionInfo, forkRev)
+		}
+	}
+
+	// Garbage collect node snapshots
+	g.garbageCollectSnapshots()
+
+	return nil
+}
+
+// garbageCollectSnapshots removes node history entries that are no longer needed.
+// It directly marks which snapshots would be used by simulating snapshotAt for each
+// needed (fork, revision) combination.
+func (g *Garland) garbageCollectSnapshots() {
+	// Build set of snapshots that are actually in use
+	inUse := make(map[NodeID]map[ForkRevision]bool)
+
+	for forkID, forkInfo := range g.forks {
+		if forkInfo.Deleted {
+			// Check if any non-deleted fork still depends on this fork's history
+			hasDependent := false
+			for _, otherFork := range g.forks {
+				if !otherFork.Deleted && g.forkDependsOn(otherFork.ID, forkID) {
+					hasDependent = true
+					break
+				}
+			}
+			if !hasDependent {
+				continue // Can skip this fork entirely
+			}
+		}
+
+		// Mark snapshots used by this fork's needed revisions
+		for rev := forkInfo.PrunedUpTo; rev <= forkInfo.HighestRevision; rev++ {
+			g.markSnapshotsInUseForRevision(forkID, rev, inUse)
+		}
+	}
+
+	// Remove snapshots not in use
+	for _, node := range g.nodeRegistry {
+		if node == nil {
+			continue
+		}
+		nodeInUse := inUse[node.id]
+		for forkRev := range node.history {
+			if nodeInUse == nil || !nodeInUse[forkRev] {
+				delete(node.history, forkRev)
+			}
+		}
+	}
+}
+
+// markSnapshotsInUseForRevision marks all snapshots that would be used when accessing
+// the tree at the given fork and revision.
+func (g *Garland) markSnapshotsInUseForRevision(fork ForkID, rev RevisionID, inUse map[NodeID]map[ForkRevision]bool) {
+	// Find the correct root for this fork/revision
+	revInfo := g.findRevisionInfo(fork, rev)
+	if revInfo == nil || revInfo.RootID == 0 {
+		// No revision info - fall back to current root
+		if g.root == nil {
+			return
+		}
+		g.markSnapshotsReachableFrom(g.root.id, fork, rev, inUse)
+		return
+	}
+	g.markSnapshotsReachableFrom(revInfo.RootID, fork, rev, inUse)
+}
+
+// markSnapshotsReachableFrom recursively marks snapshots reachable from a node.
+func (g *Garland) markSnapshotsReachableFrom(nodeID NodeID, fork ForkID, rev RevisionID, inUse map[NodeID]map[ForkRevision]bool) {
+	node := g.nodeRegistry[nodeID]
+	if node == nil {
+		return
+	}
+
+	snap, key := node.snapshotAtWithKey(fork, rev)
+	if snap == nil {
+		return
+	}
+
+	// Mark this snapshot as in use
+	if inUse[nodeID] == nil {
+		inUse[nodeID] = make(map[ForkRevision]bool)
+	}
+	if inUse[nodeID][key] {
+		return // Already marked, avoid re-traversing
+	}
+	inUse[nodeID][key] = true
+
+	// Recurse into children if internal node
+	if !snap.isLeaf {
+		g.markSnapshotsReachableFrom(snap.leftID, fork, rev, inUse)
+		g.markSnapshotsReachableFrom(snap.rightID, fork, rev, inUse)
+	}
+}
+
+// forkDependsOn checks if fork depends on otherFork's history.
+func (g *Garland) forkDependsOn(fork, otherFork ForkID) bool {
+	if fork == otherFork {
+		return true
+	}
+
+	forkInfo := g.forks[fork]
+	if forkInfo == nil {
+		return false
+	}
+
+	// Walk up the parent chain
+	current := forkInfo.ParentFork
+	for current != fork { // Avoid infinite loop
+		if current == otherFork {
+			return true
+		}
+		parentInfo := g.forks[current]
+		if parentInfo == nil {
+			break
+		}
+		if current == parentInfo.ParentFork {
+			break // Reached root or cycle
+		}
+		current = parentInfo.ParentFork
+	}
+
+	return false
+}
+
+// forkInheritsRevision checks if fork can access a revision from ancestorFork.
+func (g *Garland) forkInheritsRevision(fork, ancestorFork ForkID, revision RevisionID) bool {
+	if fork == ancestorFork {
+		return true
+	}
+
+	// Walk up the parent chain to find if we inherit from ancestorFork
+	forkInfo := g.forks[fork]
+	for forkInfo != nil {
+		if forkInfo.ParentFork == ancestorFork {
+			// We inherit revisions up to ParentRevision
+			return revision <= forkInfo.ParentRevision
+		}
+		if forkInfo.ParentFork == forkInfo.ID {
+			break // Root fork
+		}
+		forkInfo = g.forks[forkInfo.ParentFork]
+	}
+
+	return false
 }
 
 // FindForksBetween returns all fork divergence points between two revisions
@@ -4774,4 +5041,272 @@ func escapeForPreview(s string) string {
 		}
 	}
 	return string(result)
+}
+
+// SnapshotStats contains statistics about node snapshots.
+type SnapshotStats struct {
+	TotalSnapshots   int                    // Total snapshots across all nodes
+	ByFork           map[ForkID]int         // Snapshots per fork
+	ByForkRevision   map[ForkRevision]int   // Snapshots per fork/revision
+}
+
+// GetSnapshotStats returns statistics about node snapshots.
+// Useful for testing and diagnostics to verify garbage collection.
+func (g *Garland) GetSnapshotStats() SnapshotStats {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	stats := SnapshotStats{
+		ByFork:         make(map[ForkID]int),
+		ByForkRevision: make(map[ForkRevision]int),
+	}
+
+	for _, node := range g.nodeRegistry {
+		for forkRev := range node.history {
+			stats.TotalSnapshots++
+			stats.ByFork[forkRev.Fork]++
+			stats.ByForkRevision[forkRev]++
+		}
+	}
+
+	return stats
+}
+
+// LoadDecorations loads decorations from a file using the INI format.
+// Unknown sections are ignored for future compatibility.
+// Comments are lines starting with ';' or '# ' (hash followed by space).
+// End-of-line comments start with whitespace followed by ';' or '#'.
+func (g *Garland) LoadDecorations(fs FileSystemInterface, path string) error {
+	if fs == nil {
+		fs = g.sourceFS
+	}
+	if fs == nil {
+		return ErrNoDataSource
+	}
+
+	data, err := fs.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	return g.LoadDecorationsFromString(string(data))
+}
+
+// LoadDecorationsFromString loads decorations from an INI-formatted string.
+// Unknown sections are ignored for future compatibility.
+// Comments are lines starting with ';' or '# ' (hash followed by space).
+// End-of-line comments start with whitespace followed by ';' or '#'.
+func (g *Garland) LoadDecorationsFromString(content string) error {
+	entries, err := parseDecorationINI(content)
+	if err != nil {
+		return err
+	}
+
+	if len(entries) == 0 {
+		return nil
+	}
+
+	_, err = g.Decorate(entries)
+	return err
+}
+
+// parseDecorationINI parses INI format decoration content.
+// Returns decoration entries from the [decorations] section.
+// Unknown sections are silently ignored for forward compatibility.
+func parseDecorationINI(content string) ([]DecorationEntry, error) {
+	var entries []DecorationEntry
+	inDecorationsSection := false
+
+	lines := splitLines(content)
+	for _, line := range lines {
+		// Remove end-of-line comments (whitespace followed by ; or #)
+		line = stripEndOfLineComment(line)
+
+		// Trim whitespace
+		line = trimWhitespace(line)
+
+		// Skip empty lines
+		if len(line) == 0 {
+			continue
+		}
+
+		// Check for full-line comments
+		if isFullLineComment(line) {
+			continue
+		}
+
+		// Check for section header
+		if line[0] == '[' {
+			sectionName := parseSectionHeader(line)
+			inDecorationsSection = (sectionName == "decorations")
+			continue
+		}
+
+		// Parse key=value if in decorations section
+		if inDecorationsSection {
+			key, value, ok := parseKeyValue(line)
+			if ok {
+				bytePos, err := parseInt64(value)
+				if err != nil {
+					// Skip malformed entries silently for robustness
+					continue
+				}
+				addr := ByteAddress(bytePos)
+				entries = append(entries, DecorationEntry{
+					Key:     key,
+					Address: &addr,
+				})
+			}
+		}
+		// Unknown sections are silently ignored
+	}
+
+	return entries, nil
+}
+
+// splitLines splits content into lines, handling various line endings.
+func splitLines(content string) []string {
+	var lines []string
+	var current []byte
+
+	for i := 0; i < len(content); i++ {
+		if content[i] == '\n' {
+			lines = append(lines, string(current))
+			current = current[:0]
+		} else if content[i] == '\r' {
+			lines = append(lines, string(current))
+			current = current[:0]
+			// Skip following \n if present (CRLF)
+			if i+1 < len(content) && content[i+1] == '\n' {
+				i++
+			}
+		} else {
+			current = append(current, content[i])
+		}
+	}
+	// Don't forget the last line if it doesn't end with newline
+	if len(current) > 0 {
+		lines = append(lines, string(current))
+	}
+
+	return lines
+}
+
+// stripEndOfLineComment removes end-of-line comments.
+// End-of-line comments start with whitespace followed by ';' or '#'.
+func stripEndOfLineComment(line string) string {
+	for i := 0; i < len(line); i++ {
+		// Look for whitespace
+		if line[i] == ' ' || line[i] == '\t' {
+			// Check if followed by comment character
+			for j := i + 1; j < len(line); j++ {
+				if line[j] == ' ' || line[j] == '\t' {
+					continue
+				}
+				if line[j] == ';' || line[j] == '#' {
+					return line[:i]
+				}
+				break
+			}
+		}
+	}
+	return line
+}
+
+// isFullLineComment checks if a line is a full-line comment.
+// Comments start with ';' or '# ' (hash followed by space).
+func isFullLineComment(line string) bool {
+	if len(line) == 0 {
+		return false
+	}
+	// Semicolon comments
+	if line[0] == ';' {
+		return true
+	}
+	// Hash comments require a space after (to allow #fragment bookmarks)
+	if line[0] == '#' && len(line) > 1 && line[1] == ' ' {
+		return true
+	}
+	return false
+}
+
+// parseSectionHeader extracts the section name from a line like "[section]".
+func parseSectionHeader(line string) string {
+	if len(line) < 2 || line[0] != '[' {
+		return ""
+	}
+	end := -1
+	for i := 1; i < len(line); i++ {
+		if line[i] == ']' {
+			end = i
+			break
+		}
+	}
+	if end == -1 {
+		return ""
+	}
+	return trimWhitespace(line[1:end])
+}
+
+// parseKeyValue parses a "key=value" line.
+func parseKeyValue(line string) (key, value string, ok bool) {
+	eqIndex := -1
+	for i := 0; i < len(line); i++ {
+		if line[i] == '=' {
+			eqIndex = i
+			break
+		}
+	}
+	if eqIndex == -1 {
+		return "", "", false
+	}
+	key = trimWhitespace(line[:eqIndex])
+	value = trimWhitespace(line[eqIndex+1:])
+	return key, value, true
+}
+
+// trimWhitespace removes leading and trailing whitespace.
+func trimWhitespace(s string) string {
+	start := 0
+	for start < len(s) && (s[start] == ' ' || s[start] == '\t') {
+		start++
+	}
+	end := len(s)
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t') {
+		end--
+	}
+	return s[start:end]
+}
+
+// parseInt64 parses a string as int64.
+func parseInt64(s string) (int64, error) {
+	if len(s) == 0 {
+		return 0, ErrInvalidPosition
+	}
+
+	negative := false
+	start := 0
+	if s[0] == '-' {
+		negative = true
+		start = 1
+	} else if s[0] == '+' {
+		start = 1
+	}
+
+	if start >= len(s) {
+		return 0, ErrInvalidPosition
+	}
+
+	var result int64
+	for i := start; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, ErrInvalidPosition
+		}
+		result = result*10 + int64(s[i]-'0')
+	}
+
+	if negative {
+		result = -result
+	}
+	return result, nil
 }
