@@ -208,6 +208,52 @@ func (r *REPL) handleCommand(input string) bool {
 	case "dumpdecorations":
 		r.cmdDumpDecorations(args)
 
+	// Search commands
+	case "find":
+		r.cmdFind(args)
+
+	case "findall":
+		r.cmdFindAll(args)
+
+	case "findnext":
+		r.cmdFindNext(args)
+
+	case "findregex":
+		r.cmdFindRegex(args)
+
+	case "findregexall":
+		r.cmdFindRegexAll(args)
+
+	case "findnextregex":
+		r.cmdFindNextRegex(args)
+
+	case "match":
+		r.cmdMatch(args)
+
+	case "replace":
+		r.cmdReplace(args)
+
+	case "replaceall":
+		r.cmdReplaceAll(args)
+
+	case "replacecount":
+		r.cmdReplaceCount(args)
+
+	case "replaceregex":
+		r.cmdReplaceRegex(args)
+
+	case "replaceregexall":
+		r.cmdReplaceRegexAll(args)
+
+	case "replaceregexcount":
+		r.cmdReplaceRegexCount(args)
+
+	case "count":
+		r.cmdCount(args)
+
+	case "countregex":
+		r.cmdCountRegex(args)
+
 	default:
 		fmt.Printf("Unknown command: %s. Type 'help' for available commands.\n", cmd)
 	}
@@ -310,6 +356,27 @@ POSITION CONVERSION:
   convert byte <pos>        Convert byte position to rune/line
   convert rune <pos>        Convert rune position to byte/line
   convert line <l> <r>      Convert line:rune position to byte/rune
+
+SEARCH & REPLACE:
+  find "needle" [flags]     Find first occurrence from cursor
+  findall "needle" [flags]  Find all occurrences
+  findnext "needle" [flags] Find next and move cursor to it
+  findregex "pattern" [flags]    Find first regex match
+  findregexall "pattern" [flags] Find all regex matches
+  findnextregex "pattern" [flags] Find next regex match, move cursor
+  match "pattern" [flags]   Check if regex matches at cursor position
+  replace "needle" "repl" [flags]    Replace first occurrence
+  replaceall "needle" "repl" [flags] Replace all occurrences
+  replacecount "needle" "repl" <n> [flags] Replace up to n occurrences
+  replaceregex "pattern" "repl" [flags]    Replace first regex match
+  replaceregexall "pattern" "repl" [flags] Replace all regex matches
+  replaceregexcount "pattern" "repl" <n> [flags] Replace up to n regex matches
+  count "needle" [flags]    Count occurrences
+  countregex "pattern" [flags] Count regex matches
+
+Search flags: -i (case insensitive), -w (whole word), -b (backward)
+Regex flags: -i (case insensitive), -b (backward)
+Regex replacement supports $1, $2, etc. for capture groups.
 
 OTHER:
   help                      Show this help message
@@ -1990,6 +2057,689 @@ func (r *REPL) cmdDumpDecorations(args []string) {
 	}
 
 	fmt.Printf("Decorations exported to %s\n", path)
+}
+
+// parseSearchFlags parses flags from args: -i (case insensitive), -w (whole word), -b (backward)
+func parseSearchFlags(args []string) (garland.SearchOptions, []string) {
+	opts := garland.SearchOptions{
+		CaseSensitive: true, // Default to case sensitive
+		WholeWord:     false,
+		Backward:      false,
+	}
+
+	var remaining []string
+	for _, arg := range args {
+		switch arg {
+		case "-i":
+			opts.CaseSensitive = false
+		case "-w":
+			opts.WholeWord = true
+		case "-b":
+			opts.Backward = true
+		default:
+			remaining = append(remaining, arg)
+		}
+	}
+	return opts, remaining
+}
+
+// parseRegexFlags parses flags from args: -i (case insensitive), -b (backward)
+func parseRegexFlags(args []string) (garland.RegexOptions, []string) {
+	opts := garland.RegexOptions{
+		CaseInsensitive: false,
+		Backward:        false,
+	}
+
+	var remaining []string
+	for _, arg := range args {
+		switch arg {
+		case "-i":
+			opts.CaseInsensitive = true
+		case "-b":
+			opts.Backward = true
+		default:
+			remaining = append(remaining, arg)
+		}
+	}
+	return opts, remaining
+}
+
+func (r *REPL) cmdFind(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 1 {
+		fmt.Println("Usage: find \"needle\" [-i] [-w] [-b]")
+		fmt.Println("  -i: case insensitive")
+		fmt.Println("  -w: whole word only")
+		fmt.Println("  -b: search backward")
+		return
+	}
+
+	opts, remaining := parseSearchFlags(args)
+	if len(remaining) < 1 {
+		fmt.Println("Usage: find \"needle\" [flags]")
+		return
+	}
+
+	needle, _, err := r.parseQuotedString(strings.Join(remaining, " "))
+	if err != nil {
+		fmt.Printf("Parse error: %v\n", err)
+		return
+	}
+
+	cursor := r.cursor()
+	match, err := cursor.FindString(needle, opts)
+	if err != nil {
+		fmt.Printf("Find error: %v\n", err)
+		return
+	}
+
+	if match == nil {
+		fmt.Println("No match found")
+		return
+	}
+
+	fmt.Printf("Found at byte %d-%d: %q\n", match.ByteStart, match.ByteEnd, match.Match)
+}
+
+func (r *REPL) cmdFindAll(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 1 {
+		fmt.Println("Usage: findall \"needle\" [-i] [-w] [-b]")
+		return
+	}
+
+	opts, remaining := parseSearchFlags(args)
+	if len(remaining) < 1 {
+		fmt.Println("Usage: findall \"needle\" [flags]")
+		return
+	}
+
+	needle, _, err := r.parseQuotedString(strings.Join(remaining, " "))
+	if err != nil {
+		fmt.Printf("Parse error: %v\n", err)
+		return
+	}
+
+	cursor := r.cursor()
+	matches, err := cursor.FindStringAll(needle, opts)
+	if err != nil {
+		fmt.Printf("Find error: %v\n", err)
+		return
+	}
+
+	if len(matches) == 0 {
+		fmt.Println("No matches found")
+		return
+	}
+
+	fmt.Printf("Found %d matches:\n", len(matches))
+	for i, match := range matches {
+		fmt.Printf("  %d. byte %d-%d: %q\n", i+1, match.ByteStart, match.ByteEnd, match.Match)
+	}
+}
+
+func (r *REPL) cmdFindNext(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 1 {
+		fmt.Println("Usage: findnext \"needle\" [-i] [-w] [-b]")
+		return
+	}
+
+	opts, remaining := parseSearchFlags(args)
+	if len(remaining) < 1 {
+		fmt.Println("Usage: findnext \"needle\" [flags]")
+		return
+	}
+
+	needle, _, err := r.parseQuotedString(strings.Join(remaining, " "))
+	if err != nil {
+		fmt.Printf("Parse error: %v\n", err)
+		return
+	}
+
+	cursor := r.cursor()
+	match, err := cursor.FindNext(needle, opts)
+	if err != nil {
+		fmt.Printf("Find error: %v\n", err)
+		return
+	}
+
+	if match == nil {
+		fmt.Println("No match found")
+		return
+	}
+
+	line, lineRune := cursor.LinePos()
+	fmt.Printf("Found at byte %d-%d: %q\n", match.ByteStart, match.ByteEnd, match.Match)
+	fmt.Printf("Cursor moved to byte=%d, line=%d:%d\n", cursor.BytePos(), line, lineRune)
+}
+
+func (r *REPL) cmdFindRegex(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 1 {
+		fmt.Println("Usage: findregex \"pattern\" [-i] [-b]")
+		fmt.Println("  -i: case insensitive")
+		fmt.Println("  -b: search backward")
+		return
+	}
+
+	opts, remaining := parseRegexFlags(args)
+	if len(remaining) < 1 {
+		fmt.Println("Usage: findregex \"pattern\" [flags]")
+		return
+	}
+
+	pattern, _, err := r.parseQuotedString(strings.Join(remaining, " "))
+	if err != nil {
+		fmt.Printf("Parse error: %v\n", err)
+		return
+	}
+
+	cursor := r.cursor()
+	match, err := cursor.FindRegex(pattern, opts)
+	if err != nil {
+		fmt.Printf("Find error: %v\n", err)
+		return
+	}
+
+	if match == nil {
+		fmt.Println("No match found")
+		return
+	}
+
+	fmt.Printf("Found at byte %d-%d: %q\n", match.ByteStart, match.ByteEnd, match.Match)
+}
+
+func (r *REPL) cmdFindRegexAll(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 1 {
+		fmt.Println("Usage: findregexall \"pattern\" [-i] [-b]")
+		return
+	}
+
+	opts, remaining := parseRegexFlags(args)
+	if len(remaining) < 1 {
+		fmt.Println("Usage: findregexall \"pattern\" [flags]")
+		return
+	}
+
+	pattern, _, err := r.parseQuotedString(strings.Join(remaining, " "))
+	if err != nil {
+		fmt.Printf("Parse error: %v\n", err)
+		return
+	}
+
+	cursor := r.cursor()
+	matches, err := cursor.FindRegexAll(pattern, opts)
+	if err != nil {
+		fmt.Printf("Find error: %v\n", err)
+		return
+	}
+
+	if len(matches) == 0 {
+		fmt.Println("No matches found")
+		return
+	}
+
+	fmt.Printf("Found %d matches:\n", len(matches))
+	for i, match := range matches {
+		fmt.Printf("  %d. byte %d-%d: %q\n", i+1, match.ByteStart, match.ByteEnd, match.Match)
+	}
+}
+
+func (r *REPL) cmdFindNextRegex(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 1 {
+		fmt.Println("Usage: findnextregex \"pattern\" [-i] [-b]")
+		return
+	}
+
+	opts, remaining := parseRegexFlags(args)
+	if len(remaining) < 1 {
+		fmt.Println("Usage: findnextregex \"pattern\" [flags]")
+		return
+	}
+
+	pattern, _, err := r.parseQuotedString(strings.Join(remaining, " "))
+	if err != nil {
+		fmt.Printf("Parse error: %v\n", err)
+		return
+	}
+
+	cursor := r.cursor()
+	match, err := cursor.FindNextRegex(pattern, opts)
+	if err != nil {
+		fmt.Printf("Find error: %v\n", err)
+		return
+	}
+
+	if match == nil {
+		fmt.Println("No match found")
+		return
+	}
+
+	line, lineRune := cursor.LinePos()
+	fmt.Printf("Found at byte %d-%d: %q\n", match.ByteStart, match.ByteEnd, match.Match)
+	fmt.Printf("Cursor moved to byte=%d, line=%d:%d\n", cursor.BytePos(), line, lineRune)
+}
+
+func (r *REPL) cmdMatch(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 1 {
+		fmt.Println("Usage: match \"pattern\" [-i]")
+		fmt.Println("  Checks if regex matches at current cursor position")
+		return
+	}
+
+	caseInsensitive := false
+	var remaining []string
+	for _, arg := range args {
+		if arg == "-i" {
+			caseInsensitive = true
+		} else {
+			remaining = append(remaining, arg)
+		}
+	}
+
+	if len(remaining) < 1 {
+		fmt.Println("Usage: match \"pattern\" [-i]")
+		return
+	}
+
+	pattern, _, err := r.parseQuotedString(strings.Join(remaining, " "))
+	if err != nil {
+		fmt.Printf("Parse error: %v\n", err)
+		return
+	}
+
+	cursor := r.cursor()
+	matches, result, err := cursor.MatchRegex(pattern, caseInsensitive)
+	if err != nil {
+		fmt.Printf("Match error: %v\n", err)
+		return
+	}
+
+	if !matches {
+		fmt.Println("No match at cursor position")
+		return
+	}
+
+	fmt.Printf("Match found: %q (bytes %d-%d)\n", result.Match, result.ByteStart, result.ByteEnd)
+}
+
+func (r *REPL) cmdReplace(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 2 {
+		fmt.Println("Usage: replace \"needle\" \"replacement\" [-i] [-w] [-b]")
+		return
+	}
+
+	opts, remaining := parseSearchFlags(args)
+	if len(remaining) < 2 {
+		fmt.Println("Usage: replace \"needle\" \"replacement\" [flags]")
+		return
+	}
+
+	fullInput := strings.Join(remaining, " ")
+	needle, remainder, err := r.parseQuotedString(fullInput)
+	if err != nil {
+		fmt.Printf("Parse error for needle: %v\n", err)
+		return
+	}
+
+	replacement, _, err := r.parseQuotedString(strings.TrimSpace(remainder))
+	if err != nil {
+		fmt.Printf("Parse error for replacement: %v\n", err)
+		return
+	}
+
+	cursor := r.cursor()
+	replaced, result, err := cursor.ReplaceString(needle, replacement, opts)
+	if err != nil {
+		fmt.Printf("Replace error: %v\n", err)
+		return
+	}
+
+	if !replaced {
+		fmt.Println("No match found")
+		return
+	}
+
+	fmt.Printf("Replaced 1 occurrence. Fork=%d, revision=%d\n", result.Fork, result.Revision)
+}
+
+func (r *REPL) cmdReplaceAll(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 2 {
+		fmt.Println("Usage: replaceall \"needle\" \"replacement\" [-i] [-w] [-b]")
+		return
+	}
+
+	opts, remaining := parseSearchFlags(args)
+	if len(remaining) < 2 {
+		fmt.Println("Usage: replaceall \"needle\" \"replacement\" [flags]")
+		return
+	}
+
+	fullInput := strings.Join(remaining, " ")
+	needle, remainder, err := r.parseQuotedString(fullInput)
+	if err != nil {
+		fmt.Printf("Parse error for needle: %v\n", err)
+		return
+	}
+
+	replacement, _, err := r.parseQuotedString(strings.TrimSpace(remainder))
+	if err != nil {
+		fmt.Printf("Parse error for replacement: %v\n", err)
+		return
+	}
+
+	cursor := r.cursor()
+	count, result, err := cursor.ReplaceStringAll(needle, replacement, opts)
+	if err != nil {
+		fmt.Printf("Replace error: %v\n", err)
+		return
+	}
+
+	if count == 0 {
+		fmt.Println("No matches found")
+		return
+	}
+
+	fmt.Printf("Replaced %d occurrences. Fork=%d, revision=%d\n", count, result.Fork, result.Revision)
+}
+
+func (r *REPL) cmdReplaceCount(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 3 {
+		fmt.Println("Usage: replacecount \"needle\" \"replacement\" <count> [-i] [-w] [-b]")
+		return
+	}
+
+	opts, remaining := parseSearchFlags(args)
+	if len(remaining) < 3 {
+		fmt.Println("Usage: replacecount \"needle\" \"replacement\" <count> [flags]")
+		return
+	}
+
+	fullInput := strings.Join(remaining, " ")
+	needle, remainder, err := r.parseQuotedString(fullInput)
+	if err != nil {
+		fmt.Printf("Parse error for needle: %v\n", err)
+		return
+	}
+
+	remainder = strings.TrimSpace(remainder)
+	replacement, remainder, err := r.parseQuotedString(remainder)
+	if err != nil {
+		fmt.Printf("Parse error for replacement: %v\n", err)
+		return
+	}
+
+	remainder = strings.TrimSpace(remainder)
+	count, err := strconv.Atoi(strings.Fields(remainder)[0])
+	if err != nil {
+		fmt.Printf("Invalid count: %v\n", err)
+		return
+	}
+
+	cursor := r.cursor()
+	replaced, result, err := cursor.ReplaceStringCount(needle, replacement, count, opts)
+	if err != nil {
+		fmt.Printf("Replace error: %v\n", err)
+		return
+	}
+
+	if replaced == 0 {
+		fmt.Println("No matches found")
+		return
+	}
+
+	fmt.Printf("Replaced %d occurrences. Fork=%d, revision=%d\n", replaced, result.Fork, result.Revision)
+}
+
+func (r *REPL) cmdReplaceRegex(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 2 {
+		fmt.Println("Usage: replaceregex \"pattern\" \"replacement\" [-i] [-b]")
+		fmt.Println("  Replacement can use $1, $2, etc. for capture groups")
+		return
+	}
+
+	opts, remaining := parseRegexFlags(args)
+	if len(remaining) < 2 {
+		fmt.Println("Usage: replaceregex \"pattern\" \"replacement\" [flags]")
+		return
+	}
+
+	fullInput := strings.Join(remaining, " ")
+	pattern, remainder, err := r.parseQuotedString(fullInput)
+	if err != nil {
+		fmt.Printf("Parse error for pattern: %v\n", err)
+		return
+	}
+
+	replacement, _, err := r.parseQuotedString(strings.TrimSpace(remainder))
+	if err != nil {
+		fmt.Printf("Parse error for replacement: %v\n", err)
+		return
+	}
+
+	cursor := r.cursor()
+	replaced, result, err := cursor.ReplaceRegex(pattern, replacement, opts)
+	if err != nil {
+		fmt.Printf("Replace error: %v\n", err)
+		return
+	}
+
+	if !replaced {
+		fmt.Println("No match found")
+		return
+	}
+
+	fmt.Printf("Replaced 1 occurrence. Fork=%d, revision=%d\n", result.Fork, result.Revision)
+}
+
+func (r *REPL) cmdReplaceRegexAll(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 2 {
+		fmt.Println("Usage: replaceregexall \"pattern\" \"replacement\" [-i] [-b]")
+		return
+	}
+
+	opts, remaining := parseRegexFlags(args)
+	if len(remaining) < 2 {
+		fmt.Println("Usage: replaceregexall \"pattern\" \"replacement\" [flags]")
+		return
+	}
+
+	fullInput := strings.Join(remaining, " ")
+	pattern, remainder, err := r.parseQuotedString(fullInput)
+	if err != nil {
+		fmt.Printf("Parse error for pattern: %v\n", err)
+		return
+	}
+
+	replacement, _, err := r.parseQuotedString(strings.TrimSpace(remainder))
+	if err != nil {
+		fmt.Printf("Parse error for replacement: %v\n", err)
+		return
+	}
+
+	cursor := r.cursor()
+	count, result, err := cursor.ReplaceRegexAll(pattern, replacement, opts)
+	if err != nil {
+		fmt.Printf("Replace error: %v\n", err)
+		return
+	}
+
+	if count == 0 {
+		fmt.Println("No matches found")
+		return
+	}
+
+	fmt.Printf("Replaced %d occurrences. Fork=%d, revision=%d\n", count, result.Fork, result.Revision)
+}
+
+func (r *REPL) cmdReplaceRegexCount(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 3 {
+		fmt.Println("Usage: replaceregexcount \"pattern\" \"replacement\" <count> [-i] [-b]")
+		return
+	}
+
+	opts, remaining := parseRegexFlags(args)
+	if len(remaining) < 3 {
+		fmt.Println("Usage: replaceregexcount \"pattern\" \"replacement\" <count> [flags]")
+		return
+	}
+
+	fullInput := strings.Join(remaining, " ")
+	pattern, remainder, err := r.parseQuotedString(fullInput)
+	if err != nil {
+		fmt.Printf("Parse error for pattern: %v\n", err)
+		return
+	}
+
+	remainder = strings.TrimSpace(remainder)
+	replacement, remainder, err := r.parseQuotedString(remainder)
+	if err != nil {
+		fmt.Printf("Parse error for replacement: %v\n", err)
+		return
+	}
+
+	remainder = strings.TrimSpace(remainder)
+	count, err := strconv.Atoi(strings.Fields(remainder)[0])
+	if err != nil {
+		fmt.Printf("Invalid count: %v\n", err)
+		return
+	}
+
+	cursor := r.cursor()
+	replaced, result, err := cursor.ReplaceRegexCount(pattern, replacement, count, opts)
+	if err != nil {
+		fmt.Printf("Replace error: %v\n", err)
+		return
+	}
+
+	if replaced == 0 {
+		fmt.Println("No matches found")
+		return
+	}
+
+	fmt.Printf("Replaced %d occurrences. Fork=%d, revision=%d\n", replaced, result.Fork, result.Revision)
+}
+
+func (r *REPL) cmdCount(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 1 {
+		fmt.Println("Usage: count \"needle\" [-i] [-w]")
+		return
+	}
+
+	opts, remaining := parseSearchFlags(args)
+	if len(remaining) < 1 {
+		fmt.Println("Usage: count \"needle\" [flags]")
+		return
+	}
+
+	needle, _, err := r.parseQuotedString(strings.Join(remaining, " "))
+	if err != nil {
+		fmt.Printf("Parse error: %v\n", err)
+		return
+	}
+
+	cursor := r.cursor()
+	count, err := cursor.CountString(needle, opts)
+	if err != nil {
+		fmt.Printf("Count error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Found %d occurrences\n", count)
+}
+
+func (r *REPL) cmdCountRegex(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 1 {
+		fmt.Println("Usage: countregex \"pattern\" [-i]")
+		return
+	}
+
+	caseInsensitive := false
+	var remaining []string
+	for _, arg := range args {
+		if arg == "-i" {
+			caseInsensitive = true
+		} else {
+			remaining = append(remaining, arg)
+		}
+	}
+
+	if len(remaining) < 1 {
+		fmt.Println("Usage: countregex \"pattern\" [-i]")
+		return
+	}
+
+	pattern, _, err := r.parseQuotedString(strings.Join(remaining, " "))
+	if err != nil {
+		fmt.Printf("Parse error: %v\n", err)
+		return
+	}
+
+	cursor := r.cursor()
+	count, err := cursor.CountRegex(pattern, caseInsensitive)
+	if err != nil {
+		fmt.Printf("Count error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Found %d matches\n", count)
 }
 
 // Ensure utf8 is used (for future unicode-aware operations)
