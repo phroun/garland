@@ -350,6 +350,19 @@ func (c *Cursor) DeleteBytes(length int64, includeLineDecorations bool) ([]Relat
 	return c.garland.deleteBytesAt(c, c.bytePos, length, includeLineDecorations)
 }
 
+// OverwriteBytes replaces `length` bytes at cursor position with new data.
+// This is more efficient than separate delete + insert for binary editing.
+// The operation properly accounts for changes in line counts (newlines)
+// and rune counts (UTF-8 sequences).
+// Returns decorations that were in the overwritten range.
+// Cursor position is not changed after the operation.
+func (c *Cursor) OverwriteBytes(length int64, newData []byte) ([]RelativeDecoration, ChangeResult, error) {
+	if c.garland == nil {
+		return nil, ChangeResult{}, ErrCursorNotFound
+	}
+	return c.garland.overwriteBytesAt(c, c.bytePos, length, newData)
+}
+
 // DeleteRunes deletes `length` runes starting at cursor position.
 // Returns decorations from the deleted range.
 // If includeLineDecorations is true, also returns (but does not move)

@@ -86,6 +86,9 @@ var (
 var (
 	// ErrNotALeaf indicates that an operation expected a leaf node but got an internal node.
 	ErrNotALeaf = errors.New("expected leaf node")
+
+	// ErrInternal indicates an internal consistency error (should not happen).
+	ErrInternal = errors.New("internal error")
 )
 
 // Configuration errors

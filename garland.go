@@ -726,11 +726,36 @@ func (g *Garland) CurrentRevision() RevisionID {
 }
 
 // ByteCount returns total bytes (or known bytes if still loading).
+// For revisions created during streaming, includes the streaming remainder.
 func (g *Garland) ByteCount() CountResult {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
+
+	// Get the current revision's tree byte count
+	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
+	if rootSnap == nil {
+		return CountResult{Value: 0, Complete: g.countComplete}
+	}
+	treeBytes := rootSnap.byteCount
+
+	// Check for streaming remainder
+	// Only add remainder if current tree is NOT the streaming tree
+	// (otherwise we'd double-count since g.root IS g.streamingRoot)
+	revInfo, hasRevInfo := g.revisionInfo[ForkRevision{g.currentFork, g.currentRevision}]
+	if hasRevInfo && revInfo.StreamKnownBytes >= 0 && g.streamingRoot != nil && g.root != g.streamingRoot {
+		// This revision was created during streaming - add remainder
+		streamSnap := g.streamingRoot.snapshotAt(0, 0)
+		if streamSnap != nil {
+			currentStreamBytes := streamSnap.byteCount
+			if currentStreamBytes > revInfo.StreamKnownBytes {
+				streamRemainderBytes := currentStreamBytes - revInfo.StreamKnownBytes
+				treeBytes += streamRemainderBytes
+			}
+		}
+	}
+
 	return CountResult{
-		Value:    g.totalBytes,
+		Value:    treeBytes,
 		Complete: g.countComplete,
 	}
 }
@@ -836,11 +861,16 @@ func (g *Garland) TransactionCommit() (ChangeResult, error) {
 	}
 
 	// Store revision info for undo history with current root ID
+	streamKnown := int64(-1) // -1 means streaming is complete
+	if g.loader != nil && !g.loader.eofReached {
+		streamKnown = g.loader.bytesLoaded
+	}
 	g.revisionInfo[ForkRevision{g.currentFork, g.currentRevision}] = &RevisionInfo{
-		Revision:   g.currentRevision,
-		Name:       g.transaction.name,
-		HasChanges: g.transaction.hasMutations,
-		RootID:     g.root.id,
+		Revision:         g.currentRevision,
+		Name:             g.transaction.name,
+		HasChanges:       g.transaction.hasMutations,
+		RootID:           g.root.id,
+		StreamKnownBytes: streamKnown,
 	}
 
 	result := ChangeResult{
@@ -1312,6 +1342,7 @@ func (g *Garland) channelLoaderRoutine() {
 				if g.streamingRoot != nil {
 					if revInfo, exists := g.revisionInfo[ForkRevision{0, 0}]; exists {
 						revInfo.RootID = g.streamingRoot.id
+						revInfo.StreamKnownBytes = -1 // Mark as complete
 					}
 				}
 
@@ -1435,10 +1466,11 @@ func (g *Garland) buildInitialTree(data []byte) {
 
 	// Record initial revision (revision 0 with the initial tree)
 	g.revisionInfo[ForkRevision{0, 0}] = &RevisionInfo{
-		Revision:   0,
-		Name:       "(initial)",
-		HasChanges: false,
-		RootID:     g.root.id,
+		Revision:         0,
+		Name:             "(initial)",
+		HasChanges:       false,
+		RootID:           g.root.id,
+		StreamKnownBytes: -1, // -1 means complete (not streaming)
 	}
 }
 
@@ -1468,11 +1500,13 @@ func (g *Garland) buildEmptyTree() {
 	g.internalNodesByChildren[[2]NodeID{contentNode.id, g.eofNode.id}] = g.root.id
 
 	// Record initial revision (revision 0 with the empty tree)
+	// For channel sources, revision 0 starts with 0 bytes known (streaming)
 	g.revisionInfo[ForkRevision{0, 0}] = &RevisionInfo{
-		Revision:   0,
-		Name:       "(initial)",
-		HasChanges: false,
-		RootID:     g.root.id,
+		Revision:         0,
+		Name:             "(initial)",
+		HasChanges:       false,
+		RootID:           g.root.id,
+		StreamKnownBytes: 0, // 0 means streaming hasn't loaded anything yet
 	}
 }
 
@@ -1824,6 +1858,123 @@ func (g *Garland) deleteBytesAt(c *Cursor, pos int64, length int64, includeLineD
 	return relDecs, result, nil
 }
 
+// overwriteBytesAt replaces bytes at a position with new data in a single atomic operation.
+// This is more efficient than delete + insert for binary editing scenarios.
+func (g *Garland) overwriteBytesAt(c *Cursor, pos int64, length int64, newData []byte) ([]RelativeDecoration, ChangeResult, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// Handle edge case: if length is 0 and newData is empty, nothing to do
+	if length == 0 && len(newData) == 0 {
+		return nil, ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}, nil
+	}
+
+	// Validate position
+	if pos < 0 || pos > g.totalBytes {
+		return nil, ChangeResult{}, ErrInvalidPosition
+	}
+
+	// Clamp length to available data
+	if pos+length > g.totalBytes {
+		length = g.totalBytes - pos
+	}
+
+	// Read the content being overwritten to calculate deltas and get decorations
+	var deletedData []byte
+	var deletedDecs []Decoration
+	var err error
+	var deleteRootID NodeID
+
+	if length > 0 {
+		deletedData, err = g.readBytesRangeInternal(pos, length)
+		if err != nil {
+			return nil, ChangeResult{}, err
+		}
+
+		// Perform the deletion portion
+		deletedDecs, deleteRootID, err = g.deleteRange(pos, length)
+		if err != nil {
+			return nil, ChangeResult{}, err
+		}
+
+		// Update root to the post-deletion tree
+		g.root = g.nodeRegistry[deleteRootID]
+	}
+
+	// Calculate deleted counts
+	deletedBytes := int64(len(deletedData))
+	deletedRunes := int64(len([]rune(string(deletedData))))
+	deletedLines := int64(0)
+	for _, b := range deletedData {
+		if b == '\n' {
+			deletedLines++
+		}
+	}
+
+	// Perform the insertion portion at the same position using the updated tree
+	if len(newData) > 0 {
+		rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
+		if rootSnap == nil {
+			return nil, ChangeResult{}, ErrInternal
+		}
+		newRootID, err := g.insertInternal(g.root, rootSnap, pos, 0, newData, nil, true)
+		if err != nil {
+			return nil, ChangeResult{}, err
+		}
+		g.root = g.nodeRegistry[newRootID]
+	}
+
+	// Calculate inserted counts
+	insertedBytes := int64(len(newData))
+	insertedRunes := int64(len([]rune(string(newData))))
+	insertedLines := int64(0)
+	for _, b := range newData {
+		if b == '\n' {
+			insertedLines++
+		}
+	}
+
+	// Update counts with net change
+	g.totalBytes += insertedBytes - deletedBytes
+	g.totalRunes += insertedRunes - deletedRunes
+	g.totalLines += insertedLines - deletedLines
+
+	// Adjust cursors
+	// If the overwrite changes the byte length, cursors after the range need to shift
+	netByteChange := insertedBytes - deletedBytes
+	netRuneChange := insertedRunes - deletedRunes
+	netLineChange := insertedLines - deletedLines
+
+	for _, cursor := range g.cursors {
+		if cursor != c {
+			if cursor.bytePos >= pos+length {
+				// Cursor is after overwritten range - shift by net change
+				if netByteChange != 0 {
+					cursor.adjustForMutation(pos+length, netByteChange, netRuneChange, netLineChange)
+				}
+			} else if cursor.bytePos > pos {
+				// Cursor is within overwritten range - move to start of range
+				cursor.bytePos = pos
+				cursor.runePos, _ = g.byteToRuneInternal(pos)
+				cursor.line, cursor.lineRune, _ = g.byteToLineRuneInternal(pos)
+			}
+		}
+	}
+
+	// Convert absolute decorations to relative
+	relDecs := make([]RelativeDecoration, len(deletedDecs))
+	for i, d := range deletedDecs {
+		relDecs[i] = RelativeDecoration{
+			Key:      d.Key,
+			Position: d.Position - pos,
+		}
+	}
+
+	// Handle versioning
+	result := g.recordMutation()
+	return relDecs, result, nil
+}
+
 func (g *Garland) deleteRunesAt(c *Cursor, runePos int64, length int64, includeLineDecorations bool) ([]RelativeDecoration, ChangeResult, error) {
 	if length <= 0 {
 		return nil, ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}, nil
@@ -1903,11 +2054,16 @@ func (g *Garland) recordMutation() ChangeResult {
 	}
 
 	// Store revision info (unnamed) with current root ID
+	streamKnown := int64(-1) // -1 means streaming is complete
+	if g.loader != nil && !g.loader.eofReached {
+		streamKnown = g.loader.bytesLoaded
+	}
 	g.revisionInfo[ForkRevision{g.currentFork, g.currentRevision}] = &RevisionInfo{
-		Revision:   g.currentRevision,
-		Name:       "",
-		HasChanges: true,
-		RootID:     g.root.id,
+		Revision:         g.currentRevision,
+		Name:             "",
+		HasChanges:       true,
+		RootID:           g.root.id,
+		StreamKnownBytes: streamKnown,
 	}
 
 	return ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}
@@ -1951,16 +2107,45 @@ func (g *Garland) readBytesAt(pos int64, length int64) ([]byte, error) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
-	if pos > g.totalBytes {
+	// Calculate the actual total bytes for this revision (including streaming remainder)
+	totalBytesForRevision := g.calculateTotalBytesUnlocked()
+
+	if pos > totalBytesForRevision {
 		return nil, ErrInvalidPosition
 	}
 
 	// Clamp length to available data
-	if pos+length > g.totalBytes {
-		length = g.totalBytes - pos
+	if pos+length > totalBytesForRevision {
+		length = totalBytesForRevision - pos
 	}
 
 	return g.readBytesRangeInternal(pos, length)
+}
+
+// calculateTotalBytesUnlocked returns the total bytes for the current revision,
+// including streaming remainder. Caller must hold at least read lock.
+func (g *Garland) calculateTotalBytesUnlocked() int64 {
+	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
+	if rootSnap == nil {
+		return 0
+	}
+	treeBytes := rootSnap.byteCount
+
+	// Check for streaming remainder
+	// Only add remainder if current tree is NOT the streaming tree
+	revInfo, hasRevInfo := g.revisionInfo[ForkRevision{g.currentFork, g.currentRevision}]
+	if hasRevInfo && revInfo.StreamKnownBytes >= 0 && g.streamingRoot != nil && g.root != g.streamingRoot {
+		streamSnap := g.streamingRoot.snapshotAt(0, 0)
+		if streamSnap != nil {
+			currentStreamBytes := streamSnap.byteCount
+			if currentStreamBytes > revInfo.StreamKnownBytes {
+				streamRemainderBytes := currentStreamBytes - revInfo.StreamKnownBytes
+				treeBytes += streamRemainderBytes
+			}
+		}
+	}
+
+	return treeBytes
 }
 
 func (g *Garland) readStringAt(pos int64, length int64) (string, error) {
@@ -2034,9 +2219,101 @@ func (g *Garland) readLineAt(line int64) (string, error) {
 }
 
 // readBytesRangeInternal reads bytes from pos to pos+length.
+// For revisions created during streaming, this includes the streaming remainder.
 // Caller must hold at least read lock.
 func (g *Garland) readBytesRangeInternal(pos int64, length int64) ([]byte, error) {
 	if length <= 0 {
+		return nil, nil
+	}
+
+	// Get revision info to check for streaming remainder
+	revInfo, hasRevInfo := g.revisionInfo[ForkRevision{g.currentFork, g.currentRevision}]
+
+	// Calculate tree byte count
+	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
+	if rootSnap == nil {
+		return nil, ErrInternal
+	}
+	treeBytes := rootSnap.byteCount
+
+	// Calculate streaming remainder if applicable
+	// Only add remainder if current tree is NOT the streaming tree
+	streamRemainderStart := int64(-1) // -1 means no remainder
+	streamRemainderBytes := int64(0)
+
+	if hasRevInfo && revInfo.StreamKnownBytes >= 0 && g.streamingRoot != nil && g.root != g.streamingRoot {
+		// This revision was created during streaming - it may have remainder
+		streamSnap := g.streamingRoot.snapshotAt(0, 0)
+		if streamSnap != nil {
+			currentStreamBytes := streamSnap.byteCount
+			if currentStreamBytes > revInfo.StreamKnownBytes {
+				streamRemainderStart = revInfo.StreamKnownBytes
+				streamRemainderBytes = currentStreamBytes - revInfo.StreamKnownBytes
+			}
+		}
+	}
+
+	totalBytes := treeBytes + streamRemainderBytes
+
+	// Clamp length to available bytes
+	if pos >= totalBytes {
+		return nil, nil
+	}
+	if pos+length > totalBytes {
+		length = totalBytes - pos
+	}
+
+	result := make([]byte, 0, length)
+	remaining := length
+	currentPos := pos
+
+	// Read from tree portion
+	for remaining > 0 && currentPos < treeBytes {
+		leafResult, err := g.findLeafByByteUnlocked(currentPos)
+		if err != nil {
+			return nil, err
+		}
+
+		snap := leafResult.Snapshot
+
+		// Calculate how much we can read from this leaf
+		availableInLeaf := snap.byteCount - leafResult.ByteOffset
+		toRead := remaining
+		if toRead > availableInLeaf {
+			toRead = availableInLeaf
+		}
+		// Don't read past tree boundary
+		if currentPos+toRead > treeBytes {
+			toRead = treeBytes - currentPos
+		}
+
+		// Copy data from leaf
+		start := leafResult.ByteOffset
+		end := start + toRead
+		result = append(result, snap.data[start:end]...)
+
+		remaining -= toRead
+		currentPos += toRead
+	}
+
+	// Read from streaming remainder if needed
+	if remaining > 0 && streamRemainderStart >= 0 {
+		// currentPos is now >= treeBytes, convert to streaming position
+		streamPos := streamRemainderStart + (currentPos - treeBytes)
+		streamData, err := g.readFromStreamingTree(streamPos, remaining)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, streamData...)
+	}
+
+	return result, nil
+}
+
+// readFromStreamingTree reads bytes from the streamingRoot tree at the given position.
+// Caller must hold at least read lock.
+func (g *Garland) readFromStreamingTree(pos int64, length int64) ([]byte, error) {
+	if g.streamingRoot == nil || length <= 0 {
 		return nil, nil
 	}
 
@@ -2045,9 +2322,12 @@ func (g *Garland) readBytesRangeInternal(pos int64, length int64) ([]byte, error
 	currentPos := pos
 
 	for remaining > 0 {
-		leafResult, err := g.findLeafByByteUnlocked(currentPos)
+		leafResult, err := g.findLeafByByteInTree(g.streamingRoot, 0, 0, currentPos)
 		if err != nil {
 			return nil, err
+		}
+		if leafResult == nil {
+			break // Past end of streaming tree
 		}
 
 		snap := leafResult.Snapshot
@@ -2069,6 +2349,61 @@ func (g *Garland) readBytesRangeInternal(pos int64, length int64) ([]byte, error
 	}
 
 	return result, nil
+}
+
+// findLeafByByteInTree finds the leaf containing the given byte position in a specific tree.
+// Caller must hold at least read lock.
+func (g *Garland) findLeafByByteInTree(root *Node, fork ForkID, revision RevisionID, pos int64) (*LeafSearchResult, error) {
+	if root == nil {
+		return nil, ErrInternal
+	}
+
+	node := root
+	accumulatedBytes := int64(0)
+
+	for {
+		snap := node.snapshotAt(fork, revision)
+		if snap == nil {
+			return nil, ErrInternal
+		}
+
+		// Check if this is a leaf
+		if snap.leftID == 0 {
+			// Leaf node
+			if pos-accumulatedBytes >= snap.byteCount {
+				return nil, nil // Past end
+			}
+			return &LeafSearchResult{
+				Node:       node,
+				Snapshot:   snap,
+				ByteOffset: pos - accumulatedBytes,
+			}, nil
+		}
+
+		// Internal node - descend
+		leftNode := g.nodeRegistry[snap.leftID]
+		if leftNode == nil {
+			return nil, ErrInternal
+		}
+
+		leftSnap := leftNode.snapshotAt(fork, revision)
+		if leftSnap == nil {
+			return nil, ErrInternal
+		}
+
+		if pos < accumulatedBytes+leftSnap.byteCount {
+			// Position is in left subtree
+			node = leftNode
+		} else {
+			// Position is in right subtree
+			accumulatedBytes += leftSnap.byteCount
+			rightNode := g.nodeRegistry[snap.rightID]
+			if rightNode == nil {
+				return nil, ErrInternal
+			}
+			node = rightNode
+		}
+	}
 }
 
 // findLineEnd finds the byte position of the end of the line (at newline or EOF).

@@ -383,3 +383,83 @@ func TestChannelSourceUndoToRevision0(t *testing.T) {
 		t.Errorf("After undo to rev 0: %q, want %q", string(data), "Streamed content")
 	}
 }
+
+func TestChannelSourceStreamingContinuesAfterEdits(t *testing.T) {
+	// This test verifies that streaming content arriving AFTER an edit
+	// is visible when you UndoSeek back to that revision.
+	// The user's model: streaming content "was always there" - it should
+	// be visible from ALL revisions as the "remainder" that wasn't
+	// accessible yet when that revision was created.
+	lib, _ := Init(LibraryOptions{})
+	dataChan := make(chan []byte)
+
+	g, _ := lib.Open(FileOptions{DataChannel: dataChan})
+	defer g.Close()
+
+	// Feed initial data
+	dataChan <- []byte("Initial")
+	time.Sleep(10 * time.Millisecond)
+
+	cursor := g.NewCursor()
+
+	// Make an edit while stream is still open - creates revision 1
+	cursor.SeekByte(0)
+	cursor.InsertString("PREFIX:", nil, true)
+
+	// At revision 1, we should see "PREFIX:Initial"
+	cursor.SeekByte(0)
+	data, _ := cursor.ReadBytes(15)
+	if string(data) != "PREFIX:Initial" {
+		t.Errorf("At revision 1: %q, want %q", string(data), "PREFIX:Initial")
+	}
+
+	// Now stream more data AFTER the edit
+	dataChan <- []byte(" More")
+	time.Sleep(10 * time.Millisecond)
+
+	// At current revision (1), should we see the new streaming content?
+	// With the "remainder node" model, yes - the content at the end
+	// "was always there" even if we couldn't see it yet.
+	bc := g.ByteCount()
+	// Current working tree: "PREFIX:" (7) + "Initial" (7) + " More" (5) = 19
+	// But the streaming tree is separate from revision 1's tree...
+	t.Logf("ByteCount after more streaming: %d, complete=%v", bc.Value, bc.Complete)
+
+	// Close the stream
+	close(dataChan)
+	time.Sleep(10 * time.Millisecond)
+
+	// UndoSeek to revision 0 - should see all streamed content
+	err := g.UndoSeek(0)
+	if err != nil {
+		t.Fatalf("UndoSeek to 0 failed: %v", err)
+	}
+
+	cursor.SeekByte(0)
+	data, _ = cursor.ReadBytes(12)
+	if string(data) != "Initial More" {
+		t.Errorf("At revision 0 after full stream: %q, want %q", string(data), "Initial More")
+	}
+
+	// UndoSeek to revision 1 - the question is: do we see " More"?
+	// With remainder node model, revision 1 should be: "PREFIX:Initial More"
+	err = g.UndoSeek(1)
+	if err != nil {
+		t.Fatalf("UndoSeek to 1 failed: %v", err)
+	}
+
+	cursor.SeekByte(0)
+	bc = g.ByteCount()
+	t.Logf("At revision 1, ByteCount = %d", bc.Value)
+
+	// What does revision 1 show?
+	data, _ = cursor.ReadBytes(bc.Value)
+	t.Logf("Revision 1 content: %q (len=%d)", string(data), len(data))
+
+	// Revision 1 should show "PREFIX:Initial More" (19 bytes)
+	// because the streaming remainder is appended to all revisions
+	expected := "PREFIX:Initial More"
+	if string(data) != expected {
+		t.Errorf("Revision 1 content = %q, want %q", string(data), expected)
+	}
+}

@@ -271,8 +271,9 @@ type ForkInfo struct {
 
 // RevisionInfo contains metadata about a revision for undo history display.
 type RevisionInfo struct {
-	Revision   RevisionID
-	Name       string // from TransactionStart
-	HasChanges bool   // true if actual mutations occurred
-	RootID     NodeID // root node ID at this revision (for UndoSeek)
+	Revision         RevisionID
+	Name             string // from TransactionStart
+	HasChanges       bool   // true if actual mutations occurred
+	RootID           NodeID // root node ID at this revision (for UndoSeek)
+	StreamKnownBytes int64  // bytes of streaming content known when revision was created (-1 if complete)
 }
