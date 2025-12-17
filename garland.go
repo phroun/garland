@@ -19,6 +19,29 @@ const (
 	MemoryOnly
 )
 
+// ChillLevel specifies how aggressively to move data to cold storage.
+type ChillLevel int
+
+const (
+	// ChillInactiveForks moves data not used by the currently active fork
+	// to cold storage. This is the gentlest level.
+	ChillInactiveForks ChillLevel = iota
+
+	// ChillOldHistory also moves data from older revisions in the undo
+	// buffer that are more than a few steps back and not utilized by
+	// any branching point.
+	ChillOldHistory
+
+	// ChillUnusedData moves all data not used at the current undo position.
+	// This keeps only what's needed to display/edit the current state.
+	ChillUnusedData
+
+	// ChillEverything moves all data to cold storage. Use when switching
+	// to another document or dropping to a shell. Data will be restored
+	// from cold storage on access.
+	ChillEverything
+)
+
 // ColdStorageInterface allows custom cold storage implementations.
 type ColdStorageInterface interface {
 	// Set stores data for a block within a folder.
@@ -423,6 +446,240 @@ func (g *Garland) SaveAs(fs FileSystemInterface, name string) error {
 	g.mu.RUnlock()
 
 	return fs.WriteFile(name, data)
+}
+
+// Chill moves data to cold storage based on the specified aggressiveness level.
+// This frees memory by storing data externally, to be reloaded on demand.
+//
+// For MemoryOnly files, this is a no-op by design.
+//
+// Levels:
+//   - ChillInactiveForks: Only chill data not used by the current fork
+//   - ChillOldHistory: Also chill old undo history beyond recent revisions
+//   - ChillUnusedData: Chill everything not used at current revision
+//   - ChillEverything: Chill all data (for switching documents or shells)
+func (g *Garland) Chill(level ChillLevel) error {
+	// MemoryOnly files don't use cold storage
+	if g.loadingStyle == MemoryOnly {
+		return nil
+	}
+
+	// Check if cold storage is available
+	if g.lib.coldStorageBackend == nil {
+		return nil
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// Collect nodes that are "in use" based on the level
+	inUse := make(map[NodeID]bool)
+
+	switch level {
+	case ChillInactiveForks:
+		// Keep nodes used by current fork's complete history
+		g.markNodesInUseForFork(g.currentFork, inUse)
+
+	case ChillOldHistory:
+		// Keep nodes for current fork but only recent revisions (within 10 steps)
+		minRev := g.currentRevision
+		if minRev > 10 {
+			minRev = g.currentRevision - 10
+		}
+		g.markNodesInUseForRevisionRange(g.currentFork, minRev, g.currentRevision, inUse)
+		// Also keep nodes at fork branch points
+		g.markNodesAtBranchPoints(inUse)
+
+	case ChillUnusedData:
+		// Only keep nodes at the current revision
+		g.markNodesInUseForRevision(g.currentFork, g.currentRevision, inUse)
+
+	case ChillEverything:
+		// Mark nothing as in use - chill everything
+	}
+
+	// Move data for nodes not in use to cold storage
+	chilledCount := 0
+	for _, node := range g.nodeRegistry {
+		if inUse[node.id] {
+			continue
+		}
+		for forkRev, snap := range node.history {
+			if snap.isLeaf && snap.storageState == StorageMemory && len(snap.data) > 0 {
+				err := g.chillSnapshot(node.id, forkRev, snap)
+				if err != nil {
+					// Log error but continue chilling other nodes
+					continue
+				}
+				chilledCount++
+			}
+		}
+	}
+
+	// For ChillEverything, also chill the "in use" nodes
+	if level == ChillEverything {
+		for nodeID := range inUse {
+			node := g.nodeRegistry[nodeID]
+			if node == nil {
+				continue
+			}
+			for forkRev, snap := range node.history {
+				if snap.isLeaf && snap.storageState == StorageMemory && len(snap.data) > 0 {
+					err := g.chillSnapshot(node.id, forkRev, snap)
+					if err != nil {
+						continue
+					}
+					chilledCount++
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// chillSnapshot moves a snapshot's data to cold storage.
+func (g *Garland) chillSnapshot(nodeID NodeID, forkRev ForkRevision, snap *NodeSnapshot) error {
+	// Compute hash if not already present
+	if len(snap.dataHash) == 0 {
+		snap.dataHash = computeHash(snap.data)
+	}
+
+	// Store data in cold storage
+	blockName := formatBlockName(nodeID, forkRev)
+	err := g.lib.coldStorageBackend.Set(g.id, blockName, snap.data)
+	if err != nil {
+		return err
+	}
+
+	// Store decorations if present
+	if len(snap.decorations) > 0 {
+		if len(snap.decorationHash) == 0 {
+			snap.decorationHash = computeHash(encodeDecorations(snap.decorations))
+		}
+		decBlockName := formatBlockName(nodeID, forkRev) + ".dec"
+		err = g.lib.coldStorageBackend.Set(g.id, decBlockName, encodeDecorations(snap.decorations))
+		if err != nil {
+			return err
+		}
+		snap.decorations = nil
+	}
+
+	// Clear in-memory data and update state
+	snap.data = nil
+	snap.storageState = StorageCold
+
+	return nil
+}
+
+// markNodesInUseForFork marks all nodes used by any revision in a fork.
+func (g *Garland) markNodesInUseForFork(fork ForkID, inUse map[NodeID]bool) {
+	forkInfo := g.forks[fork]
+	if forkInfo == nil {
+		return
+	}
+
+	// Mark nodes for all revisions in this fork
+	for rev := RevisionID(0); rev <= forkInfo.HighestRevision; rev++ {
+		g.markNodesInUseForRevision(fork, rev, inUse)
+	}
+
+	// If this fork has a parent, mark parent fork nodes too
+	if forkInfo.ParentFork != fork {
+		g.markNodesInUseForFork(forkInfo.ParentFork, inUse)
+	}
+}
+
+// markNodesInUseForRevision marks all nodes reachable from a specific revision.
+func (g *Garland) markNodesInUseForRevision(fork ForkID, rev RevisionID, inUse map[NodeID]bool) {
+	revInfo := g.revisionInfo[ForkRevision{fork, rev}]
+	if revInfo == nil {
+		return
+	}
+
+	g.markNodesReachableFrom(revInfo.RootID, fork, rev, inUse)
+}
+
+// markNodesInUseForRevisionRange marks nodes for a range of revisions.
+func (g *Garland) markNodesInUseForRevisionRange(fork ForkID, minRev, maxRev RevisionID, inUse map[NodeID]bool) {
+	for rev := minRev; rev <= maxRev; rev++ {
+		g.markNodesInUseForRevision(fork, rev, inUse)
+	}
+}
+
+// markNodesAtBranchPoints marks nodes at fork divergence points.
+func (g *Garland) markNodesAtBranchPoints(inUse map[NodeID]bool) {
+	for _, forkInfo := range g.forks {
+		if forkInfo.ParentFork != forkInfo.ID {
+			// This fork branched from parent - mark the branch point
+			g.markNodesInUseForRevision(forkInfo.ParentFork, forkInfo.ParentRevision, inUse)
+		}
+	}
+}
+
+// markNodesReachableFrom recursively marks all nodes reachable from a root.
+func (g *Garland) markNodesReachableFrom(nodeID NodeID, fork ForkID, rev RevisionID, inUse map[NodeID]bool) {
+	if nodeID == 0 || inUse[nodeID] {
+		return
+	}
+
+	inUse[nodeID] = true
+
+	node := g.nodeRegistry[nodeID]
+	if node == nil {
+		return
+	}
+
+	snap := node.snapshotAt(fork, rev)
+	if snap == nil || snap.isLeaf {
+		return
+	}
+
+	// Recurse into children
+	g.markNodesReachableFrom(snap.leftID, fork, rev, inUse)
+	g.markNodesReachableFrom(snap.rightID, fork, rev, inUse)
+}
+
+// formatBlockName creates a unique name for a cold storage block.
+func formatBlockName(nodeID NodeID, forkRev ForkRevision) string {
+	return formatNodeID(nodeID) + "_" + formatForkRev(forkRev)
+}
+
+func formatNodeID(id NodeID) string {
+	return formatUint64(uint64(id))
+}
+
+func formatForkRev(fr ForkRevision) string {
+	return formatUint64(uint64(fr.Fork)) + "_" + formatUint64(uint64(fr.Revision))
+}
+
+func formatUint64(n uint64) string {
+	if n == 0 {
+		return "0"
+	}
+	digits := make([]byte, 0, 20)
+	for n > 0 {
+		digits = append(digits, byte('0'+n%10))
+		n /= 10
+	}
+	// Reverse
+	for i, j := 0, len(digits)-1; i < j; i, j = i+1, j-1 {
+		digits[i], digits[j] = digits[j], digits[i]
+	}
+	return string(digits)
+}
+
+// encodeDecorations serializes decorations for cold storage.
+func encodeDecorations(decs []Decoration) []byte {
+	// Simple format: key\0position\n for each decoration
+	var buf []byte
+	for _, d := range decs {
+		buf = append(buf, []byte(d.Key)...)
+		buf = append(buf, 0)
+		buf = append(buf, []byte(formatUint64(uint64(d.Position)))...)
+		buf = append(buf, '\n')
+	}
+	return buf
 }
 
 // NewCursor creates a new cursor at position 0.
@@ -1023,7 +1280,105 @@ func (g *Garland) loadFromFile(path string) ([]byte, error) {
 }
 
 func (g *Garland) startChannelLoader(ch chan []byte) {
-	// TODO: Implement channel loading
+	g.loader = &Loader{
+		garland:  g,
+		dataChan: ch,
+		stopChan: make(chan struct{}),
+	}
+
+	// Start background goroutine to read from channel
+	go g.channelLoaderRoutine()
+}
+
+// channelLoaderRoutine reads data from the channel and appends it to the tree.
+func (g *Garland) channelLoaderRoutine() {
+	for {
+		select {
+		case <-g.loader.stopChan:
+			return
+		case data, ok := <-g.loader.dataChan:
+			if !ok {
+				// Channel closed - mark as complete and update revision 0
+				g.mu.Lock()
+				g.countComplete = true
+				g.loader.eofReached = true
+
+				// Update revision 0 to point to the final tree state
+				// This allows UndoSeek(0) to return to the fully loaded content
+				if revInfo, exists := g.revisionInfo[ForkRevision{0, 0}]; exists {
+					revInfo.RootID = g.root.id
+				}
+
+				g.mu.Unlock()
+				return
+			}
+			if len(data) > 0 {
+				g.appendStreamData(data)
+			}
+		}
+	}
+}
+
+// appendStreamData appends data from a streaming source to the tree.
+func (g *Garland) appendStreamData(data []byte) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// Create a new leaf node for this chunk
+	g.nextNodeID++
+	chunkNode := newNode(g.nextNodeID, g)
+	g.nodeRegistry[chunkNode.id] = chunkNode
+
+	snap := createLeafSnapshot(data, nil, 0)
+	chunkNode.setSnapshot(g.currentFork, g.currentRevision, snap)
+
+	// Get current root snapshot
+	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
+	if rootSnap == nil {
+		return
+	}
+
+	// Get the left child (content) and right child (EOF)
+	leftID := rootSnap.leftID
+	eofID := rootSnap.rightID
+
+	// Insert the new chunk before the EOF node
+	// We need to create a new internal node that combines existing content with new chunk
+	leftNode := g.nodeRegistry[leftID]
+	leftSnap := leftNode.snapshotAt(g.currentFork, g.currentRevision)
+
+	// Create new internal node combining left content with new chunk
+	g.nextNodeID++
+	newContentNode := newNode(g.nextNodeID, g)
+	g.nodeRegistry[newContentNode.id] = newContentNode
+
+	newContentSnap := createInternalSnapshot(leftID, chunkNode.id, leftSnap, snap)
+	newContentNode.setSnapshot(g.currentFork, g.currentRevision, newContentSnap)
+
+	// Create new root combining new content with EOF
+	g.nextNodeID++
+	newRoot := newNode(g.nextNodeID, g)
+	g.nodeRegistry[newRoot.id] = newRoot
+
+	eofNode := g.nodeRegistry[eofID]
+	eofSnap := eofNode.snapshotAt(g.currentFork, g.currentRevision)
+
+	newRootSnap := createInternalSnapshot(newContentNode.id, eofID, newContentSnap, eofSnap)
+	newRoot.setSnapshot(g.currentFork, g.currentRevision, newRootSnap)
+
+	g.root = newRoot
+
+	// Update counts
+	g.totalBytes += snap.byteCount
+	g.totalRunes += snap.runeCount
+	g.totalLines += snap.lineCount
+
+	// Update loader progress
+	if g.loader != nil {
+		g.loader.bytesLoaded += snap.byteCount
+		g.loader.runesLoaded += snap.runeCount
+		g.loader.linesLoaded += snap.lineCount
+	}
 }
 
 func (g *Garland) buildInitialTree(data []byte) {
@@ -1092,6 +1447,14 @@ func (g *Garland) buildEmptyTree() {
 
 	// Register the root structure for reuse
 	g.internalNodesByChildren[[2]NodeID{contentNode.id, g.eofNode.id}] = g.root.id
+
+	// Record initial revision (revision 0 with the empty tree)
+	g.revisionInfo[ForkRevision{0, 0}] = &RevisionInfo{
+		Revision:   0,
+		Name:       "(initial)",
+		HasChanges: false,
+		RootID:     g.root.id,
+	}
 }
 
 func (g *Garland) loadInitialDecorations(options FileOptions) error {
