@@ -887,3 +887,77 @@ Pruning process:
 1. Traverse node registry
 2. Remove history entries for pruned versions
 3. Compact remaining history
+
+---
+
+## Future Work: Warm Block Conflict Resolution
+
+### Problem Statement
+
+When a Garland is backed by warm storage (original file), the file may change externally:
+- User modifies file in another application
+- Network file system sync
+- Background process updates
+
+This can lead to:
+- `ErrWarmStorageMismatch` when checksum fails
+- Data corruption if not detected
+- Placeholder blocks if recovery fails
+
+### Proposed Solution
+
+Add an interface for applications to detect and resolve warm block changes:
+
+```go
+// WarmBlockChange describes a detected change in warm storage.
+type WarmBlockChange struct {
+    NodeID       NodeID
+    ExpectedHash []byte
+    ActualHash   []byte
+    ByteRange    [2]int64 // start, end in original file
+}
+
+// ConflictResolution specifies how to handle a warm block change.
+type ConflictResolution int
+
+const (
+    UseWarmVersion ConflictResolution = iota  // Accept the changed file content
+    UseTreeVersion                            // Keep the in-memory tree version
+    MergeManual                               // Application will provide merged data
+)
+
+// WarmBlockConflict is returned when warm storage has changed.
+type WarmBlockConflict struct {
+    Changes     []WarmBlockChange
+    TreeContent []byte              // What the tree expects
+    WarmContent []byte              // What warm storage now contains
+}
+
+// DetectWarmChanges checks for modifications to the backing file.
+// Can also detect changes when file is in cold storage (comparing checksums).
+func (g *Garland) DetectWarmChanges() ([]WarmBlockConflict, error)
+
+// ResolveWarmConflict applies a resolution to a warm block conflict.
+// For MergeManual, mergedData contains the application's merged content.
+func (g *Garland) ResolveWarmConflict(conflict WarmBlockConflict,
+    resolution ConflictResolution, mergedData []byte) error
+```
+
+### Use Cases
+
+1. **File Modified Externally**: Detect when the backing file has changed and
+   allow the application to show a diff/merge UI similar to git conflict resolution.
+
+2. **Placeholder Recovery**: When blocks became placeholders due to storage errors,
+   allow the application to attempt recovery by re-reading the source file.
+
+3. **Cold Storage Validation**: Even when data is in cold storage, allow periodic
+   validation that warm storage still matches original hashes, enabling early
+   detection of file modifications.
+
+### Implementation Notes
+
+- `HasChanged` in FileSystemInterface already provides basic change detection
+- `BlockChecksum` can verify specific ranges
+- Need to track original file checksums per-block for comparison
+- Resolution might need to create new revisions to preserve history
