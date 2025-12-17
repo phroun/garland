@@ -175,6 +175,9 @@ type Garland struct {
 	eofNode      *Node              // special node for EOF decorations
 	nodeRegistry map[NodeID]*Node   // all nodes
 	nextNodeID   NodeID
+	// Structure lookup: maps (leftID, rightID) to the internal node with those children
+	// This allows us to reuse internal nodes instead of creating new ones
+	internalNodesByChildren map[[2]NodeID]NodeID
 
 	// Versioning
 	currentFork     ForkID
@@ -259,12 +262,13 @@ func (lib *Library) Open(options FileOptions) (*Garland, error) {
 			All:   options.ReadAheadAll,
 		},
 
-		nodeRegistry:    make(map[NodeID]*Node),
-		nextNodeID:      1,
-		forks:           make(map[ForkID]*ForkInfo),
-		revisionInfo:    make(map[ForkRevision]*RevisionInfo),
-		cursors:         make([]*Cursor, 0),
-		decorationCache: make(map[string]*DecorationCacheEntry),
+		nodeRegistry:            make(map[NodeID]*Node),
+		nextNodeID:              1,
+		internalNodesByChildren: make(map[[2]NodeID]NodeID),
+		forks:                   make(map[ForkID]*ForkInfo),
+		revisionInfo:            make(map[ForkRevision]*RevisionInfo),
+		cursors:                 make([]*Cursor, 0),
+		decorationCache:         make(map[string]*DecorationCacheEntry),
 	}
 
 	// Initialize fork 0
@@ -858,6 +862,9 @@ func (g *Garland) buildInitialTree(data []byte) {
 	rootSnap := createInternalSnapshot(contentNode.id, g.eofNode.id, snap, eofSnap)
 	g.root.setSnapshot(0, 0, rootSnap)
 
+	// Register the root structure for reuse
+	g.internalNodesByChildren[[2]NodeID{contentNode.id, g.eofNode.id}] = g.root.id
+
 	// Update counts
 	g.totalBytes = snap.byteCount
 	g.totalRunes = snap.runeCount
@@ -894,6 +901,9 @@ func (g *Garland) buildEmptyTree() {
 	g.nodeRegistry[g.root.id] = g.root
 	rootSnap := createInternalSnapshot(contentNode.id, g.eofNode.id, contentSnap, eofSnap)
 	g.root.setSnapshot(0, 0, rootSnap)
+
+	// Register the root structure for reuse
+	g.internalNodesByChildren[[2]NodeID{contentNode.id, g.eofNode.id}] = g.root.id
 }
 
 func (g *Garland) loadInitialDecorations(options FileOptions) error {

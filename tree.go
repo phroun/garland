@@ -368,8 +368,10 @@ func (g *Garland) splitLeaf(node *Node, snap *NodeSnapshot, bytePos int64) (Node
 	return leftNode.id, rightNode.id, nil
 }
 
-// concatenate creates a new internal node joining two subtrees.
-// Returns the ID of the new internal node.
+// concatenate creates or reuses an internal node joining two subtrees.
+// If a node with the same (leftID, rightID) structure exists, reuses it
+// and adds a new snapshot. Otherwise creates a new node.
+// Returns the ID of the internal node.
 func (g *Garland) concatenate(leftID, rightID NodeID) (NodeID, error) {
 	leftNode := g.nodeRegistry[leftID]
 	rightNode := g.nodeRegistry[rightID]
@@ -385,12 +387,26 @@ func (g *Garland) concatenate(leftID, rightID NodeID) (NodeID, error) {
 		return 0, ErrInvalidPosition
 	}
 
+	// Create the new snapshot for this version
+	internalSnap := createInternalSnapshot(leftID, rightID, leftSnap, rightSnap)
+
+	// Check if we already have an internal node with this structure
+	key := [2]NodeID{leftID, rightID}
+	if existingID, ok := g.internalNodesByChildren[key]; ok {
+		// Reuse existing node - just add a new snapshot
+		existingNode := g.nodeRegistry[existingID]
+		if existingNode != nil {
+			existingNode.setSnapshot(g.currentFork, g.currentRevision, internalSnap)
+			return existingID, nil
+		}
+	}
+
 	// Create new internal node
 	g.nextNodeID++
 	internalNode := newNode(g.nextNodeID, g)
 	g.nodeRegistry[internalNode.id] = internalNode
+	g.internalNodesByChildren[key] = internalNode.id
 
-	internalSnap := createInternalSnapshot(leftID, rightID, leftSnap, rightSnap)
 	internalNode.setSnapshot(g.currentFork, g.currentRevision, internalSnap)
 
 	return internalNode.id, nil
