@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -900,9 +901,61 @@ func (r *REPL) cmdDump() {
 		return
 	}
 
+	// Collect cursor positions and sort by byte position
+	type cursorPos struct {
+		name string
+		pos  int64
+	}
+	var cursorPositions []cursorPos
+	for name, c := range r.cursors {
+		cursorPositions = append(cursorPositions, cursorPos{name: name, pos: c.BytePos()})
+	}
+	sort.Slice(cursorPositions, func(i, j int) bool {
+		return cursorPositions[i].pos < cursorPositions[j].pos
+	})
+
+	// Build output with cursor markers inserted at their positions
+	// ANSI: \x1b[1;32m = bold green, \x1b[0m = reset
+	var output strings.Builder
+	dataStr := string(data)
+	lastPos := int64(0)
+
+	// Group cursors at the same position
+	for i := 0; i < len(cursorPositions); {
+		pos := cursorPositions[i].pos
+
+		// Output text from last position to this cursor position
+		if pos > lastPos && lastPos < int64(len(dataStr)) {
+			endPos := pos
+			if endPos > int64(len(dataStr)) {
+				endPos = int64(len(dataStr))
+			}
+			output.WriteString(dataStr[lastPos:endPos])
+		}
+
+		// Collect all cursors at this position
+		var cursorsHere []string
+		for i < len(cursorPositions) && cursorPositions[i].pos == pos {
+			cursorsHere = append(cursorsHere, cursorPositions[i].name)
+			i++
+		}
+
+		// Output cursor marker(s)
+		output.WriteString("\x1b[1;32m(")
+		output.WriteString(strings.Join(cursorsHere, ","))
+		output.WriteString(")\x1b[0m")
+
+		lastPos = pos
+	}
+
+	// Output remaining text after last cursor
+	if lastPos < int64(len(dataStr)) {
+		output.WriteString(dataStr[lastPos:])
+	}
+
 	fmt.Println("Content:")
 	fmt.Println("--------")
-	fmt.Printf("%s\n", string(data))
+	fmt.Printf("%s\n", output.String())
 	fmt.Println("--------")
 	fmt.Printf("Total: %d bytes, %d runes, %d lines\n",
 		r.garland.ByteCount().Value,
@@ -918,9 +971,83 @@ func (r *REPL) cmdTree() {
 		return
 	}
 
-	fmt.Println("Tree structure inspection not yet implemented")
-	fmt.Printf("Current state: fork=%d, revision=%d\n",
+	treeInfo := r.garland.GetTreeInfo()
+	if treeInfo == nil {
+		fmt.Println("No tree structure available")
+		return
+	}
+
+	fmt.Printf("Tree structure (fork=%d, rev=%d):\n",
 		r.garland.CurrentFork(), r.garland.CurrentRevision())
+	fmt.Println()
+	r.printTreeNode(treeInfo, "", true)
+}
+
+// printTreeNode recursively prints a tree node with line-drawing characters
+func (r *REPL) printTreeNode(node *garland.TreeNodeInfo, prefix string, isLast bool) {
+	if node == nil {
+		return
+	}
+
+	// Line drawing characters (UTF-8)
+	// ├── for non-last children
+	// └── for last child
+	// │   for continuation
+	connector := "├── "
+	if isLast {
+		connector = "└── "
+	}
+
+	// Build node description
+	var desc string
+	storageLabel := storageStateString(node.Storage)
+
+	if node.IsLeaf {
+		if node.DataPreview != "" {
+			desc = fmt.Sprintf("LEAF[%d] %dB %dR %dL [%s] \"%s\"",
+				node.NodeID, node.ByteCount, node.RuneCount, node.LineCount,
+				storageLabel, node.DataPreview)
+		} else {
+			desc = fmt.Sprintf("LEAF[%d] %dB %dR %dL [%s] (empty/cold)",
+				node.NodeID, node.ByteCount, node.RuneCount, node.LineCount,
+				storageLabel)
+		}
+	} else {
+		desc = fmt.Sprintf("NODE[%d] %dB %dR %dL",
+			node.NodeID, node.ByteCount, node.RuneCount, node.LineCount)
+	}
+
+	fmt.Printf("%s%s%s\n", prefix, connector, desc)
+
+	// Determine child prefix
+	childPrefix := prefix
+	if isLast {
+		childPrefix += "    "
+	} else {
+		childPrefix += "│   "
+	}
+
+	// Print children
+	for i, child := range node.Children {
+		isChildLast := (i == len(node.Children)-1)
+		r.printTreeNode(child, childPrefix, isChildLast)
+	}
+}
+
+// storageStateString returns a short label for a storage state
+func storageStateString(s garland.StorageState) string {
+	switch s {
+	case garland.StorageMemory:
+		return "mem"
+	case garland.StorageWarm:
+		return "warm"
+	case garland.StorageCold:
+		return "cold"
+	case garland.StoragePlaceholder:
+		return "placeholder"
+	default:
+		return "?"
+	}
 }
 
 func (r *REPL) cmdTransaction(args []string) {

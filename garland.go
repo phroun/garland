@@ -3638,3 +3638,107 @@ func (g *Garland) rebuildFromLeafInternal(node *Node, snap *NodeSnapshot, target
 	}
 	return g.concatenate(snap.leftID, newRightID)
 }
+
+// TreeNodeInfo contains information about a single node in the tree.
+type TreeNodeInfo struct {
+	NodeID       NodeID
+	IsLeaf       bool
+	ByteCount    int64
+	RuneCount    int64
+	LineCount    int64
+	Storage      StorageState
+	DataPreview  string // First 32 chars of leaf data (for leaves only)
+	LeftChildID  NodeID // For internal nodes
+	RightChildID NodeID // For internal nodes
+	Children     []*TreeNodeInfo
+}
+
+// GetTreeInfo returns a snapshot of the current tree structure for visualization.
+func (g *Garland) GetTreeInfo() *TreeNodeInfo {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	if g.root == nil {
+		return nil
+	}
+
+	return g.buildTreeInfo(g.root, g.currentFork, g.currentRevision)
+}
+
+// buildTreeInfo recursively builds a TreeNodeInfo from a node.
+func (g *Garland) buildTreeInfo(node *Node, fork ForkID, rev RevisionID) *TreeNodeInfo {
+	if node == nil {
+		return nil
+	}
+
+	snap := node.snapshotAt(fork, rev)
+	if snap == nil {
+		return nil
+	}
+
+	info := &TreeNodeInfo{
+		NodeID:    node.id,
+		IsLeaf:    snap.isLeaf,
+		ByteCount: snap.byteCount,
+		RuneCount: snap.runeCount,
+		LineCount: snap.lineCount,
+		Storage:   snap.storageState,
+	}
+
+	if snap.isLeaf {
+		// Create data preview (first 32 chars, escaped)
+		if len(snap.data) > 0 {
+			preview := string(snap.data)
+			if len(preview) > 32 {
+				preview = preview[:32] + "..."
+			}
+			// Escape special characters for display
+			preview = escapeForPreview(preview)
+			info.DataPreview = preview
+		}
+	} else {
+		// Internal node - recurse into children
+		info.LeftChildID = snap.leftID
+		info.RightChildID = snap.rightID
+
+		if snap.leftID != 0 {
+			if leftNode := g.nodeRegistry[snap.leftID]; leftNode != nil {
+				info.Children = append(info.Children, g.buildTreeInfo(leftNode, fork, rev))
+			}
+		}
+		if snap.rightID != 0 {
+			if rightNode := g.nodeRegistry[snap.rightID]; rightNode != nil {
+				info.Children = append(info.Children, g.buildTreeInfo(rightNode, fork, rev))
+			}
+		}
+	}
+
+	return info
+}
+
+// escapeForPreview escapes special characters for display in tree output.
+func escapeForPreview(s string) string {
+	var result []byte
+	for _, r := range s {
+		switch r {
+		case '\n':
+			result = append(result, '\\', 'n')
+		case '\r':
+			result = append(result, '\\', 'r')
+		case '\t':
+			result = append(result, '\\', 't')
+		case '\\':
+			result = append(result, '\\', '\\')
+		default:
+			if r < 32 || r == 127 {
+				// Control character - show as \xNN
+				result = append(result, '\\', 'x')
+				hex := "0123456789abcdef"
+				result = append(result, hex[(r>>4)&0xf], hex[r&0xf])
+			} else {
+				result = append(result, string(r)...)
+			}
+		}
+	}
+	return string(result)
+}
