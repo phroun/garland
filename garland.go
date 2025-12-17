@@ -42,6 +42,22 @@ const (
 	ChillEverything
 )
 
+// Default leaf size constants for tree building.
+const (
+	// DefaultMaxLeafSize is the maximum bytes per leaf node.
+	// Files larger than this are split into multiple leaves.
+	DefaultMaxLeafSize = 128 * 1024 // 128KB
+
+	// DefaultTargetLeafSize is the ideal leaf size (MaxLeafSize / 2).
+	DefaultTargetLeafSize = 64 * 1024 // 64KB
+
+	// DefaultMinLeafSize is the minimum leaf size before merging (MaxLeafSize / 4).
+	DefaultMinLeafSize = 32 * 1024 // 32KB
+
+	// DefaultInitialUsageWindow is the default byte range to keep in memory.
+	DefaultInitialUsageWindow = 1024 * 1024 // 1MB
+)
+
 // ColdStorageInterface allows custom cold storage implementations.
 type ColdStorageInterface interface {
 	// Set stores data for a block within a folder.
@@ -134,6 +150,20 @@ type FileOptions struct {
 	DecorationPath   string // load from dump file
 	DecorationString string // parse from dump format
 
+	// Tree structure options
+	// MaxLeafSize is the maximum bytes per leaf node (default 128KB).
+	// Larger files are split into a balanced tree of leaves.
+	// Target leaf size is MaxLeafSize/2, minimum is MaxLeafSize/4.
+	MaxLeafSize int64
+
+	// InitialUsageStart and InitialUsageEnd define a byte range to keep in memory.
+	// Nodes outside this range are immediately chilled to cold storage after loading.
+	// This avoids loading a huge file fully into RAM just to chill it immediately.
+	// Set InitialUsageEnd to -1 (default) to use a reasonable default window.
+	// Set both to 0 to chill everything immediately (pure cold storage load).
+	InitialUsageStart int64
+	InitialUsageEnd   int64 // -1 means auto (defaults to 1MB or file size, whichever is smaller)
+
 	// Ready thresholds - ALL specified (non-zero) must be met
 	// Measured from beginning of file at initial load
 	ReadyLines int64
@@ -214,6 +244,11 @@ type Garland struct {
 	readyThreshold  ReadyThreshold
 	readAheadConfig ReadAheadConfig
 
+	// Leaf size configuration
+	maxLeafSize    int64 // maximum bytes per leaf
+	targetLeafSize int64 // ideal leaf size (max/2)
+	minLeafSize    int64 // minimum before merging (max/4)
+
 	// Tree structure
 	root         *Node
 	eofNode      *Node              // special node for EOF decorations
@@ -291,6 +326,14 @@ func (lib *Library) Open(options FileOptions) (*Garland, error) {
 	garlandID := lib.nextGarlandID
 	lib.mu.Unlock()
 
+	// Configure leaf sizes
+	maxLeaf := options.MaxLeafSize
+	if maxLeaf <= 0 {
+		maxLeaf = DefaultMaxLeafSize
+	}
+	targetLeaf := maxLeaf / 2
+	minLeaf := maxLeaf / 4
+
 	g := &Garland{
 		lib:        lib,
 		id:         formatGarlandID(garlandID),
@@ -309,6 +352,10 @@ func (lib *Library) Open(options FileOptions) (*Garland, error) {
 			Runes: options.ReadAheadRunes,
 			All:   options.ReadAheadAll,
 		},
+
+		maxLeafSize:    maxLeaf,
+		targetLeafSize: targetLeaf,
+		minLeafSize:    minLeaf,
 
 		nodeRegistry:            make(map[NodeID]*Node),
 		nextNodeID:              1,
@@ -361,7 +408,7 @@ func (lib *Library) Open(options FileOptions) (*Garland, error) {
 
 	// Build initial tree structure
 	if initialData != nil {
-		g.buildInitialTree(initialData)
+		g.buildInitialTree(initialData, options.InitialUsageStart, options.InitialUsageEnd)
 	} else {
 		// Create empty tree for async loading
 		g.buildEmptyTree()
@@ -1811,14 +1858,42 @@ func (g *Garland) appendStreamData(data []byte) {
 	}
 }
 
-func (g *Garland) buildInitialTree(data []byte) {
-	// Create root node with all data
-	g.nextNodeID++
-	contentNode := newNode(g.nextNodeID, g)
-	g.nodeRegistry[contentNode.id] = contentNode
+func (g *Garland) buildInitialTree(data []byte, usageStart, usageEnd int64) {
+	dataLen := int64(len(data))
 
-	snap := createLeafSnapshot(data, nil, 0)
-	contentNode.setSnapshot(0, 0, snap)
+	// Resolve usage window
+	// A usageEnd of 0 or less means "auto" - use default window or entire file
+	if usageEnd <= 0 {
+		// Auto: use default window or entire file, whichever is smaller
+		usageEnd = DefaultInitialUsageWindow
+		if usageEnd > dataLen {
+			usageEnd = dataLen
+		}
+	}
+	if usageStart < 0 {
+		usageStart = 0
+	}
+	if usageEnd > dataLen {
+		usageEnd = dataLen
+	}
+
+	// Build content tree
+	var contentNodeID NodeID
+	var contentSnap *NodeSnapshot
+
+	if dataLen <= g.maxLeafSize {
+		// Small file - single leaf
+		g.nextNodeID++
+		contentNode := newNode(g.nextNodeID, g)
+		g.nodeRegistry[contentNode.id] = contentNode
+
+		contentSnap = createLeafSnapshot(data, nil, 0)
+		contentNode.setSnapshot(0, 0, contentSnap)
+		contentNodeID = contentNode.id
+	} else {
+		// Large file - build balanced tree
+		contentNodeID, contentSnap = g.buildBalancedSubtree(data, 0)
+	}
 
 	// Create EOF node
 	g.nextNodeID++
@@ -1832,16 +1907,16 @@ func (g *Garland) buildInitialTree(data []byte) {
 	g.root = newNode(g.nextNodeID, g)
 	g.nodeRegistry[g.root.id] = g.root
 
-	rootSnap := createInternalSnapshot(contentNode.id, g.eofNode.id, snap, eofSnap)
+	rootSnap := createInternalSnapshot(contentNodeID, g.eofNode.id, contentSnap, eofSnap)
 	g.root.setSnapshot(0, 0, rootSnap)
 
 	// Register the root structure for reuse
-	g.internalNodesByChildren[[2]NodeID{contentNode.id, g.eofNode.id}] = g.root.id
+	g.internalNodesByChildren[[2]NodeID{contentNodeID, g.eofNode.id}] = g.root.id
 
 	// Update counts
-	g.totalBytes = snap.byteCount
-	g.totalRunes = snap.runeCount
-	g.totalLines = snap.lineCount
+	g.totalBytes = contentSnap.byteCount
+	g.totalRunes = contentSnap.runeCount
+	g.totalLines = contentSnap.lineCount
 	g.countComplete = true
 
 	// Record initial revision (revision 0 with the initial tree)
@@ -1851,6 +1926,110 @@ func (g *Garland) buildInitialTree(data []byte) {
 		HasChanges:       false,
 		RootID:           g.root.id,
 		StreamKnownBytes: -1, // -1 means complete (not streaming)
+	}
+
+	// Chill nodes outside the usage window
+	if g.lib.coldStorageBackend != nil && g.loadingStyle != MemoryOnly {
+		g.chillNodesOutsideRange(usageStart, usageEnd)
+	}
+}
+
+// buildBalancedSubtree recursively builds a balanced tree from data.
+// Returns the node ID and the snapshot for the subtree root.
+func (g *Garland) buildBalancedSubtree(data []byte, fileOffset int64) (NodeID, *NodeSnapshot) {
+	dataLen := int64(len(data))
+
+	// Base case: data fits in a single leaf
+	if dataLen <= g.targetLeafSize {
+		g.nextNodeID++
+		node := newNode(g.nextNodeID, g)
+		g.nodeRegistry[node.id] = node
+
+		snap := createLeafSnapshot(data, nil, fileOffset)
+		node.setSnapshot(0, 0, snap)
+		return node.id, snap
+	}
+
+	// Recursive case: split at midpoint and build subtrees
+	mid := dataLen / 2
+
+	// Align to rune boundary to avoid splitting UTF-8 characters
+	mid = int64(alignToRuneBoundary(data, mid))
+
+	leftID, leftSnap := g.buildBalancedSubtree(data[:mid], fileOffset)
+	rightID, rightSnap := g.buildBalancedSubtree(data[mid:], fileOffset+mid)
+
+	// Create internal node
+	g.nextNodeID++
+	node := newNode(g.nextNodeID, g)
+	g.nodeRegistry[node.id] = node
+
+	snap := createInternalSnapshot(leftID, rightID, leftSnap, rightSnap)
+	node.setSnapshot(0, 0, snap)
+
+	// Register for structure reuse
+	g.internalNodesByChildren[[2]NodeID{leftID, rightID}] = node.id
+
+	return node.id, snap
+}
+
+// chillNodesOutsideRange moves leaf data outside the specified byte range to cold storage.
+// This is called after initial tree build to avoid keeping large files entirely in RAM.
+func (g *Garland) chillNodesOutsideRange(usageStart, usageEnd int64) {
+	if g.root == nil {
+		return
+	}
+
+	rootSnap := g.root.snapshotAt(0, 0)
+	if rootSnap == nil {
+		return
+	}
+
+	g.chillSubtreeOutsideRange(g.root, rootSnap, 0, usageStart, usageEnd)
+}
+
+// chillSubtreeOutsideRange recursively chills leaf nodes outside the usage range.
+// nodeStart is the byte offset where this subtree begins.
+func (g *Garland) chillSubtreeOutsideRange(node *Node, snap *NodeSnapshot, nodeStart, usageStart, usageEnd int64) {
+	if snap == nil {
+		return
+	}
+
+	nodeEnd := nodeStart + snap.byteCount
+
+	if snap.isLeaf {
+		// Check if this leaf is entirely outside the usage range
+		if nodeEnd <= usageStart || nodeStart >= usageEnd {
+			// Chill this leaf - it's outside the usage window
+			if snap.storageState == StorageMemory && len(snap.data) > 0 {
+				forkRev := ForkRevision{Fork: 0, Revision: 0}
+				g.chillSnapshot(node.id, forkRev, snap)
+			}
+		}
+		return
+	}
+
+	// Internal node - recurse into children
+	var leftBytes int64 = 0
+	if snap.leftID != 0 {
+		leftNode := g.nodeRegistry[snap.leftID]
+		if leftNode != nil {
+			leftSnap := leftNode.snapshotAt(0, 0)
+			if leftSnap != nil {
+				leftBytes = leftSnap.byteCount
+				g.chillSubtreeOutsideRange(leftNode, leftSnap, nodeStart, usageStart, usageEnd)
+			}
+		}
+	}
+
+	if snap.rightID != 0 {
+		rightNode := g.nodeRegistry[snap.rightID]
+		if rightNode != nil {
+			rightSnap := rightNode.snapshotAt(0, 0)
+			if rightSnap != nil {
+				g.chillSubtreeOutsideRange(rightNode, rightSnap, nodeStart+leftBytes, usageStart, usageEnd)
+			}
+		}
 	}
 }
 

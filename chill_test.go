@@ -54,15 +54,39 @@ func TestChillWithColdStorage(t *testing.T) {
 	g, _ := lib.Open(FileOptions{DataString: "Hello World"})
 	defer g.Close()
 
+	t.Logf("After open: rev=%d, bytes=%d, nodes=%d", g.currentRevision, g.totalBytes, len(g.nodeRegistry))
+
 	// Make some edits to create multiple revisions
 	cursor := g.NewCursor()
 	cursor.SeekByte(5)
 	cursor.InsertString(" Beautiful", nil, true)
 
+	t.Logf("After insert: rev=%d, bytes=%d, nodes=%d", g.currentRevision, g.totalBytes, len(g.nodeRegistry))
+
+	// Log nodes before chill
+	for id, node := range g.nodeRegistry {
+		for forkRev, snap := range node.history {
+			if snap.isLeaf && snap.byteCount > 0 {
+				t.Logf("  Node %d @ {%d,%d}: %d bytes, data=%q, storage=%d",
+					id, forkRev.Fork, forkRev.Revision, snap.byteCount, string(snap.data), snap.storageState)
+			}
+		}
+	}
+
 	// Chill unused data
 	err := g.Chill(ChillUnusedData)
 	if err != nil {
 		t.Errorf("Chill returned error: %v", err)
+	}
+
+	t.Logf("After chill:")
+	for id, node := range g.nodeRegistry {
+		for forkRev, snap := range node.history {
+			if snap.isLeaf && snap.byteCount > 0 {
+				t.Logf("  Node %d @ {%d,%d}: %d bytes, data=%q, storage=%d",
+					id, forkRev.Fork, forkRev.Revision, snap.byteCount, string(snap.data), snap.storageState)
+			}
+		}
 	}
 
 	// Current data should still be accessible
