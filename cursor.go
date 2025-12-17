@@ -198,6 +198,38 @@ func (c *Cursor) SeekLine(line, runeInLine int64) error {
 	return nil
 }
 
+// SeekRelativeBytes moves the cursor relative to its current byte position.
+// Positive delta moves forward, negative moves backward.
+// Clamps to valid range [0, byteCount].
+func (c *Cursor) SeekRelativeBytes(delta int64) error {
+	if c.garland == nil {
+		return ErrCursorNotFound
+	}
+
+	newPos := c.bytePos + delta
+	if newPos < 0 {
+		newPos = 0
+	}
+	// Clamp to byte count (will be validated by SeekByte)
+	return c.SeekByte(newPos)
+}
+
+// SeekRelativeRunes moves the cursor relative to its current rune position.
+// Positive delta moves forward, negative moves backward.
+// Clamps to valid range [0, runeCount].
+func (c *Cursor) SeekRelativeRunes(delta int64) error {
+	if c.garland == nil {
+		return ErrCursorNotFound
+	}
+
+	newPos := c.runePos + delta
+	if newPos < 0 {
+		newPos = 0
+	}
+	// Clamp to rune count (will be validated by SeekRune)
+	return c.SeekRune(newPos)
+}
+
 // updatePosition updates the cursor's position and records history if needed.
 func (c *Cursor) updatePosition(bytePos, runePos, line, lineRune int64) {
 	c.bytePos = bytePos

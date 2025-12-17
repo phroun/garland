@@ -104,6 +104,9 @@ func (r *REPL) handleCommand(input string) bool {
 	case "seek":
 		r.cmdSeek(args)
 
+	case "relseek":
+		r.cmdRelSeek(args)
+
 	case "read":
 		r.cmdRead(args)
 
@@ -168,6 +171,8 @@ CURSOR OPERATIONS:
   seek byte <pos>         Move cursor to byte position
   seek rune <pos>         Move cursor to rune position
   seek line <line> <rune> Move cursor to line:rune position
+  relseek bytes <delta>   Move cursor relative (+ forward, - backward)
+  relseek runes <delta>   Move cursor relative by runes
 
 READ OPERATIONS:
   read bytes <length>     Read bytes from cursor position (advances cursor)
@@ -361,6 +366,45 @@ func (r *REPL) cmdSeek(args []string) {
 
 	if err != nil {
 		fmt.Printf("Seek error: %v\n", err)
+		return
+	}
+
+	line, lineRune := cursor.LinePos()
+	fmt.Printf("Cursor moved to byte=%d, rune=%d, line=%d:%d\n",
+		cursor.BytePos(), cursor.RunePos(), line, lineRune)
+}
+
+func (r *REPL) cmdRelSeek(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 2 {
+		fmt.Println("Usage: relseek bytes|runes <delta>")
+		fmt.Println("  delta can be positive (forward) or negative (backward)")
+		return
+	}
+
+	cursor := r.cursor()
+	mode := strings.ToLower(args[0])
+	delta, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil {
+		fmt.Printf("Invalid delta: %v\n", err)
+		return
+	}
+
+	switch mode {
+	case "bytes":
+		err = cursor.SeekRelativeBytes(delta)
+	case "runes":
+		err = cursor.SeekRelativeRunes(delta)
+	default:
+		fmt.Println("Unknown relseek mode. Use: bytes or runes")
+		return
+	}
+
+	if err != nil {
+		fmt.Printf("RelSeek error: %v\n", err)
 		return
 	}
 
