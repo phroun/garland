@@ -41,11 +41,6 @@ These are features that don't exist yet but would enhance the library:
 - Word selection (currently only navigation is implemented)
 - Word deletion (delete word forward/backward)
 
-#### Bookmarks
-- Named bookmarks separate from decorations
-- Jump to bookmark by name
-- Bookmark list/management
-
 ### Diff Between Revisions
 
 - Show differences between any two revisions
@@ -79,22 +74,12 @@ These are features that don't exist yet but would enhance the library:
 
 ### Advanced Editing
 
-#### Auto-complete
-- Completion suggestions
-- Word completion from document
-- Custom completion providers
-
 #### Plugins/Extensions
 - Plugin architecture
 - Event hooks for operations
 - Custom command registration
 
 ### Integration Features
-
-#### Clipboard Support
-- System clipboard integration
-- Multiple clipboard registers (vim-style)
-- Clipboard history
 
 #### File Watching
 - Detect external file modifications
@@ -144,6 +129,14 @@ These features are addressed through other mechanisms:
 
 - **Selection Ranges** - Handled via decorations; applications can use decoration pairs to mark selection start/end positions
 - **Macros** - A separate macro language has been developed independently of this library
+- **Bookmarks** - Use decorations with a naming convention (e.g., `bookmark:name`)
+
+## Out of Scope
+
+These are application-layer concerns, not appropriate for a backend text buffer library:
+
+- **Clipboard Support** - System clipboard integration is platform-specific and belongs in the host application
+- **Auto-complete** - Completion UI/UX belongs in the application; the library already provides search and word navigation primitives that applications can build on
 
 ## Priority Recommendations
 
@@ -153,6 +146,3 @@ These features are addressed through other mechanisms:
 ### Medium Priority (Quality of Life)
 2. Diff between revisions - debugging/comparison feature
 3. Revision pruning - deeper history management (memory limits now handle active data)
-
-### Lower Priority (Nice to Have)
-4. Clipboard support - platform-specific complexity
