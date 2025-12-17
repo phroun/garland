@@ -30,6 +30,10 @@ type ColdStorageInterface interface {
 
 	// Delete removes a block from a folder.
 	Delete(folder, block string) error
+
+	// DeleteFolder removes an empty folder.
+	// Returns an error if the folder is not empty.
+	DeleteFolder(folder string) error
 }
 
 // LibraryOptions configures the garland library.
@@ -67,7 +71,7 @@ func Init(options LibraryOptions) (*Library, error) {
 
 	// If a path was provided but no backend, create a file-based backend
 	if options.ColdStoragePath != "" && options.ColdStorageBackend == nil {
-		lib.coldStorageBackend = newFileColdStorage(options.ColdStoragePath)
+		lib.coldStorageBackend = newFSColdStorage(lib.defaultFS, options.ColdStoragePath)
 	}
 
 	return lib, nil

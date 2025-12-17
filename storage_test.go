@@ -213,7 +213,8 @@ func TestLocalFileSystemHasChanged(t *testing.T) {
 
 func TestFileColdStorage(t *testing.T) {
 	tmpDir := t.TempDir()
-	cs := newFileColdStorage(tmpDir)
+	fs := &localFileSystem{}
+	cs := newFSColdStorage(fs, tmpDir)
 
 	// Set data
 	testData := []byte("test cold storage data")
@@ -251,7 +252,8 @@ func TestFileColdStorage(t *testing.T) {
 
 func TestFileColdStorageMultipleFolders(t *testing.T) {
 	tmpDir := t.TempDir()
-	cs := newFileColdStorage(tmpDir)
+	fs := &localFileSystem{}
+	cs := newFSColdStorage(fs, tmpDir)
 
 	// Create blocks in different folders
 	cs.Set("file1", "data", []byte("file1 data"))
@@ -278,7 +280,8 @@ func TestFileColdStorageMultipleFolders(t *testing.T) {
 
 func TestFileColdStorageGetNotFound(t *testing.T) {
 	tmpDir := t.TempDir()
-	cs := newFileColdStorage(tmpDir)
+	fs := &localFileSystem{}
+	cs := newFSColdStorage(fs, tmpDir)
 
 	_, err := cs.Get("nonexistent", "block")
 	if err == nil {
@@ -288,7 +291,8 @@ func TestFileColdStorageGetNotFound(t *testing.T) {
 
 func TestFileColdStorageOverwrite(t *testing.T) {
 	tmpDir := t.TempDir()
-	cs := newFileColdStorage(tmpDir)
+	fs := &localFileSystem{}
+	cs := newFSColdStorage(fs, tmpDir)
 
 	cs.Set("folder", "block", []byte("original"))
 	cs.Set("folder", "block", []byte("overwritten"))
@@ -296,6 +300,36 @@ func TestFileColdStorageOverwrite(t *testing.T) {
 	data, _ := cs.Get("folder", "block")
 	if string(data) != "overwritten" {
 		t.Errorf("After overwrite: %q, want %q", string(data), "overwritten")
+	}
+}
+
+func TestFileColdStorageDeleteFolder(t *testing.T) {
+	tmpDir := t.TempDir()
+	fs := &localFileSystem{}
+	cs := newFSColdStorage(fs, tmpDir)
+
+	// Create a block
+	cs.Set("testfolder", "block1", []byte("data"))
+
+	// Try to delete non-empty folder (should fail)
+	err := cs.DeleteFolder("testfolder")
+	if err == nil {
+		t.Error("DeleteFolder on non-empty folder should fail")
+	}
+
+	// Delete the block first
+	cs.Delete("testfolder", "block1")
+
+	// Now delete empty folder
+	err = cs.DeleteFolder("testfolder")
+	if err != nil {
+		t.Errorf("DeleteFolder on empty folder failed: %v", err)
+	}
+
+	// Verify folder is gone
+	folderPath := filepath.Join(tmpDir, "testfolder")
+	if _, err := os.Stat(folderPath); !os.IsNotExist(err) {
+		t.Error("Folder should be deleted")
 	}
 }
 
