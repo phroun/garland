@@ -82,18 +82,12 @@ The current model uses point cursors only. Selection ranges would enable:
 
 ### Performance Enhancements
 
-#### Memory Limits
-- Maximum RAM usage threshold
-- Auto-chill when approaching limit
-- LRU eviction for rarely-accessed nodes
-
 #### Incremental Loading Limits
 - Progressive loading for huge files
 - Viewport-based loading (load visible portion first)
 - Background loading of remainder
 
 #### Caching Improvements
-- LRU cache for thawed nodes
 - Read-ahead caching for sequential access
 - Cache statistics and tuning
 
@@ -158,6 +152,8 @@ The following features have been implemented:
 - **Lazy loading blocking** - `waitFor*` functions now block with timeout support; `Is*Ready` check methods for non-blocking guards
 - **Find/Search** - String and regex search with case sensitivity, whole word matching, forward/backward
 - **Find and Replace** - Single, all, and count-limited replacement with regex capture group expansion
+- **Incremental Memory Management** - Soft/hard memory limits with LRU-based auto-chilling; single background worker across all open files; budget-limited per-tick operations for smooth user experience
+- **Incremental Tree Rebalancing** - Path-based rebalancing after mutations with configurable budget; `ForceRebalance()` for full tree rebuild when needed; `NeedsRebalancing()` check
 
 ## Priority Recommendations
 
@@ -167,8 +163,8 @@ The following features have been implemented:
 
 ### Medium Priority (Quality of Life)
 3. File change detection - safety feature
-4. Revision pruning - memory management for long sessions
-5. Diff between revisions - debugging/comparison feature
+4. Diff between revisions - debugging/comparison feature
+5. Revision pruning - deeper history management (memory limits now handle active data)
 
 ### Lower Priority (Nice to Have)
 6. Clipboard support - platform-specific complexity

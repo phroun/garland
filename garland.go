@@ -84,6 +84,30 @@ type LibraryOptions struct {
 
 	// ColdStorageBackend is a custom cold storage implementation.
 	ColdStorageBackend ColdStorageInterface
+
+	// Memory management options
+	// MemorySoftLimit is the target memory usage in bytes.
+	// When exceeded, background maintenance starts chilling LRU nodes.
+	// 0 means disabled (default).
+	MemorySoftLimit int64
+
+	// MemoryHardLimit is the maximum memory usage in bytes.
+	// When exceeded, immediate (but still budgeted) chilling occurs.
+	// 0 means disabled (default).
+	MemoryHardLimit int64
+
+	// ChillBudgetPerTick is the maximum nodes to chill per maintenance tick.
+	// Default is 5 if not specified.
+	ChillBudgetPerTick int
+
+	// RebalanceBudget is the maximum rotations per mutation operation.
+	// Default is 2 if not specified.
+	RebalanceBudget int
+
+	// BackgroundInterval is how often the background maintenance worker runs.
+	// 0 means disabled (maintenance only happens opportunistically).
+	// Typical value: 100ms to 1s.
+	BackgroundInterval time.Duration
 }
 
 // Library manages garland instances and shared resources like cold storage.
@@ -97,21 +121,54 @@ type Library struct {
 	mu             sync.RWMutex
 
 	nextGarlandID uint64
+
+	// Memory management configuration
+	memorySoftLimit    int64
+	memoryHardLimit    int64
+	chillBudgetPerTick int
+	rebalanceBudget    int
+	backgroundInterval time.Duration
+
+	// Background maintenance worker
+	maintenanceStop chan struct{}
+	maintenanceWg   sync.WaitGroup
 }
 
 // Init initializes the garland library with cold storage options.
 // Cold storage is shared across all files opened through this library instance.
 func Init(options LibraryOptions) (*Library, error) {
+	// Set defaults for maintenance configuration
+	chillBudget := options.ChillBudgetPerTick
+	if chillBudget <= 0 {
+		chillBudget = 5 // default: chill 5 nodes per tick
+	}
+	rebalanceBudget := options.RebalanceBudget
+	if rebalanceBudget <= 0 {
+		rebalanceBudget = 2 // default: 2 rotations per operation
+	}
+
 	lib := &Library{
 		coldStoragePath:    options.ColdStoragePath,
 		coldStorageBackend: options.ColdStorageBackend,
 		activeGarlands:     make(map[string]*Garland),
 		defaultFS:          &localFileSystem{},
+
+		// Memory management
+		memorySoftLimit:    options.MemorySoftLimit,
+		memoryHardLimit:    options.MemoryHardLimit,
+		chillBudgetPerTick: chillBudget,
+		rebalanceBudget:    rebalanceBudget,
+		backgroundInterval: options.BackgroundInterval,
 	}
 
 	// If a path was provided but no backend, create a file-based backend
 	if options.ColdStoragePath != "" && options.ColdStorageBackend == nil {
 		lib.coldStorageBackend = newFSColdStorage(lib.defaultFS, options.ColdStoragePath)
+	}
+
+	// Start background maintenance worker if configured
+	if options.BackgroundInterval > 0 {
+		lib.startMaintenanceWorker()
 	}
 
 	return lib, nil
@@ -299,6 +356,9 @@ type Garland struct {
 	// Streaming state - for channel-based sources, tracks the rev 0 tree separately
 	// from the working tree (which may be at a different revision due to edits)
 	streamingRoot *Node // The root of the revision 0 streaming tree
+
+	// Memory tracking for incremental maintenance
+	memoryBytes int64 // total bytes of in-memory leaf data
 }
 
 // Open creates or loads a Garland from various sources.
@@ -425,6 +485,9 @@ func (lib *Library) Open(options FileOptions) (*Garland, error) {
 	if err := g.loadInitialDecorations(options); err != nil {
 		return nil, err
 	}
+
+	// Calculate initial memory usage
+	g.recalculateMemoryUsage()
 
 	// Register with library
 	lib.mu.Lock()
@@ -794,6 +857,9 @@ func (g *Garland) chillSnapshot(nodeID NodeID, forkRev ForkRevision, snap *NodeS
 		snap.dataHash = computeHash(snap.data)
 	}
 
+	// Track bytes being freed
+	bytesFreed := int64(len(snap.data))
+
 	// Store data in cold storage
 	blockName := formatBlockName(nodeID, forkRev)
 	err := g.lib.coldStorageBackend.Set(g.id, blockName, snap.data)
@@ -817,6 +883,9 @@ func (g *Garland) chillSnapshot(nodeID NodeID, forkRev ForkRevision, snap *NodeS
 	// Clear in-memory data and update state
 	snap.data = nil
 	snap.storageState = StorageCold
+
+	// Update memory tracking
+	g.updateMemoryTracking(-bytesFreed)
 
 	return nil
 }
@@ -1005,6 +1074,12 @@ func (g *Garland) thawSnapshot(nodeID NodeID, forkRev ForkRevision, snap *NodeSn
 	snap.data = data
 	snap.storageState = StorageMemory
 
+	// Update memory tracking
+	g.updateMemoryTracking(int64(len(data)))
+
+	// Mark as recently accessed
+	g.touchSnapshot(snap)
+
 	// Try to restore decorations if they were stored
 	decBlockName := blockName + ".dec"
 	decData, err := g.lib.coldStorageBackend.Get(g.id, decBlockName)
@@ -1047,7 +1122,8 @@ func (g *Garland) ensureSnapshotData(node *Node, forkRev ForkRevision, snap *Nod
 
 	switch snap.storageState {
 	case StorageMemory:
-		// Data is already in memory
+		// Data is already in memory - touch it for LRU tracking
+		g.touchSnapshot(snap)
 		return nil
 
 	case StorageCold:
@@ -1104,6 +1180,13 @@ func (g *Garland) readFromWarmStorage(snap *NodeSnapshot) error {
 
 	snap.data = data
 	snap.storageState = StorageMemory
+
+	// Update memory tracking
+	g.updateMemoryTracking(int64(len(data)))
+
+	// Mark as recently accessed
+	g.touchSnapshot(snap)
+
 	return nil
 }
 
@@ -3363,6 +3446,10 @@ func (g *Garland) recordMutation() ChangeResult {
 		cursor.lastFork = g.currentFork
 		cursor.lastRevision = g.currentRevision
 	}
+
+	// Check memory pressure and perform incremental maintenance if needed
+	// Note: This is done without holding the lock, so we need to be careful
+	go g.CheckMemoryPressure()
 
 	return ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}
 }

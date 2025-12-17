@@ -260,6 +260,16 @@ func (r *REPL) handleCommand(input string) bool {
 	case "isready":
 		r.cmdIsReady(args)
 
+	// Memory management commands
+	case "memory":
+		r.cmdMemory()
+
+	case "memchill":
+		r.cmdMemChill(args)
+
+	case "rebalance":
+		r.cmdRebalance()
+
 	default:
 		fmt.Printf("Unknown command: %s. Type 'help' for available commands.\n", cmd)
 	}
@@ -393,6 +403,14 @@ STREAMING/LAZY LOADING:
 Note: During streaming input (via DataChannel), these commands let you check
 if a position is available before seeking. Seek operations block by default
 until data arrives. Use isready to guard against blocking.
+
+MEMORY MANAGEMENT:
+  memory                    Show current memory usage statistics
+  memchill [count]          Incrementally chill LRU nodes (default: 5 nodes)
+  rebalance                 Force tree rebalancing (use sparingly)
+
+Note: Memory management is automatic when soft/hard limits are configured in
+LibraryOptions. These commands allow manual intervention for debugging.
 
 OTHER:
   help                      Show this help message
@@ -2833,6 +2851,91 @@ func (r *REPL) cmdIsReady(args []string) {
 
 	default:
 		fmt.Println("Unknown mode. Use: byte, rune, or line")
+	}
+}
+
+func (r *REPL) cmdMemory() {
+	if !r.ensureGarland() {
+		return
+	}
+
+	stats := r.garland.MemoryUsage()
+
+	fmt.Println("Memory Usage Statistics:")
+	fmt.Printf("  In-memory bytes:    %d\n", stats.MemoryBytes)
+	fmt.Printf("  In-memory leaves:   %d\n", stats.InMemoryLeaves)
+	fmt.Printf("  Cold storage leaves: %d\n", stats.ColdStoredLeaves)
+	fmt.Printf("  Warm storage leaves: %d\n", stats.WarmStoredLeaves)
+
+	if stats.SoftLimit > 0 {
+		fmt.Printf("  Soft limit:         %d bytes\n", stats.SoftLimit)
+		if stats.MemoryBytes > stats.SoftLimit {
+			fmt.Println("  Status: OVER soft limit (background chilling active)")
+		}
+	} else {
+		fmt.Println("  Soft limit:         (disabled)")
+	}
+
+	if stats.HardLimit > 0 {
+		fmt.Printf("  Hard limit:         %d bytes\n", stats.HardLimit)
+		if stats.MemoryBytes > stats.HardLimit {
+			fmt.Println("  Status: OVER hard limit (immediate chilling triggered)")
+		}
+	} else {
+		fmt.Println("  Hard limit:         (disabled)")
+	}
+
+	// Check tree balance
+	if r.garland.NeedsRebalancing() {
+		fmt.Println("  Tree status:        Needs rebalancing")
+	} else {
+		fmt.Println("  Tree status:        Balanced")
+	}
+}
+
+func (r *REPL) cmdMemChill(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	budget := 5 // default
+	if len(args) > 0 {
+		n, err := strconv.Atoi(args[0])
+		if err != nil || n <= 0 {
+			fmt.Println("Usage: memchill [count]")
+			fmt.Println("  count: number of nodes to chill (default: 5)")
+			return
+		}
+		budget = n
+	}
+
+	stats := r.lib.IncrementalChill(budget)
+
+	if stats.NodesChilled > 0 {
+		fmt.Printf("Chilled %d nodes, freed %d bytes\n", stats.NodesChilled, stats.BytesChilled)
+	} else {
+		fmt.Println("No nodes chilled (none eligible or cold storage not configured)")
+	}
+}
+
+func (r *REPL) cmdRebalance() {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if !r.garland.NeedsRebalancing() {
+		fmt.Println("Tree is already balanced, no rebalancing needed")
+		return
+	}
+
+	stats := r.garland.ForceRebalance()
+
+	if stats.RotationsPerformed == -1 {
+		fmt.Println("Tree was rebuilt (full rebalance)")
+	} else if stats.RotationsPerformed > 0 {
+		fmt.Printf("Performed %d rotations\n", stats.RotationsPerformed)
+	} else {
+		fmt.Println("Rebalancing complete")
 	}
 }
 

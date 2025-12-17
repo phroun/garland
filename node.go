@@ -2,6 +2,7 @@ package garland
 
 import (
 	"crypto/sha256"
+	"time"
 	"unicode/utf8"
 )
 
@@ -76,6 +77,10 @@ type NodeSnapshot struct {
 	// lineStarts contains the starting positions of each line within this leaf.
 	// Only populated for leaf nodes.
 	lineStarts []LineStart
+
+	// lastAccessTime tracks when this snapshot's data was last accessed.
+	// Used for LRU-based memory management. Zero value means never accessed.
+	lastAccessTime time.Time
 }
 
 // newNode creates a new node with the given ID and Garland reference.
@@ -147,6 +152,7 @@ func createLeafSnapshot(data []byte, decorations []Decoration, originalOffset in
 		decorations:        decorations,
 		storageState:       StorageMemory,
 		originalFileOffset: originalOffset,
+		lastAccessTime:     time.Now(), // Initialize access time for LRU tracking
 	}
 
 	// Calculate weights
