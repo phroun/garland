@@ -844,6 +844,9 @@ func (g *Garland) rollbackToPreTransaction() {
 	g.currentFork = g.transaction.preTransactionFork
 	g.currentRevision = g.transaction.preTransactionRev
 
+	// Restore counts from the root snapshot at pre-transaction revision
+	g.updateCountsFromRoot()
+
 	// Restore cursor positions
 	for cursor, pos := range g.transaction.preTransactionCursors {
 		cursor.restorePosition(pos)
