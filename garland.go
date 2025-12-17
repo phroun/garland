@@ -256,6 +256,10 @@ type Garland struct {
 
 	// Transaction state
 	transaction *TransactionState
+
+	// Streaming state - for channel-based sources, tracks the rev 0 tree separately
+	// from the working tree (which may be at a different revision due to edits)
+	streamingRoot *Node // The root of the revision 0 streaming tree
 }
 
 // Open creates or loads a Garland from various sources.
@@ -1290,7 +1294,7 @@ func (g *Garland) startChannelLoader(ch chan []byte) {
 	go g.channelLoaderRoutine()
 }
 
-// channelLoaderRoutine reads data from the channel and appends it to the tree.
+// channelLoaderRoutine reads data from the channel and appends to the streaming tree.
 func (g *Garland) channelLoaderRoutine() {
 	for {
 		select {
@@ -1298,15 +1302,17 @@ func (g *Garland) channelLoaderRoutine() {
 			return
 		case data, ok := <-g.loader.dataChan:
 			if !ok {
-				// Channel closed - mark as complete and update revision 0
+				// Channel closed - mark as complete and finalize streaming
 				g.mu.Lock()
 				g.countComplete = true
 				g.loader.eofReached = true
 
-				// Update revision 0 to point to the final tree state
-				// This allows UndoSeek(0) to return to the fully loaded content
-				if revInfo, exists := g.revisionInfo[ForkRevision{0, 0}]; exists {
-					revInfo.RootID = g.root.id
+				// Update revision 0's RootID to point to the final streaming tree
+				// This ensures UndoSeek(0) shows all streamed content
+				if g.streamingRoot != nil {
+					if revInfo, exists := g.revisionInfo[ForkRevision{0, 0}]; exists {
+						revInfo.RootID = g.streamingRoot.id
+					}
 				}
 
 				g.mu.Unlock()
@@ -1319,21 +1325,29 @@ func (g *Garland) channelLoaderRoutine() {
 	}
 }
 
-// appendStreamData appends data from a streaming source to the tree.
+// appendStreamData appends data from a streaming source to the revision 0 tree.
+// Streaming content is visible in ALL revisions because it was "always there" in
+// the source file - we're just making it progressively visible.
+// Uses streamingRoot to track the revision 0 tree separately from working tree.
 func (g *Garland) appendStreamData(data []byte) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	// Create a new leaf node for this chunk
+	// Create a new leaf node for this chunk - always at revision 0
 	g.nextNodeID++
 	chunkNode := newNode(g.nextNodeID, g)
 	g.nodeRegistry[chunkNode.id] = chunkNode
 
 	snap := createLeafSnapshot(data, nil, 0)
-	chunkNode.setSnapshot(g.currentFork, g.currentRevision, snap)
+	chunkNode.setSnapshot(0, 0, snap) // Always fork 0, revision 0
 
-	// Get current root snapshot
-	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
+	// Get the streaming root (revision 0 tree)
+	streamRoot := g.streamingRoot
+	if streamRoot == nil {
+		streamRoot = g.root
+	}
+
+	rootSnap := streamRoot.snapshotAt(0, 0)
 	if rootSnap == nil {
 		return
 	}
@@ -1343,30 +1357,35 @@ func (g *Garland) appendStreamData(data []byte) {
 	eofID := rootSnap.rightID
 
 	// Insert the new chunk before the EOF node
-	// We need to create a new internal node that combines existing content with new chunk
 	leftNode := g.nodeRegistry[leftID]
-	leftSnap := leftNode.snapshotAt(g.currentFork, g.currentRevision)
+	leftSnap := leftNode.snapshotAt(0, 0)
 
-	// Create new internal node combining left content with new chunk
+	// Create new internal node combining left content with new chunk - at revision 0
 	g.nextNodeID++
 	newContentNode := newNode(g.nextNodeID, g)
 	g.nodeRegistry[newContentNode.id] = newContentNode
 
 	newContentSnap := createInternalSnapshot(leftID, chunkNode.id, leftSnap, snap)
-	newContentNode.setSnapshot(g.currentFork, g.currentRevision, newContentSnap)
+	newContentNode.setSnapshot(0, 0, newContentSnap)
 
-	// Create new root combining new content with EOF
+	// Create new root combining new content with EOF - at revision 0
 	g.nextNodeID++
-	newRoot := newNode(g.nextNodeID, g)
-	g.nodeRegistry[newRoot.id] = newRoot
+	newStreamRoot := newNode(g.nextNodeID, g)
+	g.nodeRegistry[newStreamRoot.id] = newStreamRoot
 
 	eofNode := g.nodeRegistry[eofID]
-	eofSnap := eofNode.snapshotAt(g.currentFork, g.currentRevision)
+	eofSnap := eofNode.snapshotAt(0, 0)
 
 	newRootSnap := createInternalSnapshot(newContentNode.id, eofID, newContentSnap, eofSnap)
-	newRoot.setSnapshot(g.currentFork, g.currentRevision, newRootSnap)
+	newStreamRoot.setSnapshot(0, 0, newRootSnap)
 
-	g.root = newRoot
+	// Update streaming root
+	g.streamingRoot = newStreamRoot
+
+	// If we're still at revision 0 (no edits yet), also update the working root
+	if g.currentFork == 0 && g.currentRevision == 0 {
+		g.root = newStreamRoot
+	}
 
 	// Update counts
 	g.totalBytes += snap.byteCount
