@@ -864,7 +864,7 @@ func (g *Garland) insertBytesAt(c *Cursor, pos int64, data []byte, decorations [
 	// Adjust cursors after insertion point
 	for _, cursor := range g.cursors {
 		if cursor != c && cursor.bytePos >= pos {
-			cursor.adjustForMutation(pos, insertedBytes)
+			cursor.adjustForMutation(pos, insertedBytes, insertedRunes, insertedLines)
 		}
 	}
 
@@ -929,7 +929,7 @@ func (g *Garland) deleteBytesAt(c *Cursor, pos int64, length int64, includeLineD
 		if cursor != c {
 			if cursor.bytePos > pos+length {
 				// Cursor is after deleted range - shift back
-				cursor.adjustForMutation(pos, -deletedBytes)
+				cursor.adjustForMutation(pos+length, -deletedBytes, -deletedRunes, -deletedLines)
 			} else if cursor.bytePos > pos {
 				// Cursor is within deleted range - move to deletion point
 				cursor.bytePos = pos

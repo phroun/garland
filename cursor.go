@@ -261,13 +261,26 @@ func (c *Cursor) updatePosition(bytePos, runePos, line, lineRune int64) {
 }
 
 // adjustForMutation adjusts cursor position after a mutation.
-// mutationPos is where the mutation occurred, delta is the size change
-// (positive for insert, negative for delete).
-func (c *Cursor) adjustForMutation(mutationPos int64, delta int64) {
+// mutationPos is where the mutation occurred (byte position).
+// byteDelta, runeDelta, lineDelta are the size changes (positive for insert, negative for delete).
+func (c *Cursor) adjustForMutation(mutationPos int64, byteDelta, runeDelta, lineDelta int64) {
 	if c.bytePos > mutationPos {
-		c.bytePos += delta
-		// Note: rune and line positions need recalculation from the garland
-		// This is handled by the mutation operation itself
+		c.bytePos += byteDelta
+		c.runePos += runeDelta
+		// Line position adjustment is more complex - only adjust if mutation was on a prior line
+		// For simplicity, we adjust lineRune only, as line number changes depend on newline insertions
+		// If the mutation added/removed newlines before our line, adjust line number
+		if lineDelta != 0 {
+			c.line += lineDelta
+		}
+	} else if c.bytePos == mutationPos && byteDelta > 0 {
+		// Insert at cursor position - cursor stays at same logical position
+		// but the content shifted, so coordinates shift too
+		c.bytePos += byteDelta
+		c.runePos += runeDelta
+		if lineDelta != 0 {
+			c.line += lineDelta
+		}
 	}
 }
 
