@@ -94,8 +94,13 @@ func TestDecorationSlidingOnInsert(t *testing.T) {
 
 // TestDecorationSlidingOnDelete tests that decorations slide correctly when text is deleted.
 // Decorations before the delete range should NOT move.
-// Decorations within the delete range should be removed.
+// Decorations within the delete range are RETURNED to the caller (not automatically deleted).
 // Decorations after the delete range should slide left.
+//
+// DeleteBytes returns decorations from the deleted range, allowing the caller to:
+// - Re-insert them at the deletion point (consolidate)
+// - Discard them (explicit deletion)
+// - Move them elsewhere
 func TestDecorationSlidingOnDelete(t *testing.T) {
 	lib, err := Init(LibraryOptions{})
 	if err != nil {
@@ -111,31 +116,53 @@ func TestDecorationSlidingOnDelete(t *testing.T) {
 
 	cursor := g.NewCursor()
 
-	// Add decorations
+	// Add content with decorations at various positions
+	// Note: Empty string inserts don't store decorations, so we need to insert actual content
+	// We'll insert markers that we can track: "[0]", "[3]", "[5]", "[8]", "[A]" (A=10)
+	// "Hello World" -> "[0]Hello World" -> "[0]Hel[3]lo World" etc.
+
+	// Insert "[0]" at position 0 with decoration
 	cursor.SeekByte(0)
-	_, _ = cursor.InsertString("", []RelativeDecoration{{Key: "mark_0", Position: 0}}, false)
-	cursor.SeekByte(3)
-	_, _ = cursor.InsertString("", []RelativeDecoration{{Key: "mark_3", Position: 0}}, false) // Will be deleted
-	cursor.SeekByte(5)
-	_, _ = cursor.InsertString("", []RelativeDecoration{{Key: "mark_5", Position: 0}}, false) // Will be deleted
-	cursor.SeekByte(8)
-	_, _ = cursor.InsertString("", []RelativeDecoration{{Key: "mark_8", Position: 0}}, false)
-	cursor.SeekByte(10)
-	_, _ = cursor.InsertString("", []RelativeDecoration{{Key: "mark_10", Position: 0}}, false)
+	_, _ = cursor.InsertString("[0]", []RelativeDecoration{{Key: "mark_0", Position: 0}}, false)
+	// Now: "[0]Hello World"
 
-	t.Log("=== Initial state: 'Hello World' with decorations at 0, 3, 5, 8, 10 ===")
+	// Insert "[3]" at position 6 (original pos 3 + 3 for "[0]") with decoration
+	cursor.SeekByte(6)
+	_, _ = cursor.InsertString("[3]", []RelativeDecoration{{Key: "mark_3", Position: 0}}, false)
+	// Now: "[0]Hel[3]lo World"
 
-	// Delete "lo W" (4 bytes from position 3)
-	// "Hel" + "orld" = "Helorld"
-	// Expected:
-	// mark_0: 0 (unchanged)
-	// mark_3: deleted (in range)
-	// mark_5: deleted (in range)
-	// mark_8: 4 (was 8, slides left by 4)
-	// mark_10: 6 (was 10, slides left by 4)
+	// Insert "[5]" at position 12 (original pos 5 + 6) with decoration
+	cursor.SeekByte(12)
+	_, _ = cursor.InsertString("[5]", []RelativeDecoration{{Key: "mark_5", Position: 0}}, false)
+	// Now: "[0]Hel[3]lo[5] World"
 
-	cursor.SeekByte(3)
-	_, _, err = cursor.DeleteBytes(4, false)
+	// Insert "[8]" at position 18 (original pos 8 + 9) with decoration
+	cursor.SeekByte(18)
+	_, _ = cursor.InsertString("[8]", []RelativeDecoration{{Key: "mark_8", Position: 0}}, false)
+	// Now: "[0]Hel[3]lo[5] W[8]orld"
+
+	// Insert "[A]" at position 24 (original pos 10 + 12) with decoration
+	cursor.SeekByte(24)
+	_, _ = cursor.InsertString("[A]", []RelativeDecoration{{Key: "mark_A", Position: 0}}, false)
+	// Now: "[0]Hel[3]lo[5] W[8]or[A]ld"
+
+	// Read current state
+	cursor.SeekByte(0)
+	initData, _ := cursor.ReadBytes(g.ByteCount().Value)
+	t.Logf("=== Initial state: %q ===", string(initData))
+	// Content is: "[0]Hel[3]lo[5] W[8]or[A]ld"
+	// Positions of markers:
+	// [0] at 0-2, mark_0 at 0
+	// [3] at 6-8, mark_3 at 6
+	// [5] at 12-14, mark_5 at 12
+	// [8] at 18-20, mark_8 at 18
+	// [A] at 24-26, mark_A at 24
+
+	// Delete "[3]lo[5]" (9 bytes from position 6 to 14)
+	// This should return mark_3 and mark_5 (they're in the delete range)
+	// mark_0 stays, mark_8 and mark_A slide left by 9
+	cursor.SeekByte(6)
+	deletedDecorations, _, err := cursor.DeleteBytes(9, false)
 	if err != nil {
 		t.Fatalf("Delete failed: %v", err)
 	}
@@ -143,11 +170,24 @@ func TestDecorationSlidingOnDelete(t *testing.T) {
 	cursor.SeekByte(0)
 	data, _ := cursor.ReadBytes(g.ByteCount().Value)
 	content := string(data)
-	if content != "Helorld" {
-		t.Errorf("After delete: got %q, want %q", content, "Helorld")
+	// Initial: "[0]Hel[3]lo [5]Wor[8][A]ld"
+	// Delete 9 bytes at pos 6: removes "[3]lo [5]"
+	// Result: "[0]Hel" + "Wor[8][A]ld" = "[0]HelWor[8][A]ld"
+	expectedContent := "[0]HelWor[8][A]ld"
+	if content != expectedContent {
+		t.Errorf("After delete: got %q, want %q", content, expectedContent)
 	}
-	t.Logf("After delete 4 bytes at pos 3: %q", content)
-	t.Log("Decorations should have slid: mark_0@0, mark_3 DELETED, mark_5 DELETED, mark_8@4, mark_10@6")
+	t.Logf("After deleting 9 bytes at pos 6: %q", content)
+	t.Logf("Returned decorations from deleted range: %d decorations", len(deletedDecorations))
+	for _, d := range deletedDecorations {
+		t.Logf("  - %s at relative position %d", d.Key, d.Position)
+	}
+
+	// Verify we got the expected decorations back
+	if len(deletedDecorations) != 2 {
+		t.Errorf("Expected 2 decorations returned, got %d", len(deletedDecorations))
+	}
+	t.Log("Returned decorations (mark_3, mark_5) can be re-inserted or discarded by caller")
 }
 
 // TestDecorationSlidingWithUndoSeek tests that UndoSeek restores decoration positions.
@@ -510,6 +550,140 @@ func TestDecorationNearCursorBoundaries(t *testing.T) {
 	}
 	t.Logf("After insert 'XX' at 4: %q", readContent())
 	t.Log("Expected: mark_before@3, mark_at@6, mark_after@7")
+}
+
+// TestDecorationInsertBeforeFlag tests the subtle distinction of decoration sliding
+// based on the insertBefore flag when a decoration is exactly at the insert point.
+//
+// insertBefore=false: Insert AFTER cursor position. Decorations at insert point should STAY
+//                     (the new text goes after the decoration's logical position).
+// insertBefore=true:  Insert BEFORE cursor position. Decorations at insert point should SLIDE
+//                     (the new text goes before the decoration's logical position).
+func TestDecorationInsertBeforeFlag(t *testing.T) {
+	lib, err := Init(LibraryOptions{})
+	if err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	t.Run("insertBefore=false - decoration at insert point stays", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "ABCDEF"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		cursor := g.NewCursor()
+
+		readContent := func() string {
+			cursor.SeekByte(0)
+			data, _ := cursor.ReadBytes(g.ByteCount().Value)
+			return string(data)
+		}
+
+		// Place decoration at position 3 (at "D")
+		cursor.SeekByte(3)
+		_, _ = cursor.InsertString("", []RelativeDecoration{{Key: "mark_at_D", Position: 0}}, false)
+
+		t.Log("Initial: 'ABCDEF' with mark_at_D@3")
+
+		// Insert "XX" at position 3 with insertBefore=false
+		// This means: insert after current position, cursor advances
+		// Expected: text becomes "ABCXXDEF"
+		// Decoration at position 3 should STAY at 3 (points to first 'X' now)
+		// because the insert is conceptually "after" the decoration's anchor point
+		cursor.SeekByte(3)
+		_, err = cursor.InsertString("XX", nil, false) // insertBefore=false
+		if err != nil {
+			t.Fatalf("Insert failed: %v", err)
+		}
+
+		if content := readContent(); content != "ABCXXDEF" {
+			t.Errorf("Content: got %q, want %q", content, "ABCXXDEF")
+		}
+		t.Logf("After insert 'XX' at 3 (insertBefore=false): %q", readContent())
+		t.Log("Expected: mark_at_D stays at 3 (now points to 'X')")
+	})
+
+	t.Run("insertBefore=true - decoration at insert point slides", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "ABCDEF"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		cursor := g.NewCursor()
+
+		readContent := func() string {
+			cursor.SeekByte(0)
+			data, _ := cursor.ReadBytes(g.ByteCount().Value)
+			return string(data)
+		}
+
+		// Place decoration at position 3 (at "D")
+		cursor.SeekByte(3)
+		_, _ = cursor.InsertString("", []RelativeDecoration{{Key: "mark_at_D", Position: 0}}, false)
+
+		t.Log("Initial: 'ABCDEF' with mark_at_D@3")
+
+		// Insert "XX" at position 3 with insertBefore=true
+		// This means: insert before current position, cursor stays
+		// Expected: text becomes "ABCXXDEF"
+		// Decoration at position 3 should SLIDE to 5 (still points to 'D')
+		// because the insert is conceptually "before" the decoration's anchor point
+		cursor.SeekByte(3)
+		_, err = cursor.InsertString("XX", nil, true) // insertBefore=true
+		if err != nil {
+			t.Fatalf("Insert failed: %v", err)
+		}
+
+		if content := readContent(); content != "ABCXXDEF" {
+			t.Errorf("Content: got %q, want %q", content, "ABCXXDEF")
+		}
+		t.Logf("After insert 'XX' at 3 (insertBefore=true): %q", readContent())
+		t.Log("Expected: mark_at_D slides to 5 (still points to 'D')")
+	})
+
+	t.Run("mixed - decorations before/at/after with both flags", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "ABCDEFGH"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		cursor := g.NewCursor()
+
+		readContent := func() string {
+			cursor.SeekByte(0)
+			data, _ := cursor.ReadBytes(g.ByteCount().Value)
+			return string(data)
+		}
+
+		// Place decorations at 3, 4, 5
+		cursor.SeekByte(3)
+		_, _ = cursor.InsertString("", []RelativeDecoration{{Key: "before", Position: 0}}, false)
+		cursor.SeekByte(4)
+		_, _ = cursor.InsertString("", []RelativeDecoration{{Key: "at", Position: 0}}, false)
+		cursor.SeekByte(5)
+		_, _ = cursor.InsertString("", []RelativeDecoration{{Key: "after", Position: 0}}, false)
+
+		t.Log("Initial: 'ABCDEFGH' with before@3, at@4, after@5")
+
+		// Insert "XX" at position 4 with insertBefore=true
+		// before@3: stays at 3 (strictly before insert)
+		// at@4: slides to 6 (insertBefore=true means it slides)
+		// after@5: slides to 7 (strictly after insert)
+		cursor.SeekByte(4)
+		_, err = cursor.InsertString("XX", nil, true) // insertBefore=true
+		if err != nil {
+			t.Fatalf("Insert failed: %v", err)
+		}
+
+		if content := readContent(); content != "ABCDXXEFGH" {
+			t.Errorf("Content: got %q, want %q", content, "ABCDXXEFGH")
+		}
+		t.Logf("After insert 'XX' at 4 (insertBefore=true): %q", readContent())
+		t.Log("Expected with insertBefore=true: before@3, at@6, after@7")
+	})
 }
 
 // TestDecorationInDistantNodes tests decoration sliding when decorations are in
