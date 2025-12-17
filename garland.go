@@ -817,30 +817,215 @@ func (g *Garland) countLinesBeforeByteInternal(node *Node, snap *NodeSnapshot, t
 	return leftSnap.lineCount + g.countLinesBeforeByteInternal(rightNode, rightSnap, targetByte, leftEnd)
 }
 
-// Mutation stubs
+// Mutation operations
+
 func (g *Garland) insertBytesAt(c *Cursor, pos int64, data []byte, decorations []RelativeDecoration, insertBefore bool) (ChangeResult, error) {
-	// TODO: Implement
-	return ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}, nil
+	if len(data) == 0 {
+		return ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}, nil
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// Validate position
+	if pos < 0 || pos > g.totalBytes {
+		return ChangeResult{}, ErrInvalidPosition
+	}
+
+	// Perform the insertion by recursively rebuilding the tree
+	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
+	if rootSnap == nil {
+		return ChangeResult{}, ErrInvalidPosition
+	}
+
+	newRootID, err := g.insertInternal(g.root, rootSnap, pos, 0, data, decorations, insertBefore)
+	if err != nil {
+		return ChangeResult{}, err
+	}
+
+	// Update tree root
+	g.root = g.nodeRegistry[newRootID]
+
+	// Calculate deltas for counts
+	insertedBytes := int64(len(data))
+	insertedRunes := int64(len([]rune(string(data))))
+	insertedLines := int64(0)
+	for _, b := range data {
+		if b == '\n' {
+			insertedLines++
+		}
+	}
+
+	// Update counts
+	g.totalBytes += insertedBytes
+	g.totalRunes += insertedRunes
+	g.totalLines += insertedLines
+
+	// Adjust cursors after insertion point
+	for _, cursor := range g.cursors {
+		if cursor != c && cursor.bytePos >= pos {
+			cursor.adjustForMutation(pos, insertedBytes)
+		}
+	}
+
+	// Handle versioning
+	return g.recordMutation(), nil
 }
 
 func (g *Garland) insertStringAt(c *Cursor, pos int64, data string, decorations []RelativeDecoration, insertBefore bool) (ChangeResult, error) {
-	// TODO: Implement
-	return ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}, nil
+	return g.insertBytesAt(c, pos, []byte(data), decorations, insertBefore)
 }
 
 func (g *Garland) deleteBytesAt(c *Cursor, pos int64, length int64, includeLineDecorations bool) ([]RelativeDecoration, ChangeResult, error) {
-	// TODO: Implement
-	return nil, ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}, nil
+	if length <= 0 {
+		return nil, ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}, nil
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// Validate position
+	if pos < 0 || pos >= g.totalBytes {
+		return nil, ChangeResult{}, ErrInvalidPosition
+	}
+
+	// Clamp length to available data
+	if pos+length > g.totalBytes {
+		length = g.totalBytes - pos
+	}
+
+	// Read the content being deleted to calculate deltas
+	deletedData, err := g.readBytesRangeInternal(pos, length)
+	if err != nil {
+		return nil, ChangeResult{}, err
+	}
+
+	// Calculate what we're deleting
+	deletedBytes := int64(len(deletedData))
+	deletedRunes := int64(len([]rune(string(deletedData))))
+	deletedLines := int64(0)
+	for _, b := range deletedData {
+		if b == '\n' {
+			deletedLines++
+		}
+	}
+
+	// Perform the deletion
+	deletedDecs, newRootID, err := g.deleteRange(pos, length)
+	if err != nil {
+		return nil, ChangeResult{}, err
+	}
+
+	// Update tree root
+	g.root = g.nodeRegistry[newRootID]
+
+	// Update counts
+	g.totalBytes -= deletedBytes
+	g.totalRunes -= deletedRunes
+	g.totalLines -= deletedLines
+
+	// Adjust cursors after deletion point
+	for _, cursor := range g.cursors {
+		if cursor != c {
+			if cursor.bytePos > pos+length {
+				// Cursor is after deleted range - shift back
+				cursor.adjustForMutation(pos, -deletedBytes)
+			} else if cursor.bytePos > pos {
+				// Cursor is within deleted range - move to deletion point
+				cursor.bytePos = pos
+				// Recalculate other coordinates
+				cursor.runePos, _ = g.byteToRuneInternal(pos)
+				cursor.line, cursor.lineRune, _ = g.byteToLineRuneInternal(pos)
+			}
+		}
+	}
+
+	// Convert absolute decorations to relative
+	relDecs := make([]RelativeDecoration, len(deletedDecs))
+	for i, d := range deletedDecs {
+		relDecs[i] = RelativeDecoration{
+			Key:      d.Key,
+			Position: d.Position - pos,
+		}
+	}
+
+	// Handle versioning
+	result := g.recordMutation()
+	return relDecs, result, nil
 }
 
-func (g *Garland) deleteRunesAt(c *Cursor, pos int64, length int64, includeLineDecorations bool) ([]RelativeDecoration, ChangeResult, error) {
-	// TODO: Implement
-	return nil, ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}, nil
+func (g *Garland) deleteRunesAt(c *Cursor, runePos int64, length int64, includeLineDecorations bool) ([]RelativeDecoration, ChangeResult, error) {
+	if length <= 0 {
+		return nil, ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}, nil
+	}
+
+	// Convert rune positions to byte positions (need brief lock for this)
+	g.mu.RLock()
+	byteStart, err := g.runeToByteInternal(runePos)
+	if err != nil {
+		g.mu.RUnlock()
+		return nil, ChangeResult{}, err
+	}
+
+	byteEnd, err := g.runeToByteInternal(runePos + length)
+	if err != nil {
+		// Clamp to EOF
+		byteEnd = g.totalBytes
+	}
+	g.mu.RUnlock()
+
+	// Now call deleteBytesAt which will handle its own locking
+	return g.deleteBytesAt(c, byteStart, byteEnd-byteStart, includeLineDecorations)
 }
 
 func (g *Garland) truncateAt(c *Cursor, pos int64) (ChangeResult, error) {
-	// TODO: Implement
-	return ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}, nil
+	g.mu.RLock()
+	totalBytes := g.totalBytes
+	g.mu.RUnlock()
+
+	// Validate position
+	if pos < 0 || pos > totalBytes {
+		return ChangeResult{}, ErrInvalidPosition
+	}
+
+	// Nothing to truncate if already at end
+	if pos == totalBytes {
+		return ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}, nil
+	}
+
+	length := totalBytes - pos
+
+	// Call deleteBytesAt which will handle its own locking
+	_, result, err := g.deleteBytesAt(c, pos, length, false)
+	return result, err
+}
+
+// recordMutation handles versioning after a mutation.
+// If in a transaction, marks it as having mutations.
+// Otherwise, creates a new revision.
+func (g *Garland) recordMutation() ChangeResult {
+	if g.transaction != nil {
+		// In transaction - mark as having mutations but don't bump revision yet
+		g.transaction.hasMutations = true
+		return ChangeResult{Fork: g.currentFork, Revision: g.transaction.pendingRevision}
+	}
+
+	// Not in transaction - create implicit single-operation revision
+	g.currentRevision++
+	if forkInfo, ok := g.forks[g.currentFork]; ok {
+		if g.currentRevision > forkInfo.HighestRevision {
+			forkInfo.HighestRevision = g.currentRevision
+		}
+	}
+
+	// Store revision info (unnamed)
+	g.revisionInfo[ForkRevision{g.currentFork, g.currentRevision}] = &RevisionInfo{
+		Revision:   g.currentRevision,
+		Name:       "",
+		HasChanges: true,
+	}
+
+	return ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}
 }
 
 // Read operations
@@ -951,7 +1136,7 @@ func (g *Garland) readBytesRangeInternal(pos int64, length int64) ([]byte, error
 	currentPos := pos
 
 	for remaining > 0 {
-		leafResult, err := g.findLeafByByte(currentPos)
+		leafResult, err := g.findLeafByByteUnlocked(currentPos)
 		if err != nil {
 			return nil, err
 		}
@@ -978,6 +1163,7 @@ func (g *Garland) readBytesRangeInternal(pos int64, length int64) ([]byte, error
 }
 
 // findLineEnd finds the byte position of the end of the line (at newline or EOF).
+// Caller must hold at least read lock.
 func (g *Garland) findLineEnd(lineStart int64) int64 {
 	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
 	if rootSnap == nil {
@@ -988,7 +1174,7 @@ func (g *Garland) findLineEnd(lineStart int64) int64 {
 	totalBytes := rootSnap.byteCount
 
 	for currentPos < totalBytes {
-		leafResult, err := g.findLeafByByte(currentPos)
+		leafResult, err := g.findLeafByByteUnlocked(currentPos)
 		if err != nil {
 			return currentPos
 		}

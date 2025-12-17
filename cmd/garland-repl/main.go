@@ -12,10 +12,19 @@ import (
 
 // REPL holds the state of the interactive session
 type REPL struct {
-	lib     *garland.Library
-	garland *garland.Garland
-	cursor  *garland.Cursor
-	reader  *bufio.Reader
+	lib           *garland.Library
+	garland       *garland.Garland
+	cursors       map[string]*garland.Cursor // named cursors
+	currentCursor string                     // name of current cursor
+	reader        *bufio.Reader
+}
+
+// cursor returns the currently selected cursor
+func (r *REPL) cursor() *garland.Cursor {
+	if r.cursors == nil {
+		return nil
+	}
+	return r.cursors[r.currentCursor]
 }
 
 func main() {
@@ -107,6 +116,9 @@ func (r *REPL) handleCommand(input string) bool {
 	case "delete":
 		r.cmdDelete(args)
 
+	case "backdelete":
+		r.cmdBackDelete(args)
+
 	case "dump":
 		r.cmdDump()
 
@@ -151,19 +163,23 @@ FILE OPERATIONS:
 
 CURSOR OPERATIONS:
   cursor                  Show current cursor position
+  cursor <name>           Switch to (or create) a named cursor
+  cursor list             List all cursors and their positions
   seek byte <pos>         Move cursor to byte position
   seek rune <pos>         Move cursor to rune position
   seek line <line> <rune> Move cursor to line:rune position
 
 READ OPERATIONS:
-  read bytes <length>     Read bytes from cursor position
-  read string <length>    Read runes from cursor position as string
+  read bytes <length>     Read bytes from cursor position (advances cursor)
+  read string <length>    Read runes from cursor position (advances cursor)
   readline                Read the entire line at cursor position
 
 EDIT OPERATIONS:
-  insert <text>           Insert text at cursor position
-  delete bytes <length>   Delete bytes from cursor position
-  delete runes <length>   Delete runes from cursor position
+  insert <text>           Insert text at cursor position (advances cursor)
+  delete bytes <length>   Delete bytes forward from cursor position
+  delete runes <length>   Delete runes forward from cursor position
+  backdelete bytes <len>  Delete bytes backward (like backspace)
+  backdelete runes <len>  Delete runes backward (like backspace)
 
 INSPECTION:
   dump                    Dump all content
@@ -211,7 +227,9 @@ func (r *REPL) cmdNew(args []string) {
 	}
 
 	r.garland = g
-	r.cursor = g.NewCursor()
+	r.cursors = make(map[string]*garland.Cursor)
+	r.cursors["default"] = g.NewCursor()
+	r.currentCursor = "default"
 	fmt.Printf("Created new garland with %d bytes\n", g.ByteCount().Value)
 }
 
@@ -227,7 +245,8 @@ func (r *REPL) cmdClose() {
 
 	r.garland.Close()
 	r.garland = nil
-	r.cursor = nil
+	r.cursors = nil
+	r.currentCursor = ""
 	fmt.Println("Garland closed")
 }
 
@@ -249,10 +268,11 @@ func (r *REPL) cmdStatus() {
 	fmt.Printf("  Fork: %d, Revision: %d\n", g.CurrentFork(), g.CurrentRevision())
 	fmt.Printf("  In Transaction: %v (depth: %d)\n", g.InTransaction(), g.TransactionDepth())
 
-	if r.cursor != nil {
-		line, lineRune := r.cursor.LinePos()
-		fmt.Printf("  Cursor: byte=%d, rune=%d, line=%d:%d\n",
-			r.cursor.BytePos(), r.cursor.RunePos(), line, lineRune)
+	if cursor := r.cursor(); cursor != nil {
+		line, lineRune := cursor.LinePos()
+		fmt.Printf("  Cursor '%s': byte=%d, rune=%d, line=%d:%d\n",
+			r.currentCursor, cursor.BytePos(), cursor.RunePos(), line, lineRune)
+		fmt.Printf("  Total cursors: %d\n", len(r.cursors))
 	}
 }
 
@@ -261,13 +281,44 @@ func (r *REPL) cmdCursor(args []string) {
 		return
 	}
 
-	line, lineRune := r.cursor.LinePos()
-	fmt.Printf("Cursor Position:\n")
-	fmt.Printf("  Byte:     %d\n", r.cursor.BytePos())
-	fmt.Printf("  Rune:     %d\n", r.cursor.RunePos())
+	// Handle subcommands: cursor, cursor <name>, cursor list
+	if len(args) >= 1 {
+		subcmd := strings.ToLower(args[0])
+
+		if subcmd == "list" {
+			fmt.Println("Cursors:")
+			for name, c := range r.cursors {
+				marker := "  "
+				if name == r.currentCursor {
+					marker = "> "
+				}
+				line, lineRune := c.LinePos()
+				fmt.Printf("%s%s: byte=%d, rune=%d, line=%d:%d\n",
+					marker, name, c.BytePos(), c.RunePos(), line, lineRune)
+			}
+			return
+		}
+
+		// Switch to or create a cursor by name
+		name := args[0]
+		if _, exists := r.cursors[name]; !exists {
+			// Create new cursor
+			r.cursors[name] = r.garland.NewCursor()
+			fmt.Printf("Created new cursor '%s'\n", name)
+		}
+		r.currentCursor = name
+		fmt.Printf("Switched to cursor '%s'\n", name)
+	}
+
+	// Show current cursor info
+	cursor := r.cursor()
+	line, lineRune := cursor.LinePos()
+	fmt.Printf("Cursor '%s' Position:\n", r.currentCursor)
+	fmt.Printf("  Byte:     %d\n", cursor.BytePos())
+	fmt.Printf("  Rune:     %d\n", cursor.RunePos())
 	fmt.Printf("  Line:     %d\n", line)
 	fmt.Printf("  LineRune: %d\n", lineRune)
-	fmt.Printf("  Ready:    %v\n", r.cursor.IsReady())
+	fmt.Printf("  Ready:    %v\n", cursor.IsReady())
 }
 
 func (r *REPL) cmdSeek(args []string) {
@@ -280,6 +331,7 @@ func (r *REPL) cmdSeek(args []string) {
 		return
 	}
 
+	cursor := r.cursor()
 	mode := strings.ToLower(args[0])
 	pos, err := strconv.ParseInt(args[1], 10, 64)
 	if err != nil {
@@ -289,9 +341,9 @@ func (r *REPL) cmdSeek(args []string) {
 
 	switch mode {
 	case "byte":
-		err = r.cursor.SeekByte(pos)
+		err = cursor.SeekByte(pos)
 	case "rune":
-		err = r.cursor.SeekRune(pos)
+		err = cursor.SeekRune(pos)
 	case "line":
 		runeInLine := int64(0)
 		if len(args) >= 3 {
@@ -301,7 +353,7 @@ func (r *REPL) cmdSeek(args []string) {
 				return
 			}
 		}
-		err = r.cursor.SeekLine(pos, runeInLine)
+		err = cursor.SeekLine(pos, runeInLine)
 	default:
 		fmt.Println("Unknown seek mode. Use: byte, rune, or line")
 		return
@@ -312,9 +364,9 @@ func (r *REPL) cmdSeek(args []string) {
 		return
 	}
 
-	line, lineRune := r.cursor.LinePos()
+	line, lineRune := cursor.LinePos()
 	fmt.Printf("Cursor moved to byte=%d, rune=%d, line=%d:%d\n",
-		r.cursor.BytePos(), r.cursor.RunePos(), line, lineRune)
+		cursor.BytePos(), cursor.RunePos(), line, lineRune)
 }
 
 func (r *REPL) cmdRead(args []string) {
@@ -327,6 +379,7 @@ func (r *REPL) cmdRead(args []string) {
 		return
 	}
 
+	cursor := r.cursor()
 	mode := strings.ToLower(args[0])
 	length, err := strconv.ParseInt(args[1], 10, 64)
 	if err != nil {
@@ -336,7 +389,7 @@ func (r *REPL) cmdRead(args []string) {
 
 	switch mode {
 	case "bytes":
-		data, err := r.cursor.ReadBytes(length)
+		data, err := cursor.ReadBytes(length)
 		if err != nil {
 			fmt.Printf("Read error: %v\n", err)
 			return
@@ -345,7 +398,7 @@ func (r *REPL) cmdRead(args []string) {
 		fmt.Printf("Hex: %x\n", data)
 
 	case "string":
-		data, err := r.cursor.ReadString(length)
+		data, err := cursor.ReadString(length)
 		if err != nil {
 			fmt.Printf("Read error: %v\n", err)
 			return
@@ -362,7 +415,8 @@ func (r *REPL) cmdReadLine() {
 		return
 	}
 
-	data, err := r.cursor.ReadLine()
+	cursor := r.cursor()
+	data, err := cursor.ReadLine()
 	if err != nil {
 		fmt.Printf("Read error: %v\n", err)
 		return
@@ -385,7 +439,8 @@ func (r *REPL) cmdInsert(args []string) {
 	text = strings.ReplaceAll(text, "\\n", "\n")
 	text = strings.ReplaceAll(text, "\\t", "\t")
 
-	result, err := r.cursor.InsertString(text, nil, false)
+	cursor := r.cursor()
+	result, err := cursor.InsertString(text, nil, false)
 	if err != nil {
 		fmt.Printf("Insert error: %v\n", err)
 		return
@@ -404,6 +459,7 @@ func (r *REPL) cmdDelete(args []string) {
 		return
 	}
 
+	cursor := r.cursor()
 	mode := strings.ToLower(args[0])
 	length, err := strconv.ParseInt(args[1], 10, 64)
 	if err != nil {
@@ -413,7 +469,7 @@ func (r *REPL) cmdDelete(args []string) {
 
 	switch mode {
 	case "bytes":
-		_, result, err := r.cursor.DeleteBytes(length, false)
+		_, result, err := cursor.DeleteBytes(length, false)
 		if err != nil {
 			fmt.Printf("Delete error: %v\n", err)
 			return
@@ -422,7 +478,7 @@ func (r *REPL) cmdDelete(args []string) {
 			length, result.Fork, result.Revision)
 
 	case "runes":
-		_, result, err := r.cursor.DeleteRunes(length, false)
+		_, result, err := cursor.DeleteRunes(length, false)
 		if err != nil {
 			fmt.Printf("Delete error: %v\n", err)
 			return
@@ -435,18 +491,64 @@ func (r *REPL) cmdDelete(args []string) {
 	}
 }
 
+func (r *REPL) cmdBackDelete(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 2 {
+		fmt.Println("Usage: backdelete bytes|runes <length>")
+		return
+	}
+
+	cursor := r.cursor()
+	mode := strings.ToLower(args[0])
+	length, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil {
+		fmt.Printf("Invalid length: %v\n", err)
+		return
+	}
+
+	switch mode {
+	case "bytes":
+		_, result, err := cursor.BackDeleteBytes(length, false)
+		if err != nil {
+			fmt.Printf("BackDelete error: %v\n", err)
+			return
+		}
+		line, lineRune := cursor.LinePos()
+		fmt.Printf("Back-deleted %d bytes. Cursor now at byte=%d, line=%d:%d. Fork=%d, revision=%d\n",
+			length, cursor.BytePos(), line, lineRune, result.Fork, result.Revision)
+
+	case "runes":
+		_, result, err := cursor.BackDeleteRunes(length, false)
+		if err != nil {
+			fmt.Printf("BackDelete error: %v\n", err)
+			return
+		}
+		line, lineRune := cursor.LinePos()
+		fmt.Printf("Back-deleted %d runes. Cursor now at byte=%d, line=%d:%d. Fork=%d, revision=%d\n",
+			length, cursor.BytePos(), line, lineRune, result.Fork, result.Revision)
+
+	default:
+		fmt.Println("Unknown backdelete mode. Use: bytes or runes")
+	}
+}
+
 func (r *REPL) cmdDump() {
 	if !r.ensureGarland() {
 		return
 	}
 
+	cursor := r.cursor()
+
 	// Save cursor position
-	savedPos := r.cursor.BytePos()
+	savedPos := cursor.BytePos()
 
 	// Read all content
-	r.cursor.SeekByte(0)
+	cursor.SeekByte(0)
 	byteCount := r.garland.ByteCount().Value
-	data, err := r.cursor.ReadBytes(byteCount)
+	data, err := cursor.ReadBytes(byteCount)
 	if err != nil {
 		fmt.Printf("Read error: %v\n", err)
 		return
@@ -462,7 +564,7 @@ func (r *REPL) cmdDump() {
 		r.garland.LineCount().Value)
 
 	// Restore cursor position
-	r.cursor.SeekByte(savedPos)
+	cursor.SeekByte(savedPos)
 }
 
 func (r *REPL) cmdTree() {

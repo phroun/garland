@@ -262,22 +262,36 @@ func (c *Cursor) snapshotPosition() *CursorPosition {
 // InsertBytes inserts raw bytes at the cursor position.
 // If insertBefore is true, insertion occurs before any existing
 // cursors/decorations at this position; otherwise after.
+// After insertion, cursor advances to the end of the inserted content.
 func (c *Cursor) InsertBytes(data []byte, decorations []RelativeDecoration, insertBefore bool) (ChangeResult, error) {
 	if c.garland == nil {
 		return ChangeResult{}, ErrCursorNotFound
 	}
-	return c.garland.insertBytesAt(c, c.bytePos, data, decorations, insertBefore)
+	result, err := c.garland.insertBytesAt(c, c.bytePos, data, decorations, insertBefore)
+	if err != nil {
+		return result, err
+	}
+	// Advance cursor to end of inserted content
+	c.SeekByte(c.bytePos + int64(len(data)))
+	return result, nil
 }
 
 // InsertString inserts a string at the cursor position.
 // Relative decoration positions are measured in runes.
 // If insertBefore is true, insertion occurs before any existing
 // cursors/decorations at this position; otherwise after.
+// After insertion, cursor advances to the end of the inserted content.
 func (c *Cursor) InsertString(data string, decorations []RelativeDecoration, insertBefore bool) (ChangeResult, error) {
 	if c.garland == nil {
 		return ChangeResult{}, ErrCursorNotFound
 	}
-	return c.garland.insertStringAt(c, c.bytePos, data, decorations, insertBefore)
+	result, err := c.garland.insertStringAt(c, c.bytePos, data, decorations, insertBefore)
+	if err != nil {
+		return result, err
+	}
+	// Advance cursor to end of inserted content
+	c.SeekByte(c.bytePos + int64(len(data)))
+	return result, nil
 }
 
 // DeleteBytes deletes `length` bytes starting at cursor position.
@@ -311,25 +325,84 @@ func (c *Cursor) TruncateToEOF() (ChangeResult, error) {
 }
 
 // ReadBytes reads `length` bytes starting at cursor position.
+// After reading, cursor advances past the read data.
 func (c *Cursor) ReadBytes(length int64) ([]byte, error) {
 	if c.garland == nil {
 		return nil, ErrCursorNotFound
 	}
-	return c.garland.readBytesAt(c.bytePos, length)
+	data, err := c.garland.readBytesAt(c.bytePos, length)
+	if err != nil {
+		return nil, err
+	}
+	// Advance cursor by actual bytes read
+	c.SeekByte(c.bytePos + int64(len(data)))
+	return data, nil
 }
 
 // ReadString reads `length` runes starting at cursor position as a string.
+// After reading, cursor advances past the read data.
 func (c *Cursor) ReadString(length int64) (string, error) {
 	if c.garland == nil {
 		return "", ErrCursorNotFound
 	}
-	return c.garland.readStringAt(c.runePos, length)
+	data, err := c.garland.readStringAt(c.runePos, length)
+	if err != nil {
+		return "", err
+	}
+	// Advance cursor by actual runes read
+	c.SeekRune(c.runePos + int64(len([]rune(data))))
+	return data, nil
 }
 
 // ReadLine reads the entire line the cursor is on.
+// Note: Does NOT advance cursor (line-oriented reading is typically peek-like).
 func (c *Cursor) ReadLine() (string, error) {
 	if c.garland == nil {
 		return "", ErrCursorNotFound
 	}
 	return c.garland.readLineAt(c.line)
+}
+
+// BackDeleteBytes deletes `length` bytes BEFORE the cursor position.
+// Cursor moves to the start of the deleted range (its new position).
+// Returns decorations from the deleted range.
+func (c *Cursor) BackDeleteBytes(length int64, includeLineDecorations bool) ([]RelativeDecoration, ChangeResult, error) {
+	if c.garland == nil {
+		return nil, ChangeResult{}, ErrCursorNotFound
+	}
+	if length <= 0 {
+		return nil, ChangeResult{Fork: c.garland.currentFork, Revision: c.garland.currentRevision}, nil
+	}
+	// Calculate start position (clamp to 0)
+	startPos := c.bytePos - length
+	if startPos < 0 {
+		length = c.bytePos
+		startPos = 0
+	}
+	// Move cursor to start of delete range
+	c.SeekByte(startPos)
+	// Perform delete at new position
+	return c.garland.deleteBytesAt(c, startPos, length, includeLineDecorations)
+}
+
+// BackDeleteRunes deletes `length` runes BEFORE the cursor position.
+// Cursor moves to the start of the deleted range (its new position).
+// Returns decorations from the deleted range.
+func (c *Cursor) BackDeleteRunes(length int64, includeLineDecorations bool) ([]RelativeDecoration, ChangeResult, error) {
+	if c.garland == nil {
+		return nil, ChangeResult{}, ErrCursorNotFound
+	}
+	if length <= 0 {
+		return nil, ChangeResult{Fork: c.garland.currentFork, Revision: c.garland.currentRevision}, nil
+	}
+	// Calculate start position (clamp to 0)
+	startRunePos := c.runePos - length
+	if startRunePos < 0 {
+		length = c.runePos
+		startRunePos = 0
+	}
+	// Move cursor to start of delete range
+	c.SeekRune(startRunePos)
+	// Perform delete at new position
+	return c.garland.deleteRunesAt(c, startRunePos, length, includeLineDecorations)
 }
