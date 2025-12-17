@@ -6,25 +6,7 @@ This document outlines incomplete features and potential enhancements for the Ga
 
 These features have partial implementations that should be completed:
 
-### 1. Lazy Loading Blocking
-
-**Location:** `garland.go` lines ~2104, 2119, 2133
-
-The following functions currently return `ErrNotReady` instead of blocking until data arrives:
-- `waitForBytePosition()`
-- `waitForRunePosition()`
-- `waitForLine()`
-
-**Current behavior:** Returns error immediately if position is not yet available during streaming.
-
-**Desired behavior:** Block using condition variables until the streaming source delivers enough data to satisfy the request. This would allow callers to simply wait for data rather than polling.
-
-**Implementation notes:**
-- Add `sync.Cond` to the Garland struct
-- Signal the condition when new chunks arrive from channel sources
-- Implement timeout support for bounded waits
-
-### 2. File Change Detection
+### 1. File Change Detection
 
 **Location:** `storage.go` line ~127
 
@@ -39,7 +21,7 @@ The `HasChanged()` method on `localFileSystem` returns `ErrNotSupported`.
 - Compare against current values in `HasChanged()`
 - Consider inode checking on Unix systems
 
-### 3. Decoration Loading from Files
+### 2. Decoration Loading from Files
 
 **Location:** `garland.go` line ~2073
 
@@ -53,13 +35,7 @@ The `loadInitialDecorations()` function exists but isn't fully wired to load dec
 
 These are features that don't exist yet but would enhance the library:
 
-### Search & Navigation
-
-#### Find/Search
-- Substring search with case sensitivity options
-- Regular expression search
-- Search forward/backward from cursor
-- Find all occurrences
+### Navigation
 
 #### Word Navigation
 - Move cursor by word boundaries
@@ -83,14 +59,6 @@ The current model uses point cursors only. Selection ranges would enable:
 - Add `SelectionStart` and `SelectionEnd` to Cursor
 - Selection-aware operations (delete selection, replace selection)
 - Consider anchor/head model vs start/end model
-
-### Find and Replace
-
-- Single replacement
-- Replace all
-- Interactive replace (confirm each)
-- Regex capture group substitution
-- Preview mode
 
 ### Diff Between Revisions
 
@@ -183,20 +151,25 @@ Minor improvements for the REPL demo application:
 - Scripting mode (read commands from file)
 - Output redirection
 
+## Recently Completed Features
+
+The following features have been implemented:
+
+- **Lazy loading blocking** - `waitFor*` functions now block with timeout support; `Is*Ready` check methods for non-blocking guards
+- **Find/Search** - String and regex search with case sensitivity, whole word matching, forward/backward
+- **Find and Replace** - Single, all, and count-limited replacement with regex capture group expansion
+
 ## Priority Recommendations
 
 ### High Priority (Core Functionality)
 1. Selection ranges - fundamental for practical text editing
-2. Find/search - essential navigation feature
-3. Lazy loading blocking - completes the streaming model
+2. Word navigation - common editing operation
 
 ### Medium Priority (Quality of Life)
-4. File change detection - safety feature
-5. Word navigation - common editing operation
-6. Revision pruning - memory management for long sessions
+3. File change detection - safety feature
+4. Revision pruning - memory management for long sessions
+5. Diff between revisions - debugging/comparison feature
 
 ### Lower Priority (Nice to Have)
-7. Find and replace - can be built on top of find
-8. Diff between revisions - debugging/comparison feature
-9. Clipboard support - platform-specific complexity
-10. Macros - power user feature
+6. Clipboard support - platform-specific complexity
+7. Macros - power user feature (note: separate macro language already exists)

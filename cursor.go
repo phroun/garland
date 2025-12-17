@@ -1,6 +1,9 @@
 package garland
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // CursorPosition stores a cursor's position in all coordinate systems.
 type CursorPosition struct {
@@ -117,14 +120,23 @@ func (c *Cursor) setReady(ready bool) {
 }
 
 // SeekByte moves the cursor to an absolute byte position.
-// Blocks until the position is available during lazy loading.
+// Blocks indefinitely until the position is available during lazy loading.
+// Use SeekByteWithTimeout for timeout control, or check IsByteReady first for non-blocking.
 func (c *Cursor) SeekByte(pos int64) error {
+	return c.SeekByteWithTimeout(pos, -1) // -1 = block indefinitely
+}
+
+// SeekByteWithTimeout moves the cursor to an absolute byte position with timeout control.
+// If timeout is 0, returns ErrNotReady immediately if position not available.
+// If timeout is negative, blocks indefinitely.
+// If timeout is positive, waits up to that duration before returning ErrTimeout.
+func (c *Cursor) SeekByteWithTimeout(pos int64, timeout time.Duration) error {
 	if c.garland == nil {
 		return ErrCursorNotFound
 	}
 
 	// Wait for position to be available
-	if err := c.garland.waitForBytePosition(pos); err != nil {
+	if err := c.garland.waitForBytePosition(pos, timeout); err != nil {
 		return err
 	}
 
@@ -144,14 +156,23 @@ func (c *Cursor) SeekByte(pos int64) error {
 }
 
 // SeekRune moves the cursor to an absolute rune position.
-// Blocks until the position is available during lazy loading.
+// Blocks indefinitely until the position is available during lazy loading.
+// Use SeekRuneWithTimeout for timeout control, or check IsRuneReady first for non-blocking.
 func (c *Cursor) SeekRune(pos int64) error {
+	return c.SeekRuneWithTimeout(pos, -1) // -1 = block indefinitely
+}
+
+// SeekRuneWithTimeout moves the cursor to an absolute rune position with timeout control.
+// If timeout is 0, returns ErrNotReady immediately if position not available.
+// If timeout is negative, blocks indefinitely.
+// If timeout is positive, waits up to that duration before returning ErrTimeout.
+func (c *Cursor) SeekRuneWithTimeout(pos int64, timeout time.Duration) error {
 	if c.garland == nil {
 		return ErrCursorNotFound
 	}
 
 	// Wait for position to be available
-	if err := c.garland.waitForRunePosition(pos); err != nil {
+	if err := c.garland.waitForRunePosition(pos, timeout); err != nil {
 		return err
 	}
 
@@ -172,14 +193,23 @@ func (c *Cursor) SeekRune(pos int64) error {
 
 // SeekLine moves the cursor to a line and rune-within-line position.
 // Line and rune are both 0-indexed. The newline is the last character of its line.
-// Blocks until the position is available during lazy loading.
+// Blocks indefinitely until the position is available during lazy loading.
+// Use SeekLineWithTimeout for timeout control, or check IsLineReady first for non-blocking.
 func (c *Cursor) SeekLine(line, runeInLine int64) error {
+	return c.SeekLineWithTimeout(line, runeInLine, -1) // -1 = block indefinitely
+}
+
+// SeekLineWithTimeout moves the cursor to a line and rune-within-line position with timeout control.
+// If timeout is 0, returns ErrNotReady immediately if position not available.
+// If timeout is negative, blocks indefinitely.
+// If timeout is positive, waits up to that duration before returning ErrTimeout.
+func (c *Cursor) SeekLineWithTimeout(line, runeInLine int64, timeout time.Duration) error {
 	if c.garland == nil {
 		return ErrCursorNotFound
 	}
 
 	// Wait for line to be available
-	if err := c.garland.waitForLine(line); err != nil {
+	if err := c.garland.waitForLine(line, timeout); err != nil {
 		return err
 	}
 

@@ -12,6 +12,9 @@ var (
 	// ErrInvalidPosition indicates that a position is out of bounds.
 	ErrInvalidPosition = errors.New("position out of bounds")
 
+	// ErrTimeout indicates that a blocking wait operation timed out.
+	ErrTimeout = errors.New("operation timed out")
+
 	// ErrInvalidUTF8 indicates that an operation would split a UTF-8 sequence.
 	ErrInvalidUTF8 = errors.New("invalid UTF-8 sequence")
 

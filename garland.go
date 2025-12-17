@@ -2,6 +2,7 @@ package garland
 
 import (
 	"sync"
+	"time"
 )
 
 // LoadingStyle determines which storage tiers are available.
@@ -282,6 +283,9 @@ type Garland struct {
 	totalLines    int64
 	countComplete bool
 
+	// Streaming synchronization - for blocking waits on lazy loading
+	streamCond *sync.Cond // Signaled when new data arrives or loading completes
+
 	// File system for warm storage
 	sourceFS     FileSystemInterface
 	sourceHandle FileHandle
@@ -365,6 +369,9 @@ func (lib *Library) Open(options FileOptions) (*Garland, error) {
 		cursors:                 make([]*Cursor, 0),
 		decorationCache:         make(map[string]*DecorationCacheEntry),
 	}
+
+	// Initialize streaming condition variable (uses the garland's mutex)
+	g.streamCond = sync.NewCond(&g.mu)
 
 	// Initialize fork 0
 	g.forks[0] = &ForkInfo{
@@ -1773,6 +1780,9 @@ func (g *Garland) channelLoaderRoutine() {
 					}
 				}
 
+				// Signal all waiting goroutines that loading is complete
+				g.streamCond.Broadcast()
+
 				g.mu.Unlock()
 				return
 			}
@@ -1856,6 +1866,9 @@ func (g *Garland) appendStreamData(data []byte) {
 		g.loader.runesLoaded += snap.runeCount
 		g.loader.linesLoaded += snap.lineCount
 	}
+
+	// Signal waiting goroutines that new data is available
+	g.streamCond.Broadcast()
 }
 
 func (g *Garland) buildInitialTree(data []byte, usageStart, usageEnd int64) {
@@ -2097,43 +2110,221 @@ func (g *Garland) updateCursorReady(c *Cursor) {
 	}
 }
 
-func (g *Garland) waitForBytePosition(pos int64) error {
+// IsByteReady returns true if the given byte position is available for reading.
+// This is a non-blocking check that can be used to guard against blocking waits.
+// A negative position returns false. A position beyond EOF returns true only
+// when loading is complete (at which point seeking there would return ErrInvalidPosition).
+func (g *Garland) IsByteReady(pos int64) bool {
+	if pos < 0 {
+		return false
+	}
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.countComplete || pos <= g.totalBytes
+}
+
+// IsRuneReady returns true if the given rune position is available for reading.
+// This is a non-blocking check that can be used to guard against blocking waits.
+func (g *Garland) IsRuneReady(pos int64) bool {
+	if pos < 0 {
+		return false
+	}
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.countComplete || pos <= g.totalRunes
+}
+
+// IsLineReady returns true if the given line number is available for reading.
+// This is a non-blocking check that can be used to guard against blocking waits.
+func (g *Garland) IsLineReady(line int64) bool {
+	if line < 0 {
+		return false
+	}
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.countComplete || line <= g.totalLines
+}
+
+// waitForBytePosition blocks until the given byte position is available or timeout expires.
+// If timeout is 0, it returns immediately with ErrNotReady if not available.
+// If timeout is negative, it blocks indefinitely.
+// Caller must NOT hold the lock when calling this function.
+func (g *Garland) waitForBytePosition(pos int64, timeout time.Duration) error {
 	if pos < 0 {
 		return ErrInvalidPosition
 	}
-	// TODO: Implement blocking wait for lazy loading
-	if !g.countComplete && pos > g.totalBytes {
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// Fast path: already available or complete
+	if g.countComplete {
+		if pos > g.totalBytes {
+			return ErrInvalidPosition
+		}
+		return nil
+	}
+	if pos <= g.totalBytes {
+		return nil
+	}
+
+	// Non-blocking mode
+	if timeout == 0 {
 		return ErrNotReady
 	}
-	// After loading is complete, validate position
+
+	// Set up timeout if needed
+	var deadline time.Time
+	var timer *time.Timer
+	timedOut := false
+
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+		timer = time.AfterFunc(timeout, func() {
+			g.mu.Lock()
+			timedOut = true
+			g.streamCond.Broadcast() // Wake up all waiters to check timeout
+			g.mu.Unlock()
+		})
+		defer timer.Stop()
+	}
+
+	// Blocking wait loop
+	for !g.countComplete && pos > g.totalBytes {
+		if timedOut {
+			return ErrTimeout
+		}
+		if timeout > 0 && time.Now().After(deadline) {
+			return ErrTimeout
+		}
+		g.streamCond.Wait() // Releases lock, waits for signal, reacquires lock
+	}
+
+	// Check final state
 	if g.countComplete && pos > g.totalBytes {
 		return ErrInvalidPosition
 	}
 	return nil
 }
 
-func (g *Garland) waitForRunePosition(pos int64) error {
+// waitForRunePosition blocks until the given rune position is available or timeout expires.
+// If timeout is 0, it returns immediately with ErrNotReady if not available.
+// If timeout is negative, it blocks indefinitely.
+// Caller must NOT hold the lock when calling this function.
+func (g *Garland) waitForRunePosition(pos int64, timeout time.Duration) error {
 	if pos < 0 {
 		return ErrInvalidPosition
 	}
-	// TODO: Implement blocking wait for lazy loading
-	if !g.countComplete && pos > g.totalRunes {
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// Fast path
+	if g.countComplete {
+		if pos > g.totalRunes {
+			return ErrInvalidPosition
+		}
+		return nil
+	}
+	if pos <= g.totalRunes {
+		return nil
+	}
+
+	// Non-blocking mode
+	if timeout == 0 {
 		return ErrNotReady
 	}
+
+	// Set up timeout if needed
+	var deadline time.Time
+	var timer *time.Timer
+	timedOut := false
+
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+		timer = time.AfterFunc(timeout, func() {
+			g.mu.Lock()
+			timedOut = true
+			g.streamCond.Broadcast()
+			g.mu.Unlock()
+		})
+		defer timer.Stop()
+	}
+
+	// Blocking wait loop
+	for !g.countComplete && pos > g.totalRunes {
+		if timedOut {
+			return ErrTimeout
+		}
+		if timeout > 0 && time.Now().After(deadline) {
+			return ErrTimeout
+		}
+		g.streamCond.Wait()
+	}
+
+	// Check final state
 	if g.countComplete && pos > g.totalRunes {
 		return ErrInvalidPosition
 	}
 	return nil
 }
 
-func (g *Garland) waitForLine(line int64) error {
+// waitForLine blocks until the given line is available or timeout expires.
+// If timeout is 0, it returns immediately with ErrNotReady if not available.
+// If timeout is negative, it blocks indefinitely.
+// Caller must NOT hold the lock when calling this function.
+func (g *Garland) waitForLine(line int64, timeout time.Duration) error {
 	if line < 0 {
 		return ErrInvalidPosition
 	}
-	// TODO: Implement blocking wait for lazy loading
-	if !g.countComplete && line > g.totalLines {
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// Fast path
+	if g.countComplete {
+		if line > g.totalLines {
+			return ErrInvalidPosition
+		}
+		return nil
+	}
+	if line <= g.totalLines {
+		return nil
+	}
+
+	// Non-blocking mode
+	if timeout == 0 {
 		return ErrNotReady
 	}
+
+	// Set up timeout if needed
+	var deadline time.Time
+	var timer *time.Timer
+	timedOut := false
+
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+		timer = time.AfterFunc(timeout, func() {
+			g.mu.Lock()
+			timedOut = true
+			g.streamCond.Broadcast()
+			g.mu.Unlock()
+		})
+		defer timer.Stop()
+	}
+
+	// Blocking wait loop
+	for !g.countComplete && line > g.totalLines {
+		if timedOut {
+			return ErrTimeout
+		}
+		if timeout > 0 && time.Now().After(deadline) {
+			return ErrTimeout
+		}
+		g.streamCond.Wait()
+	}
+
+	// Check final state
 	if g.countComplete && line > g.totalLines {
 		return ErrInvalidPosition
 	}

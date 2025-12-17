@@ -254,6 +254,12 @@ func (r *REPL) handleCommand(input string) bool {
 	case "countregex":
 		r.cmdCountRegex(args)
 
+	case "ready":
+		r.cmdReady()
+
+	case "isready":
+		r.cmdIsReady(args)
+
 	default:
 		fmt.Printf("Unknown command: %s. Type 'help' for available commands.\n", cmd)
 	}
@@ -377,6 +383,16 @@ SEARCH & REPLACE:
 Search flags: -i (case insensitive), -w (whole word), -b (backward)
 Regex flags: -i (case insensitive), -b (backward)
 Regex replacement supports $1, $2, etc. for capture groups.
+
+STREAMING/LAZY LOADING:
+  ready                     Show loading status (complete, bytes/runes/lines loaded)
+  isready byte <pos>        Check if byte position is ready (non-blocking)
+  isready rune <pos>        Check if rune position is ready (non-blocking)
+  isready line <line>       Check if line is ready (non-blocking)
+
+Note: During streaming input (via DataChannel), these commands let you check
+if a position is available before seeking. Seek operations block by default
+until data arrives. Use isready to guard against blocking.
 
 OTHER:
   help                      Show this help message
@@ -2740,6 +2756,84 @@ func (r *REPL) cmdCountRegex(args []string) {
 	}
 
 	fmt.Printf("Found %d matches\n", count)
+}
+
+func (r *REPL) cmdReady() {
+	if !r.ensureGarland() {
+		return
+	}
+
+	g := r.garland
+	byteCount := g.ByteCount()
+	runeCount := g.RuneCount()
+	lineCount := g.LineCount()
+
+	completeStr := "complete"
+	if !byteCount.Complete {
+		completeStr = "streaming"
+	}
+
+	fmt.Printf("Loading Status: %s\n", completeStr)
+	fmt.Printf("  Bytes loaded: %d\n", byteCount.Value)
+	fmt.Printf("  Runes loaded: %d\n", runeCount.Value)
+	fmt.Printf("  Lines loaded: %d\n", lineCount.Value)
+
+	if !byteCount.Complete {
+		fmt.Println("\nDuring streaming, seek operations will block until data arrives.")
+		fmt.Println("Use 'isready' to check if a position is available without blocking.")
+	}
+}
+
+func (r *REPL) cmdIsReady(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	if len(args) < 2 {
+		fmt.Println("Usage: isready byte <pos>   - Check if byte position is ready")
+		fmt.Println("       isready rune <pos>   - Check if rune position is ready")
+		fmt.Println("       isready line <line>  - Check if line is ready")
+		return
+	}
+
+	mode := strings.ToLower(args[0])
+	pos, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil {
+		fmt.Printf("Invalid position: %v\n", err)
+		return
+	}
+
+	g := r.garland
+	var ready bool
+
+	switch mode {
+	case "byte":
+		ready = g.IsByteReady(pos)
+		if ready {
+			fmt.Printf("Byte position %d is ready\n", pos)
+		} else {
+			fmt.Printf("Byte position %d is NOT ready (still streaming)\n", pos)
+		}
+
+	case "rune":
+		ready = g.IsRuneReady(pos)
+		if ready {
+			fmt.Printf("Rune position %d is ready\n", pos)
+		} else {
+			fmt.Printf("Rune position %d is NOT ready (still streaming)\n", pos)
+		}
+
+	case "line":
+		ready = g.IsLineReady(pos)
+		if ready {
+			fmt.Printf("Line %d is ready\n", pos)
+		} else {
+			fmt.Printf("Line %d is NOT ready (still streaming)\n", pos)
+		}
+
+	default:
+		fmt.Println("Unknown mode. Use: byte, rune, or line")
+	}
 }
 
 // Ensure utf8 is used (for future unicode-aware operations)
