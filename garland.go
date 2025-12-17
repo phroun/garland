@@ -2480,6 +2480,14 @@ func (g *Garland) deleteBytesAt(c *Cursor, pos int64, length int64, includeLineD
 // overwriteBytesAt replaces bytes at a position with new data in a single atomic operation.
 // This is more efficient than delete + insert for binary editing scenarios.
 func (g *Garland) overwriteBytesAt(c *Cursor, pos int64, length int64, newData []byte) ([]RelativeDecoration, ChangeResult, error) {
+	return g.overwriteBytesAtInternal(c, pos, length, newData, nil, false)
+}
+
+// overwriteBytesAtInternal is the internal implementation that supports additional options.
+// - decorationsToAdd: decorations to add to the new content (relative to new content start)
+// - insertBefore: if true, displaced decorations consolidate to end; if false, to start
+// Returns the original decorations from the overwritten range with their original relative positions.
+func (g *Garland) overwriteBytesAtInternal(c *Cursor, pos int64, length int64, newData []byte, decorationsToAdd []RelativeDecoration, insertBefore bool) ([]RelativeDecoration, ChangeResult, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -2535,17 +2543,46 @@ func (g *Garland) overwriteBytesAt(c *Cursor, pos int64, length int64, newData [
 		}
 	}
 
+	// Build the decorations for the new content:
+	// 1. Start with explicitly provided decorations
+	// 2. Add consolidated displaced decorations from the overwritten range
+	var allDecorations []RelativeDecoration
+
+	// Add explicitly provided decorations first
+	if len(decorationsToAdd) > 0 {
+		allDecorations = append(allDecorations, decorationsToAdd...)
+	}
+
+	// Consolidate displaced decorations to start (position 0) or end (position len(newData))
+	// based on insertBefore flag
+	newDataLen := int64(len(newData))
+	consolidatePos := int64(0)
+	if insertBefore {
+		consolidatePos = newDataLen
+	}
+
+	for _, d := range deletedDecs {
+		allDecorations = append(allDecorations, RelativeDecoration{
+			Key:      d.Key,
+			Position: consolidatePos,
+		})
+	}
+
 	// Perform the insertion portion at the same position using the updated tree
 	if len(newData) > 0 {
 		rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
 		if rootSnap == nil {
 			return nil, ChangeResult{}, ErrInternal
 		}
-		newRootID, err := g.insertInternal(g.root, rootSnap, pos, 0, newData, nil, true)
+		newRootID, err := g.insertInternal(g.root, rootSnap, pos, 0, newData, allDecorations, insertBefore)
 		if err != nil {
 			return nil, ChangeResult{}, err
 		}
 		g.root = g.nodeRegistry[newRootID]
+	} else if len(allDecorations) > 0 {
+		// No new data but we have decorations to add - they need to go somewhere
+		// In this case, the decorations are effectively deleted (returned to caller)
+		// since there's no content to attach them to
 	}
 
 	// Calculate inserted counts
@@ -2586,7 +2623,7 @@ func (g *Garland) overwriteBytesAt(c *Cursor, pos int64, length int64, newData [
 		}
 	}
 
-	// Convert absolute decorations to relative
+	// Convert absolute decorations to relative (original positions before deletion)
 	relDecs := make([]RelativeDecoration, len(deletedDecs))
 	for i, d := range deletedDecs {
 		relDecs[i] = RelativeDecoration{
@@ -2598,6 +2635,445 @@ func (g *Garland) overwriteBytesAt(c *Cursor, pos int64, length int64, newData [
 	// Handle versioning
 	result := g.recordMutation()
 	return relDecs, result, nil
+}
+
+// MoveResult contains the result of a Move operation.
+type MoveResult struct {
+	ChangeResult
+	DisplacedDecorations []RelativeDecoration // Decorations that were in the destination range (original positions)
+}
+
+// CopyResult contains the result of a Copy operation.
+type CopyResult struct {
+	ChangeResult
+	DisplacedDecorations []RelativeDecoration // Decorations that were in the destination range (original positions)
+}
+
+// moveBytesAt moves a byte range to a new location.
+// All addresses are interpreted as positions in the original document before any changes.
+// Source and destination ranges cannot overlap for Move.
+// Decorations in the source range move with the content.
+// Decorations in the destination range are consolidated and returned.
+func (g *Garland) moveBytesAt(c *Cursor, srcStart, srcEnd, dstStart, dstEnd int64, insertBefore bool) (MoveResult, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// Validate positions
+	if srcStart < 0 || srcEnd < srcStart || srcEnd > g.totalBytes {
+		return MoveResult{}, ErrInvalidPosition
+	}
+	if dstStart < 0 || dstEnd < dstStart || dstEnd > g.totalBytes {
+		return MoveResult{}, ErrInvalidPosition
+	}
+
+	srcLen := srcEnd - srcStart
+	dstLen := dstEnd - dstStart
+
+	// Check for overlap - source and destination cannot overlap for Move
+	// Ranges overlap if: srcStart < dstEnd && dstStart < srcEnd
+	if srcStart < dstEnd && dstStart < srcEnd {
+		return MoveResult{}, ErrOverlappingRanges
+	}
+
+	// Handle edge case: moving zero bytes
+	if srcLen == 0 && dstLen == 0 {
+		return MoveResult{
+			ChangeResult: ChangeResult{Fork: g.currentFork, Revision: g.currentRevision},
+		}, nil
+	}
+
+	// Record cursor positions BEFORE any changes
+	if g.transaction == nil {
+		g.recordCursorPositionsInHistory()
+	}
+
+	// Read source data and decorations before any modifications
+	var srcData []byte
+	var srcDecs []Decoration
+	var err error
+
+	if srcLen > 0 {
+		srcData, err = g.readBytesRangeInternal(srcStart, srcLen)
+		if err != nil {
+			return MoveResult{}, err
+		}
+		// Collect decorations in source range
+		srcDecs = g.collectDecorationsInRange(srcStart, srcEnd)
+	}
+
+	// Convert source decorations to relative positions
+	srcRelDecs := make([]RelativeDecoration, len(srcDecs))
+	for i, d := range srcDecs {
+		srcRelDecs[i] = RelativeDecoration{
+			Key:      d.Key,
+			Position: d.Position - srcStart,
+		}
+	}
+
+	// Track cursors that are within the source range (to move them with content)
+	cursorInSource := make(map[*Cursor]int64) // cursor -> relative position within source
+	for _, cursor := range g.cursors {
+		if cursor.bytePos >= srcStart && cursor.bytePos < srcEnd {
+			cursorInSource[cursor] = cursor.bytePos - srcStart
+		}
+	}
+
+	// Determine order of operations based on relative positions
+	// to correctly handle address adjustments
+	var dstDecs []Decoration
+	var deleteRootID NodeID
+
+	if srcStart < dstStart {
+		// Source is before destination
+		// 1. Delete destination range first (at original address)
+		if dstLen > 0 {
+			dstDecs, deleteRootID, err = g.deleteRange(dstStart, dstLen)
+			if err != nil {
+				return MoveResult{}, err
+			}
+			g.root = g.nodeRegistry[deleteRootID]
+			g.totalBytes -= dstLen
+			g.totalRunes -= int64(len([]rune(g.readBytesRangeInternalUnsafe(dstStart, dstLen))))
+		}
+
+		// 2. Delete source range (address unchanged since src < dst)
+		if srcLen > 0 {
+			_, deleteRootID, err = g.deleteRange(srcStart, srcLen)
+			if err != nil {
+				return MoveResult{}, err
+			}
+			g.root = g.nodeRegistry[deleteRootID]
+			g.totalBytes -= srcLen
+		}
+
+		// 3. Insert source content at adjusted destination
+		// Destination shifts left by srcLen (source was removed before it)
+		// Also shifts left by dstLen (destination was removed)
+		adjustedDst := dstStart - srcLen
+		if len(srcData) > 0 {
+			// Consolidate destination decorations
+			allDecs := srcRelDecs
+			consolidatePos := int64(0)
+			if insertBefore {
+				consolidatePos = int64(len(srcData))
+			}
+			for _, d := range dstDecs {
+				allDecs = append(allDecs, RelativeDecoration{
+					Key:      d.Key,
+					Position: consolidatePos,
+				})
+			}
+
+			rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
+			newRootID, err := g.insertInternal(g.root, rootSnap, adjustedDst, 0, srcData, allDecs, insertBefore)
+			if err != nil {
+				return MoveResult{}, err
+			}
+			g.root = g.nodeRegistry[newRootID]
+			g.totalBytes += int64(len(srcData))
+		}
+	} else {
+		// Source is after destination (or at same position)
+		// 1. Delete source range first (at original address)
+		if srcLen > 0 {
+			_, deleteRootID, err = g.deleteRange(srcStart, srcLen)
+			if err != nil {
+				return MoveResult{}, err
+			}
+			g.root = g.nodeRegistry[deleteRootID]
+			g.totalBytes -= srcLen
+		}
+
+		// 2. Delete destination range (address unchanged since dst < src)
+		if dstLen > 0 {
+			dstDecs, deleteRootID, err = g.deleteRange(dstStart, dstLen)
+			if err != nil {
+				return MoveResult{}, err
+			}
+			g.root = g.nodeRegistry[deleteRootID]
+			g.totalBytes -= dstLen
+		}
+
+		// 3. Insert source content at destination (no adjustment needed)
+		if len(srcData) > 0 {
+			// Consolidate destination decorations
+			allDecs := srcRelDecs
+			consolidatePos := int64(0)
+			if insertBefore {
+				consolidatePos = int64(len(srcData))
+			}
+			for _, d := range dstDecs {
+				allDecs = append(allDecs, RelativeDecoration{
+					Key:      d.Key,
+					Position: consolidatePos,
+				})
+			}
+
+			rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
+			newRootID, err := g.insertInternal(g.root, rootSnap, dstStart, 0, srcData, allDecs, insertBefore)
+			if err != nil {
+				return MoveResult{}, err
+			}
+			g.root = g.nodeRegistry[newRootID]
+			g.totalBytes += int64(len(srcData))
+		}
+	}
+
+	// Update counts properly
+	g.updateCountsFromRoot()
+
+	// Calculate final destination position for cursor adjustment
+	var finalDstStart int64
+	if srcStart < dstStart {
+		finalDstStart = dstStart - srcLen
+	} else {
+		finalDstStart = dstStart
+	}
+
+	// Adjust cursors
+	for _, cursor := range g.cursors {
+		if relPos, inSource := cursorInSource[cursor]; inSource {
+			// Cursor was in source - move with content to destination
+			cursor.bytePos = finalDstStart + relPos
+			cursor.runePos, _ = g.byteToRuneInternalUnlocked(cursor.bytePos)
+			cursor.line, cursor.lineRune, _ = g.byteToLineRuneInternalUnlocked(cursor.bytePos)
+		} else {
+			// Cursor was outside source - adjust based on position changes
+			// This is complex due to multiple operations; recalculate based on final state
+			if cursor.bytePos > g.totalBytes {
+				cursor.bytePos = g.totalBytes
+				cursor.runePos, _ = g.byteToRuneInternalUnlocked(cursor.bytePos)
+				cursor.line, cursor.lineRune, _ = g.byteToLineRuneInternalUnlocked(cursor.bytePos)
+			}
+		}
+	}
+
+	// Convert destination decorations to relative (original positions)
+	dstRelDecs := make([]RelativeDecoration, len(dstDecs))
+	for i, d := range dstDecs {
+		dstRelDecs[i] = RelativeDecoration{
+			Key:      d.Key,
+			Position: d.Position - dstStart,
+		}
+	}
+
+	result := g.recordMutation()
+	return MoveResult{
+		ChangeResult:         result,
+		DisplacedDecorations: dstRelDecs,
+	}, nil
+}
+
+// copyBytesAt copies a byte range to a new location.
+// All addresses are interpreted as positions in the original document before any changes.
+// Source and destination ranges may overlap for Copy (source is snapshotted first).
+// decorationsToAdd are added to the copied content (relative to copied content start).
+// Decorations in the destination range are consolidated and returned.
+func (g *Garland) copyBytesAt(c *Cursor, srcStart, srcEnd, dstStart, dstEnd int64, decorationsToAdd []RelativeDecoration, insertBefore bool) (CopyResult, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// Validate positions
+	if srcStart < 0 || srcEnd < srcStart || srcEnd > g.totalBytes {
+		return CopyResult{}, ErrInvalidPosition
+	}
+	if dstStart < 0 || dstEnd < dstStart || dstEnd > g.totalBytes {
+		return CopyResult{}, ErrInvalidPosition
+	}
+
+	srcLen := srcEnd - srcStart
+	dstLen := dstEnd - dstStart
+
+	// Handle edge case: copying zero bytes and deleting zero bytes
+	if srcLen == 0 && dstLen == 0 {
+		return CopyResult{
+			ChangeResult: ChangeResult{Fork: g.currentFork, Revision: g.currentRevision},
+		}, nil
+	}
+
+	// Record cursor positions BEFORE any changes
+	if g.transaction == nil {
+		g.recordCursorPositionsInHistory()
+	}
+
+	// Snapshot source data before any modifications (important for overlapping ranges)
+	var srcData []byte
+	var err error
+
+	if srcLen > 0 {
+		srcData, err = g.readBytesRangeInternal(srcStart, srcLen)
+		if err != nil {
+			return CopyResult{}, err
+		}
+	}
+
+	// Delete destination range and capture decorations
+	var dstDecs []Decoration
+	var deleteRootID NodeID
+
+	if dstLen > 0 {
+		dstDecs, deleteRootID, err = g.deleteRange(dstStart, dstLen)
+		if err != nil {
+			return CopyResult{}, err
+		}
+		g.root = g.nodeRegistry[deleteRootID]
+	}
+
+	// Build decorations for the copied content:
+	// 1. Explicitly provided decorations
+	// 2. Consolidated destination decorations
+	var allDecs []RelativeDecoration
+	if len(decorationsToAdd) > 0 {
+		allDecs = append(allDecs, decorationsToAdd...)
+	}
+
+	// Consolidate destination decorations
+	consolidatePos := int64(0)
+	if insertBefore {
+		consolidatePos = int64(len(srcData))
+	}
+	for _, d := range dstDecs {
+		allDecs = append(allDecs, RelativeDecoration{
+			Key:      d.Key,
+			Position: consolidatePos,
+		})
+	}
+
+	// Insert copied content at destination
+	if len(srcData) > 0 {
+		rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
+		if rootSnap == nil {
+			return CopyResult{}, ErrInternal
+		}
+		newRootID, err := g.insertInternal(g.root, rootSnap, dstStart, 0, srcData, allDecs, insertBefore)
+		if err != nil {
+			return CopyResult{}, err
+		}
+		g.root = g.nodeRegistry[newRootID]
+	}
+
+	// Update counts
+	g.updateCountsFromRoot()
+
+	// Adjust cursors that were in or after the destination range
+	netChange := int64(len(srcData)) - dstLen
+	for _, cursor := range g.cursors {
+		if cursor != c {
+			if cursor.bytePos >= dstStart+dstLen {
+				// After destination - shift by net change
+				cursor.bytePos += netChange
+				if cursor.bytePos < 0 {
+					cursor.bytePos = 0
+				}
+				if cursor.bytePos > g.totalBytes {
+					cursor.bytePos = g.totalBytes
+				}
+				cursor.runePos, _ = g.byteToRuneInternalUnlocked(cursor.bytePos)
+				cursor.line, cursor.lineRune, _ = g.byteToLineRuneInternalUnlocked(cursor.bytePos)
+			} else if cursor.bytePos > dstStart {
+				// Within destination range - move to start
+				cursor.bytePos = dstStart
+				cursor.runePos, _ = g.byteToRuneInternalUnlocked(cursor.bytePos)
+				cursor.line, cursor.lineRune, _ = g.byteToLineRuneInternalUnlocked(cursor.bytePos)
+			}
+		}
+	}
+
+	// Convert destination decorations to relative (original positions)
+	dstRelDecs := make([]RelativeDecoration, len(dstDecs))
+	for i, d := range dstDecs {
+		dstRelDecs[i] = RelativeDecoration{
+			Key:      d.Key,
+			Position: d.Position - dstStart,
+		}
+	}
+
+	result := g.recordMutation()
+	return CopyResult{
+		ChangeResult:         result,
+		DisplacedDecorations: dstRelDecs,
+	}, nil
+}
+
+// collectDecorationsInRange returns all decorations within the specified byte range.
+func (g *Garland) collectDecorationsInRange(start, end int64) []Decoration {
+	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
+	if rootSnap == nil {
+		return nil
+	}
+
+	var result []Decoration
+	g.collectDecorationsInRangeRecursive(g.root, rootSnap, start, end, 0, &result)
+	return result
+}
+
+// collectDecorationsInRangeRecursive recursively collects decorations in a byte range.
+func (g *Garland) collectDecorationsInRangeRecursive(node *Node, snap *NodeSnapshot, start, end, offset int64, result *[]Decoration) {
+	if snap == nil {
+		return
+	}
+
+	nodeEnd := offset + snap.byteCount
+
+	// Skip if node doesn't overlap with range
+	if nodeEnd <= start || offset >= end {
+		return
+	}
+
+	if snap.isLeaf {
+		// Collect decorations that fall within the range
+		for _, d := range snap.decorations {
+			absPos := offset + d.Position
+			if absPos >= start && absPos < end {
+				*result = append(*result, Decoration{
+					Key:      d.Key,
+					Position: absPos,
+				})
+			}
+		}
+		return
+	}
+
+	// Internal node - recurse
+	if snap.leftID != 0 {
+		leftNode := g.nodeRegistry[snap.leftID]
+		if leftNode != nil {
+			leftSnap := leftNode.snapshotAt(g.currentFork, g.currentRevision)
+			if leftSnap != nil {
+				g.collectDecorationsInRangeRecursive(leftNode, leftSnap, start, end, offset, result)
+				offset += leftSnap.byteCount
+			}
+		}
+	}
+
+	if snap.rightID != 0 {
+		rightNode := g.nodeRegistry[snap.rightID]
+		if rightNode != nil {
+			rightSnap := rightNode.snapshotAt(g.currentFork, g.currentRevision)
+			if rightSnap != nil {
+				leftBytes := int64(0)
+				if snap.leftID != 0 {
+					leftNode := g.nodeRegistry[snap.leftID]
+					if leftNode != nil {
+						leftSnap := leftNode.snapshotAt(g.currentFork, g.currentRevision)
+						if leftSnap != nil {
+							leftBytes = leftSnap.byteCount
+						}
+					}
+				}
+				g.collectDecorationsInRangeRecursive(rightNode, rightSnap, start, end, offset+leftBytes-snap.byteCount+rightSnap.byteCount, result)
+			}
+		}
+	}
+}
+
+// readBytesRangeInternalUnsafe is a helper that returns empty slice on error (for count calculations).
+func (g *Garland) readBytesRangeInternalUnsafe(pos, length int64) string {
+	data, err := g.readBytesRangeInternal(pos, length)
+	if err != nil {
+		return ""
+	}
+	return string(data)
 }
 
 func (g *Garland) deleteRunesAt(c *Cursor, runePos int64, length int64, includeLineDecorations bool) ([]RelativeDecoration, ChangeResult, error) {

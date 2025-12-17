@@ -14,6 +14,10 @@ var (
 
 	// ErrInvalidUTF8 indicates that an operation would split a UTF-8 sequence.
 	ErrInvalidUTF8 = errors.New("invalid UTF-8 sequence")
+
+	// ErrOverlappingRanges indicates that source and destination ranges overlap
+	// in an operation that doesn't allow overlap (e.g., Move).
+	ErrOverlappingRanges = errors.New("source and destination ranges overlap")
 )
 
 // Decoration errors

@@ -124,6 +124,18 @@ func (r *REPL) handleCommand(input string) bool {
 	case "overwrite":
 		r.cmdOverwrite(args)
 
+	case "move":
+		r.cmdMove(args, false)
+
+	case "move-":
+		r.cmdMove(args, true)
+
+	case "copy":
+		r.cmdCopy(args, false)
+
+	case "copy-":
+		r.cmdCopy(args, true)
+
 	case "truncate":
 		r.cmdTruncate()
 
@@ -237,6 +249,10 @@ EDIT OPERATIONS:
   insert "text", key=5      Insert with decoration at byte offset 5 in content
   insert- "text"            Insert BEFORE existing content at position
   overwrite <len> "text"    Replace <len> bytes at cursor with <text>
+  move <src1> <src2> <dst1> [dst2]    Move bytes [src1,src2) to [dst1,dst2)
+  move- <src1> <src2> <dst1> [dst2]   Move with decorations consolidated to end
+  copy <src1> <src2> <dst1> [dst2]    Copy bytes [src1,src2) to [dst1,dst2)
+  copy- <src1> <src2> <dst1> [dst2]   Copy with decorations consolidated to end
   truncate                  Delete from cursor to end of file
   delete bytes <length>     Delete bytes forward from cursor position
   delete runes <length>     Delete runes forward from cursor position
@@ -247,6 +263,7 @@ EDIT OPERATIONS:
 
 String arguments use quotes to allow spaces: insert "hello world"
 Escape sequences: \n (newline), \t (tab), \" (quote), \\ (backslash)
+Move/Copy: All addresses are original document positions. If dst2 omitted, dst2=dst1.
 
 INSPECTION:
   dump                      Dump all content
@@ -772,6 +789,128 @@ func (r *REPL) cmdOverwrite(args []string) {
 	}
 	fmt.Printf("Overwrote %d bytes with %d bytes. Now at fork=%d, revision=%d\n",
 		length, len(text), result.Fork, result.Revision)
+}
+
+func (r *REPL) cmdMove(args []string, insertBefore bool) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	// Syntax: move srcStart srcEnd dstStart dstEnd
+	// Or: move srcStart srcEnd dstStart (same as dstStart dstStart - insertion point)
+	if len(args) < 3 {
+		fmt.Println("Usage: move <srcStart> <srcEnd> <dstStart> [dstEnd]")
+		fmt.Println("       move- <srcStart> <srcEnd> <dstStart> [dstEnd]")
+		fmt.Println("  Moves bytes [srcStart, srcEnd) to replace [dstStart, dstEnd)")
+		fmt.Println("  If dstEnd omitted, dstEnd = dstStart (insertion point)")
+		fmt.Println("  move- consolidates displaced decorations to end instead of start")
+		fmt.Println("  Source and destination ranges cannot overlap")
+		return
+	}
+
+	srcStart, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil {
+		fmt.Printf("Invalid srcStart: %v\n", err)
+		return
+	}
+
+	srcEnd, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil {
+		fmt.Printf("Invalid srcEnd: %v\n", err)
+		return
+	}
+
+	dstStart, err := strconv.ParseInt(args[2], 10, 64)
+	if err != nil {
+		fmt.Printf("Invalid dstStart: %v\n", err)
+		return
+	}
+
+	dstEnd := dstStart // Default: insertion point
+	if len(args) >= 4 {
+		dstEnd, err = strconv.ParseInt(args[3], 10, 64)
+		if err != nil {
+			fmt.Printf("Invalid dstEnd: %v\n", err)
+			return
+		}
+	}
+
+	cursor := r.cursor()
+	result, err := cursor.MoveBytes(srcStart, srcEnd, dstStart, dstEnd, insertBefore)
+	if err != nil {
+		fmt.Printf("Move error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Moved %d bytes from [%d,%d) to [%d,%d). Now at fork=%d, revision=%d\n",
+		srcEnd-srcStart, srcStart, srcEnd, dstStart, dstEnd, result.Fork, result.Revision)
+	if len(result.DisplacedDecorations) > 0 {
+		fmt.Printf("Displaced decorations from destination: %d\n", len(result.DisplacedDecorations))
+		for _, d := range result.DisplacedDecorations {
+			fmt.Printf("  %s @ relative position %d\n", d.Key, d.Position)
+		}
+	}
+}
+
+func (r *REPL) cmdCopy(args []string, insertBefore bool) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	// Syntax: copy srcStart srcEnd dstStart [dstEnd] ["decorations", key=pos, ...]
+	if len(args) < 3 {
+		fmt.Println("Usage: copy <srcStart> <srcEnd> <dstStart> [dstEnd]")
+		fmt.Println("       copy- <srcStart> <srcEnd> <dstStart> [dstEnd]")
+		fmt.Println("  Copies bytes [srcStart, srcEnd) to replace [dstStart, dstEnd)")
+		fmt.Println("  If dstEnd omitted, dstEnd = dstStart (insertion point)")
+		fmt.Println("  copy- consolidates displaced decorations to end instead of start")
+		fmt.Println("  Source and destination ranges may overlap")
+		return
+	}
+
+	srcStart, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil {
+		fmt.Printf("Invalid srcStart: %v\n", err)
+		return
+	}
+
+	srcEnd, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil {
+		fmt.Printf("Invalid srcEnd: %v\n", err)
+		return
+	}
+
+	dstStart, err := strconv.ParseInt(args[2], 10, 64)
+	if err != nil {
+		fmt.Printf("Invalid dstStart: %v\n", err)
+		return
+	}
+
+	dstEnd := dstStart // Default: insertion point
+	if len(args) >= 4 {
+		// Try to parse as number; if fails, might be decoration syntax
+		var parseErr error
+		dstEnd, parseErr = strconv.ParseInt(args[3], 10, 64)
+		if parseErr != nil {
+			dstEnd = dstStart // Keep as insertion point
+		}
+	}
+
+	cursor := r.cursor()
+	result, err := cursor.CopyBytes(srcStart, srcEnd, dstStart, dstEnd, nil, insertBefore)
+	if err != nil {
+		fmt.Printf("Copy error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Copied %d bytes from [%d,%d) to [%d,%d). Now at fork=%d, revision=%d\n",
+		srcEnd-srcStart, srcStart, srcEnd, dstStart, dstEnd, result.Fork, result.Revision)
+	if len(result.DisplacedDecorations) > 0 {
+		fmt.Printf("Displaced decorations from destination: %d\n", len(result.DisplacedDecorations))
+		for _, d := range result.DisplacedDecorations {
+			fmt.Printf("  %s @ relative position %d\n", d.Key, d.Position)
+		}
+	}
 }
 
 func (r *REPL) cmdTruncate() {

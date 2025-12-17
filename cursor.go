@@ -363,6 +363,48 @@ func (c *Cursor) OverwriteBytes(length int64, newData []byte) ([]RelativeDecorat
 	return c.garland.overwriteBytesAt(c, c.bytePos, length, newData)
 }
 
+// OverwriteBytesWithDecorations replaces bytes with new data, adding decorations.
+// - decorationsToAdd: decorations to add to the new content (relative to new content start)
+// - insertBefore: if true, displaced decorations consolidate to end; if false, to start
+// Returns the original decorations from the overwritten range with their original relative positions.
+func (c *Cursor) OverwriteBytesWithDecorations(length int64, newData []byte, decorationsToAdd []RelativeDecoration, insertBefore bool) ([]RelativeDecoration, ChangeResult, error) {
+	if c.garland == nil {
+		return nil, ChangeResult{}, ErrCursorNotFound
+	}
+	return c.garland.overwriteBytesAtInternal(c, c.bytePos, length, newData, decorationsToAdd, insertBefore)
+}
+
+// MoveBytes moves a byte range to a new location.
+// All addresses are interpreted as positions in the original document before any changes.
+// Source and destination ranges cannot overlap for Move.
+// Decorations in the source range move with the content.
+// Decorations in the destination range are consolidated and returned.
+// - srcStart, srcEnd: source byte range [srcStart, srcEnd)
+// - dstStart, dstEnd: destination byte range to replace [dstStart, dstEnd)
+// - insertBefore: if true, displaced decorations consolidate to end of new content
+// Returns MoveResult with the displaced decorations from the destination range.
+func (c *Cursor) MoveBytes(srcStart, srcEnd, dstStart, dstEnd int64, insertBefore bool) (MoveResult, error) {
+	if c.garland == nil {
+		return MoveResult{}, ErrCursorNotFound
+	}
+	return c.garland.moveBytesAt(c, srcStart, srcEnd, dstStart, dstEnd, insertBefore)
+}
+
+// CopyBytes copies a byte range to a new location.
+// All addresses are interpreted as positions in the original document before any changes.
+// Source and destination ranges may overlap for Copy (source is snapshotted first).
+// - srcStart, srcEnd: source byte range [srcStart, srcEnd)
+// - dstStart, dstEnd: destination byte range to replace [dstStart, dstEnd)
+// - decorationsToAdd: decorations to add to the copied content (like Insert)
+// - insertBefore: if true, displaced decorations consolidate to end of new content
+// Returns CopyResult with the displaced decorations from the destination range.
+func (c *Cursor) CopyBytes(srcStart, srcEnd, dstStart, dstEnd int64, decorationsToAdd []RelativeDecoration, insertBefore bool) (CopyResult, error) {
+	if c.garland == nil {
+		return CopyResult{}, ErrCursorNotFound
+	}
+	return c.garland.copyBytesAt(c, srcStart, srcEnd, dstStart, dstEnd, decorationsToAdd, insertBefore)
+}
+
 // DeleteRunes deletes `length` runes starting at cursor position.
 // Returns decorations from the deleted range.
 // If includeLineDecorations is true, also returns (but does not move)
