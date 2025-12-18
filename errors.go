@@ -51,6 +51,12 @@ var (
 
 	// ErrNotFromOriginalFile indicates warm storage is not available for this node.
 	ErrNotFromOriginalFile = errors.New("node is not from original file")
+
+	// ErrMemoryPressure indicates that memory limits are exceeded and cannot be reduced.
+	// This occurs when hard memory limit is set but no cold storage is configured,
+	// or when cold storage is full/unavailable. The application should handle this
+	// by closing unused garlands, reducing operations, or configuring cold storage.
+	ErrMemoryPressure = errors.New("memory limit exceeded and cannot be reduced")
 )
 
 // File system errors

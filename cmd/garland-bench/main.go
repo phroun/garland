@@ -70,18 +70,6 @@ func main() {
 	fmt.Println(result)
 	fmt.Println()
 
-	// Initialize library with generous memory for benchmark
-	// (we want to test operations, not memory pressure)
-	lib, err := garland.Init(garland.LibraryOptions{
-		ColdStoragePath: coldStorage,
-		MemorySoftLimit: 2 * 1024 * 1024 * 1024,  // 2 GB
-		MemoryHardLimit: 4 * 1024 * 1024 * 1024,  // 4 GB
-	})
-	if err != nil {
-		fmt.Printf("Failed to init library: %v\n", err)
-		os.Exit(1)
-	}
-
 	// Helper to run and print each benchmark
 	runBench := func(name string, fn func() BenchResult) {
 		fmt.Printf("  %-40s ", name+"...")
@@ -90,11 +78,76 @@ func main() {
 		results = append(results, result)
 	}
 
-	// Run benchmarks
-	fmt.Println("Running benchmarks...")
+	// =======================================================================
+	// TEST 1: Memory pressure detection (no cold storage, low memory limit)
+	// =======================================================================
+	fmt.Println("Testing memory pressure detection (no cold storage)...")
 	fmt.Println()
 
-	// Open file benchmark (skip memory-only for large files - would thrash)
+	libNoCold, err := garland.Init(garland.LibraryOptions{
+		// No ColdStoragePath - can't evict anywhere
+		MemorySoftLimit: 100 * 1024 * 1024, // 100 MB
+		MemoryHardLimit: 200 * 1024 * 1024, // 200 MB
+	})
+	if err != nil {
+		fmt.Printf("Failed to init library: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("  Opening 1GB file with 200MB limit and no cold storage...")
+	fmt.Println("  (This should trigger memory pressure)")
+	gPressure, err := libNoCold.Open(garland.FileOptions{
+		FilePath:     testFile,
+		LoadingStyle: garland.MemoryOnly,
+	})
+	if err != nil {
+		fmt.Printf("  Open error: %v\n", err)
+	} else {
+		// Wait a bit for loading to progress and hit the limit
+		for i := 0; i < 50; i++ {
+			time.Sleep(100 * time.Millisecond)
+			stats := gPressure.MemoryUsage()
+			if stats.UnderPressure {
+				fmt.Printf("  Memory pressure detected after loading %d MB\n", stats.MemoryBytes/(1024*1024))
+				break
+			}
+			if gPressure.ByteCount().Complete {
+				break
+			}
+		}
+
+		stats := gPressure.MemoryUsage()
+		fmt.Printf("  Final state: %d MB loaded, pressure=%v\n", stats.MemoryBytes/(1024*1024), stats.UnderPressure)
+
+		// Check the error helper
+		if err := libNoCold.CheckMemoryPressureError(); err != nil {
+			fmt.Printf("  CheckMemoryPressureError() returned: %v\n", err)
+		} else {
+			fmt.Println("  CheckMemoryPressureError() returned: nil (no pressure)")
+		}
+
+		gPressure.Close()
+	}
+	fmt.Println()
+
+	// =======================================================================
+	// TEST 2: Normal benchmarks with cold storage
+	// =======================================================================
+	fmt.Println("Running benchmarks with cold storage enabled...")
+	fmt.Println()
+
+	// Initialize library with generous memory for benchmark
+	lib, err := garland.Init(garland.LibraryOptions{
+		ColdStoragePath: coldStorage,
+		MemorySoftLimit: 2 * 1024 * 1024 * 1024, // 2 GB
+		MemoryHardLimit: 4 * 1024 * 1024 * 1024, // 4 GB
+	})
+	if err != nil {
+		fmt.Printf("Failed to init library: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Open file benchmark
 	fmt.Println("File opening:")
 	runBench("Open file (all storage tiers)", func() BenchResult {
 		return benchOpenFile(lib, testFile, garland.AllStorage, "Open file (all storage tiers)")

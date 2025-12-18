@@ -129,6 +129,9 @@ type Library struct {
 	rebalanceBudget    int
 	backgroundInterval time.Duration
 
+	// Memory pressure state - set when hard limit exceeded and can't reduce
+	memoryPressure bool
+
 	// Background maintenance worker
 	maintenanceStop chan struct{}
 	maintenanceWg   sync.WaitGroup
