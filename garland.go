@@ -4792,6 +4792,8 @@ func (g *Garland) Decorate(entries []DecorationEntry) (ChangeResult, error) {
 			if didChange {
 				g.root = g.nodeRegistry[newRootID]
 				changed = true
+				// Queue cache update for deletion
+				g.pendingDecorationDeletes = append(g.pendingDecorationDeletes, deletions[0])
 			}
 		}
 	} else if len(deletions) > 1 {
@@ -4807,6 +4809,8 @@ func (g *Garland) Decorate(entries []DecorationEntry) (ChangeResult, error) {
 		if didChange {
 			g.root = g.nodeRegistry[newRootID]
 			changed = true
+			// Queue cache updates for all deletions
+			g.pendingDecorationDeletes = append(g.pendingDecorationDeletes, deletions...)
 		}
 	}
 
@@ -4852,26 +4856,25 @@ func (g *Garland) GetDecorationPosition(key string) (AbsoluteAddress, error) {
 	// as a side effect of inserts/deletes (cache doesn't track these movements)
 	inTransaction := g.transaction != nil && g.transaction.hasMutations
 
-	// Check if cached location is valid (same fork, not in transaction)
-	if !inTransaction && cacheEntry.LastKnownFork == g.currentFork {
+	// Check if cached location is valid (same fork AND same revision, not in transaction)
+	// IMPORTANT: We must verify at the CURRENT revision, not the cached revision.
+	// The cache is just a hint - decorations can move between revisions.
+	if !inTransaction && cacheEntry.LastKnownFork == g.currentFork && cacheEntry.LastKnownRev == g.currentRevision {
 		// NodeID == 0 means "confirmed not present at this fork/revision"
-		if cacheEntry.LastKnownNode == 0 && cacheEntry.LastKnownRev == g.currentRevision {
+		if cacheEntry.LastKnownNode == 0 {
 			return AbsoluteAddress{}, ErrDecorationNotFound
 		}
 
-		// Try cached location directly using O(1) history lookup
-		// Avoid snapshotAt which is O(revisions) in worst case
-		if cacheEntry.LastKnownNode != 0 {
-			if node, ok := g.nodeRegistry[cacheEntry.LastKnownNode]; ok {
-				cachedKey := ForkRevision{cacheEntry.LastKnownFork, cacheEntry.LastKnownRev}
-				if snap, ok := node.history[cachedKey]; ok && snap != nil && snap.isLeaf {
-					for _, d := range snap.decorations {
-						if d.Key == key {
-							// Cache hit! Update access time
-							cacheEntry.LastAccess = time.Now()
-							cacheEntry.Tier = CacheTierHot
-							return ByteAddress(cacheEntry.LastKnownOffset + d.Position), nil
-						}
+		// Try cached location directly - cache is valid for current revision
+		if node, ok := g.nodeRegistry[cacheEntry.LastKnownNode]; ok {
+			snap := node.snapshotAt(g.currentFork, g.currentRevision)
+			if snap != nil && snap.isLeaf {
+				for _, d := range snap.decorations {
+					if d.Key == key {
+						// Cache hit! Update access time
+						cacheEntry.LastAccess = time.Now()
+						cacheEntry.Tier = CacheTierHot
+						return ByteAddress(cacheEntry.LastKnownOffset + d.Position), nil
 					}
 				}
 			}
