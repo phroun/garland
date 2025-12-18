@@ -261,12 +261,14 @@ func computeDecorationHash(decorations []Decoration) []byte {
 	return computeHash(data)
 }
 
-// partitionDecorations splits decorations at a given byte position.
-// Decorations before pos go to left, decorations at or after pos go to right.
+// partitionDecorations splits decorations at a given position.
+// When insertBefore=true: decorations at pos go to right (will be shifted)
+// When insertBefore=false: decorations at pos go to left (stay in place)
 // Right decorations have their positions adjusted by -pos.
-func partitionDecorations(decorations []Decoration, pos int64) (left, right []Decoration) {
+func partitionDecorations(decorations []Decoration, pos int64, insertBefore bool) (left, right []Decoration) {
 	for _, d := range decorations {
-		if d.Position < pos {
+		goesToLeft := d.Position < pos || (!insertBefore && d.Position == pos)
+		if goesToLeft {
 			left = append(left, d)
 		} else {
 			right = append(right, Decoration{

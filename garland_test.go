@@ -283,7 +283,7 @@ func TestPartitionDecorations(t *testing.T) {
 		{Key: "c", Position: 15},
 	}
 
-	left, right := partitionDecorations(decorations, 10)
+	left, right := partitionDecorations(decorations, 10, true)
 
 	if len(left) != 1 {
 		t.Errorf("Expected 1 left decoration, got %d", len(left))

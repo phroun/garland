@@ -357,8 +357,8 @@ func (g *Garland) splitLeaf(node *Node, snap *NodeSnapshot, bytePos int64) (Node
 	leftData := snap.data[:splitPos]
 	rightData := snap.data[splitPos:]
 
-	// Partition decorations
-	leftDecs, rightDecs := partitionDecorations(snap.decorations, splitPos)
+	// Partition decorations (decorations at exact split point go to right)
+	leftDecs, rightDecs := partitionDecorations(snap.decorations, splitPos, true)
 
 	// Create left leaf
 	g.nextNodeID++
@@ -522,8 +522,8 @@ func (g *Garland) insertIntoLeaf(
 	leftData := snap.data[:splitPos]
 	rightData := snap.data[splitPos:]
 
-	// Partition existing decorations
-	leftDecs, rightDecs := partitionDecorations(snap.decorations, splitPos)
+	// Partition existing decorations based on insertBefore flag
+	leftDecs, rightDecs := partitionDecorations(snap.decorations, splitPos, insertBefore)
 
 	// Adjust right decorations for insertion - but only if there's actual right data.
 	// For EOF nodes (empty right data), decorations stay at position 0 (the new EOF).
