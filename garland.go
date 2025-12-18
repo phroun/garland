@@ -359,6 +359,10 @@ type Garland struct {
 
 	// Memory tracking for incremental maintenance
 	memoryBytes int64 // total bytes of in-memory leaf data
+
+	// Source file change detection
+	sourceState      *sourceState
+	warmVerification map[NodeID]*warmVerificationState
 }
 
 // Open creates or loads a Garland from various sources.
@@ -433,6 +437,9 @@ func (lib *Library) Open(options FileOptions) (*Garland, error) {
 	// Initialize streaming condition variable (uses the garland's mutex)
 	g.streamCond = sync.NewCond(&g.mu)
 
+	// Initialize source change detection
+	g.initSourceState()
+
 	// Initialize fork 0
 	g.forks[0] = &ForkInfo{
 		ID:              0,
@@ -464,6 +471,10 @@ func (lib *Library) Open(options FileOptions) (*Garland, error) {
 	case options.FilePath != "":
 		initialData, err = g.loadFromFile(options.FilePath)
 		if err != nil {
+			return nil, err
+		}
+		// Capture source file info for change detection
+		if err := g.captureSourceInfo(); err != nil {
 			return nil, err
 		}
 
@@ -499,6 +510,9 @@ func (lib *Library) Open(options FileOptions) (*Garland, error) {
 
 // Close releases resources associated with the Garland.
 func (g *Garland) Close() error {
+	// Stop source file watching
+	g.DisableSourceWatch()
+
 	if g.lib != nil {
 		g.lib.mu.Lock()
 		delete(g.lib.activeGarlands, g.id)
@@ -850,6 +864,65 @@ func (g *Garland) thawNodeRecursive(node *Node, fork ForkID, rev RevisionID) {
 	}
 }
 
+// chillSnapshotWithTrust moves a snapshot's data to storage, respecting warm storage trust levels.
+// It prefers warm storage if available and trusted, otherwise uses cold storage.
+func (g *Garland) chillSnapshotWithTrust(nodeID NodeID, forkRev ForkRevision, snap *NodeSnapshot) error {
+	// Check if warm storage is available for this block
+	canUseWarm := snap.originalFileOffset >= 0 && g.sourceHandle != nil && g.sourceFS != nil
+
+	if canUseWarm {
+		trustLevel := g.getWarmTrustLevel(nodeID)
+
+		switch trustLevel {
+		case WarmTrustFull, WarmTrustVerified:
+			// Warm storage is trusted - evict to warm
+			return g.chillToWarmStorage(nodeID, snap)
+
+		case WarmTrustStale:
+			// Need to verify before evicting to warm
+			if err := g.verifyWarmBlock(nodeID, snap); err == nil {
+				// Verification passed - can use warm
+				return g.chillToWarmStorage(nodeID, snap)
+			}
+			// Verification failed - fall through to cold storage
+
+		case WarmTrustSuspended:
+			// User hasn't responded - don't trust warm, use cold only
+		}
+	}
+
+	// Use cold storage (either warm not available or not trusted)
+	if g.lib.coldStorageBackend != nil {
+		return g.chillSnapshot(nodeID, forkRev, snap)
+	}
+
+	// No cold storage available either - cannot chill
+	return ErrColdStorageFailure
+}
+
+// chillToWarmStorage evicts data to warm storage (original file).
+func (g *Garland) chillToWarmStorage(nodeID NodeID, snap *NodeSnapshot) error {
+	// Compute hash if not already present (needed for future verification)
+	if len(snap.dataHash) == 0 {
+		snap.dataHash = computeHash(snap.data)
+	}
+
+	// Track bytes being freed
+	bytesFreed := int64(len(snap.data))
+
+	// Clear in-memory data and update state
+	snap.data = nil
+	snap.storageState = StorageWarm
+
+	// Update memory tracking
+	g.updateMemoryTracking(-bytesFreed)
+
+	// Record verification state
+	g.updateWarmVerification(nodeID)
+
+	return nil
+}
+
 // chillSnapshot moves a snapshot's data to cold storage.
 func (g *Garland) chillSnapshot(nodeID NodeID, forkRev ForkRevision, snap *NodeSnapshot) error {
 	// Compute hash if not already present
@@ -1131,8 +1204,8 @@ func (g *Garland) ensureSnapshotData(node *Node, forkRev ForkRevision, snap *Nod
 		return g.thawSnapshot(node.id, forkRev, snap)
 
 	case StorageWarm:
-		// Read from warm storage (original file)
-		return g.readFromWarmStorage(snap)
+		// Read from warm storage (original file) with trust-aware verification
+		return g.readFromWarmStorageWithTrust(node.id, snap)
 
 	case StoragePlaceholder:
 		// Data is unavailable
@@ -1142,7 +1215,101 @@ func (g *Garland) ensureSnapshotData(node *Node, forkRev ForkRevision, snap *Nod
 	return nil
 }
 
-// readFromWarmStorage reads data from the original file for warm storage.
+// readFromWarmStorageWithTrust reads data from warm storage using trust-aware verification.
+func (g *Garland) readFromWarmStorageWithTrust(nodeID NodeID, snap *NodeSnapshot) error {
+	if g.sourceHandle == nil || g.sourceFS == nil {
+		return ErrWarmStorageMismatch
+	}
+
+	// Check trust level to decide verification strategy
+	trustLevel := g.getWarmTrustLevel(nodeID)
+	shouldVerify := true
+
+	switch trustLevel {
+	case WarmTrustFull:
+		// No changes ever detected - skip verification unless configured otherwise
+		if g.sourceState != nil && !g.sourceState.verifyOnRead {
+			shouldVerify = false
+		}
+
+	case WarmTrustVerified:
+		// Recently verified - optional verification
+		if g.sourceState != nil && !g.sourceState.verifyOnRead {
+			shouldVerify = false
+		}
+
+	case WarmTrustStale:
+		// Must verify - changes detected since last verification
+		shouldVerify = true
+
+	case WarmTrustSuspended:
+		// User notified but hasn't responded - read is risky but may be necessary
+		shouldVerify = true
+	}
+
+	// Seek to the original position
+	err := g.sourceFS.SeekByte(g.sourceHandle, snap.originalFileOffset)
+	if err != nil {
+		snap.storageState = StoragePlaceholder
+		return err
+	}
+
+	// Read the data
+	data, err := g.sourceFS.ReadBytes(g.sourceHandle, int(snap.byteCount))
+	if err != nil {
+		snap.storageState = StoragePlaceholder
+		return err
+	}
+
+	// Verify hash if required
+	if shouldVerify && len(snap.dataHash) > 0 {
+		actualHash := computeHash(data)
+		if !hashesEqual(snap.dataHash, actualHash) {
+			// Warm storage mismatch - file was modified
+			g.handleWarmStorageMismatch(nodeID)
+			snap.storageState = StoragePlaceholder
+			return ErrWarmStorageMismatch
+		}
+		// Verification passed - update tracking
+		g.updateWarmVerification(nodeID)
+	}
+
+	snap.data = data
+	snap.storageState = StorageMemory
+
+	// Update memory tracking
+	g.updateMemoryTracking(int64(len(data)))
+
+	// Mark as recently accessed
+	g.touchSnapshot(snap)
+
+	return nil
+}
+
+// handleWarmStorageMismatch is called when a warm storage read fails checksum verification.
+func (g *Garland) handleWarmStorageMismatch(nodeID NodeID) {
+	if g.sourceState == nil {
+		return
+	}
+
+	// Increment change counter if not already in modified state
+	if g.sourceState.status != SourceStatusModified {
+		g.incrementChangeCounter()
+		g.sourceState.status = SourceStatusModified
+
+		// Notify handler if set
+		if g.sourceState.changeHandler != nil {
+			info := SourceChangeInfo{
+				Type:         SourceModified,
+				PreviousSize: g.sourceState.originalSize,
+			}
+			// Call handler outside of any critical path
+			go g.sourceState.changeHandler(g, SourceStatusModified, info)
+		}
+	}
+}
+
+// readFromWarmStorage reads data from the original file for warm storage (legacy, always verifies).
 func (g *Garland) readFromWarmStorage(snap *NodeSnapshot) error {
 	if g.sourceHandle == nil || g.sourceFS == nil {
 		return ErrWarmStorageMismatch

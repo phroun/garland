@@ -159,8 +159,8 @@ func (lib *Library) IncrementalChill(budget int) MaintenanceStats {
 			continue
 		}
 
-		// Chill it
-		err := c.garland.chillSnapshot(c.nodeID, c.forkRev, snap)
+		// Chill it using trust-aware eviction
+		err := c.garland.chillSnapshotWithTrust(c.nodeID, c.forkRev, snap)
 		if err == nil {
 			stats.NodesChilled++
 			stats.BytesChilled += c.bytes
