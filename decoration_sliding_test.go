@@ -87,9 +87,24 @@ func TestDecorationSlidingOnInsert(t *testing.T) {
 	}
 	t.Logf("After insert 'XXX' at pos 5: %q", content)
 
-	// Verify decoration positions by checking if they're at expected byte positions
-	// This requires walking the tree to find decorations
-	t.Log("Decorations should have slid: mark_0@0, mark_5@8, mark_6@9, mark_10@13")
+	// Verify decoration positions
+	// With insertBefore=false, decorations AT the insert point stay (don't slide)
+	expectedPositions := map[string]int64{
+		"mark_0":  0,  // unchanged - before insert
+		"mark_5":  5,  // stays - at insert point with insertBefore=false
+		"mark_6":  9,  // was 6, slides by 3
+		"mark_10": 13, // was 10, slides by 3
+	}
+
+	for key, expected := range expectedPositions {
+		pos, err := g.GetDecorationPosition(key)
+		if err != nil {
+			t.Fatalf("GetDecorationPosition(%s) failed: %v", key, err)
+		}
+		if pos.Byte != expected {
+			t.Errorf("Decoration %s: got position %d, want %d", key, pos.Byte, expected)
+		}
+	}
 }
 
 // TestDecorationSlidingOnDelete tests that decorations slide correctly when text is deleted.
@@ -224,7 +239,13 @@ func TestDecorationSlidingWithUndoSeek(t *testing.T) {
 	if content := readContent(); content != "ABCXDEF" {
 		t.Errorf("Rev 1: got %q, want %q", content, "ABCXDEF")
 	}
-	t.Logf("Rev 1: %q with mark_X@3", readContent())
+	pos, err := g.GetDecorationPosition("mark_X")
+	if err != nil {
+		t.Fatalf("GetDecorationPosition(mark_X) failed: %v", err)
+	}
+	if pos.Byte != 3 {
+		t.Errorf("Rev 1 mark_X: got position %d, want 3", pos.Byte)
+	}
 
 	// Rev 2: Insert "YY" at position 1
 	cursor.SeekByte(1)
@@ -236,7 +257,20 @@ func TestDecorationSlidingWithUndoSeek(t *testing.T) {
 	if content := readContent(); content != "AYYBCXDEF" {
 		t.Errorf("Rev 2: got %q, want %q", content, "AYYBCXDEF")
 	}
-	t.Logf("Rev 2: %q with mark_Y@1, mark_X@5 (slid)", readContent())
+	pos, err = g.GetDecorationPosition("mark_Y")
+	if err != nil {
+		t.Fatalf("GetDecorationPosition(mark_Y) failed: %v", err)
+	}
+	if pos.Byte != 1 {
+		t.Errorf("Rev 2 mark_Y: got position %d, want 1", pos.Byte)
+	}
+	pos, err = g.GetDecorationPosition("mark_X")
+	if err != nil {
+		t.Fatalf("GetDecorationPosition(mark_X) failed: %v", err)
+	}
+	if pos.Byte != 5 {
+		t.Errorf("Rev 2 mark_X: got position %d, want 5 (should have slid)", pos.Byte)
+	}
 
 	// UndoSeek to Rev 1 - mark_X should be back at position 3
 	err = g.UndoSeek(1)
@@ -246,7 +280,13 @@ func TestDecorationSlidingWithUndoSeek(t *testing.T) {
 	if content := readContent(); content != "ABCXDEF" {
 		t.Errorf("After UndoSeek(1): got %q, want %q", content, "ABCXDEF")
 	}
-	t.Logf("After UndoSeek(1): %q - mark_X should be back @3", readContent())
+	pos, err = g.GetDecorationPosition("mark_X")
+	if err != nil {
+		t.Fatalf("After UndoSeek(1) GetDecorationPosition(mark_X) failed: %v", err)
+	}
+	if pos.Byte != 3 {
+		t.Errorf("After UndoSeek(1) mark_X: got position %d, want 3", pos.Byte)
+	}
 
 	// UndoSeek to Rev 0 - no decorations yet
 	err = g.UndoSeek(0)
@@ -256,7 +296,11 @@ func TestDecorationSlidingWithUndoSeek(t *testing.T) {
 	if content := readContent(); content != "ABCDEF" {
 		t.Errorf("After UndoSeek(0): got %q, want %q", content, "ABCDEF")
 	}
-	t.Logf("After UndoSeek(0): %q - no decorations", readContent())
+	// At Rev 0, decorations shouldn't exist yet
+	_, err = g.GetDecorationPosition("mark_X")
+	if err == nil {
+		t.Errorf("After UndoSeek(0): mark_X should not exist")
+	}
 
 	// Seek forward to Rev 2 - decorations should be restored in their slid positions
 	err = g.UndoSeek(2)
@@ -266,7 +310,20 @@ func TestDecorationSlidingWithUndoSeek(t *testing.T) {
 	if content := readContent(); content != "AYYBCXDEF" {
 		t.Errorf("After UndoSeek(2): got %q, want %q", content, "AYYBCXDEF")
 	}
-	t.Logf("After UndoSeek(2): %q - mark_Y@1, mark_X@5 restored", readContent())
+	pos, err = g.GetDecorationPosition("mark_Y")
+	if err != nil {
+		t.Fatalf("After UndoSeek(2) GetDecorationPosition(mark_Y) failed: %v", err)
+	}
+	if pos.Byte != 1 {
+		t.Errorf("After UndoSeek(2) mark_Y: got position %d, want 1", pos.Byte)
+	}
+	pos, err = g.GetDecorationPosition("mark_X")
+	if err != nil {
+		t.Fatalf("After UndoSeek(2) GetDecorationPosition(mark_X) failed: %v", err)
+	}
+	if pos.Byte != 5 {
+		t.Errorf("After UndoSeek(2) mark_X: got position %d, want 5", pos.Byte)
+	}
 }
 
 // TestDecorationSlidingWithTransactionRollback tests that rollback restores decoration positions.
@@ -292,8 +349,17 @@ func TestDecorationSlidingWithTransactionRollback(t *testing.T) {
 
 	// Add initial decoration
 	cursor.SeekByte(2)
-	_, _ = cursor.InsertString("", []RelativeDecoration{{Key: "mark_2", Position: 0}}, false)
-	t.Logf("Initial: %q with mark_2@2", readContent())
+	_, err = cursor.InsertString("", []RelativeDecoration{{Key: "mark_2", Position: 0}}, false)
+	if err != nil {
+		t.Fatalf("Insert decoration failed: %v", err)
+	}
+	pos, err := g.GetDecorationPosition("mark_2")
+	if err != nil {
+		t.Fatalf("GetDecorationPosition failed: %v", err)
+	}
+	if pos.Byte != 2 {
+		t.Errorf("Initial mark_2: got position %d, want 2", pos.Byte)
+	}
 
 	// Start transaction
 	err = g.TransactionStart("test")
@@ -310,7 +376,13 @@ func TestDecorationSlidingWithTransactionRollback(t *testing.T) {
 	if content := readContent(); content != "XXXSTART" {
 		t.Errorf("After insert: got %q, want %q", content, "XXXSTART")
 	}
-	t.Logf("After insert in transaction: %q - mark_2 should be @5", readContent())
+	pos, err = g.GetDecorationPosition("mark_2")
+	if err != nil {
+		t.Fatalf("After insert GetDecorationPosition failed: %v", err)
+	}
+	if pos.Byte != 5 {
+		t.Errorf("After insert mark_2: got position %d, want 5", pos.Byte)
+	}
 
 	// Rollback - decoration should return to position 2
 	g.TransactionRollback()
@@ -318,7 +390,13 @@ func TestDecorationSlidingWithTransactionRollback(t *testing.T) {
 	if content := readContent(); content != "START" {
 		t.Errorf("After rollback: got %q, want %q", content, "START")
 	}
-	t.Logf("After rollback: %q - mark_2 should be back @2", readContent())
+	pos, err = g.GetDecorationPosition("mark_2")
+	if err != nil {
+		t.Fatalf("After rollback GetDecorationPosition failed: %v", err)
+	}
+	if pos.Byte != 2 {
+		t.Errorf("After rollback mark_2: got position %d, want 2", pos.Byte)
+	}
 }
 
 // TestDecorationIsolationBetweenForks tests that decorations in one fork don't affect another.
@@ -347,9 +425,18 @@ func TestDecorationIsolationBetweenForks(t *testing.T) {
 
 	// Fork 0 Rev 1: Add decoration at position 2
 	cursor.SeekByte(2)
-	_, _ = cursor.InsertString("X", []RelativeDecoration{{Key: "fork0_mark", Position: 0}}, false)
+	_, err = cursor.InsertString("X", []RelativeDecoration{{Key: "fork0_mark", Position: 0}}, false)
+	if err != nil {
+		t.Fatalf("Insert X failed: %v", err)
+	}
 	// "BAXSE"
-	t.Logf("Fork 0 Rev 1: %q with fork0_mark@2", readContent())
+	pos, err := g.GetDecorationPosition("fork0_mark")
+	if err != nil {
+		t.Fatalf("GetDecorationPosition(fork0_mark) failed: %v", err)
+	}
+	if pos.Byte != 2 {
+		t.Errorf("Fork 0 Rev 1 fork0_mark: got position %d, want 2", pos.Byte)
+	}
 
 	// Go back to rev 0 and create fork 1
 	err = g.UndoSeek(0)
@@ -392,7 +479,13 @@ func TestDecorationIsolationBetweenForks(t *testing.T) {
 	if content := readContent(); content != "BAXSE" {
 		t.Errorf("Fork 0 HEAD: got %q, want %q", content, "BAXSE")
 	}
-	t.Logf("Fork 0 HEAD: %q - fork0_mark should still be @2, unaffected by fork 1", readContent())
+	pos, err = g.GetDecorationPosition("fork0_mark")
+	if err != nil {
+		t.Fatalf("Fork 0 HEAD GetDecorationPosition(fork0_mark) failed: %v", err)
+	}
+	if pos.Byte != 2 {
+		t.Errorf("Fork 0 HEAD fork0_mark: got position %d, want 2", pos.Byte)
+	}
 
 	// Switch to fork 1 - fork1_mark should be at position 0 (in "!YYYBASE")
 	err = g.ForkSeek(1)
@@ -408,7 +501,13 @@ func TestDecorationIsolationBetweenForks(t *testing.T) {
 	if content := readContent(); content != "!YYYBASE" {
 		t.Errorf("Fork 1 HEAD: got %q, want %q", content, "!YYYBASE")
 	}
-	t.Logf("Fork 1 HEAD: %q - fork1_mark@0, unaffected by fork 0", readContent())
+	pos, err = g.GetDecorationPosition("fork1_mark")
+	if err != nil {
+		t.Fatalf("Fork 1 HEAD GetDecorationPosition(fork1_mark) failed: %v", err)
+	}
+	if pos.Byte != 0 {
+		t.Errorf("Fork 1 HEAD fork1_mark: got position %d, want 0", pos.Byte)
+	}
 }
 
 // TestDecorationStabilityAtDivergencePoint tests that decorations at fork divergence points
@@ -435,16 +534,34 @@ func TestDecorationStabilityAtDivergencePoint(t *testing.T) {
 
 	// Fork 0 Rev 1: Add decoration at divergence point (position 3)
 	cursor.SeekByte(3)
-	_, _ = cursor.InsertString("", []RelativeDecoration{{Key: "diverge_mark", Position: 0}}, false)
+	_, err = cursor.InsertString("", []RelativeDecoration{{Key: "diverge_mark", Position: 0}}, false)
+	if err != nil {
+		t.Fatalf("Insert decoration failed: %v", err)
+	}
 	// "DIVERGE" with diverge_mark@3
-	t.Logf("Fork 0 Rev 1: %q with diverge_mark@3", readContent())
+	pos, err := g.GetDecorationPosition("diverge_mark")
+	if err != nil {
+		t.Fatalf("GetDecorationPosition failed: %v", err)
+	}
+	if pos.Byte != 3 {
+		t.Errorf("Fork 0 Rev 1 diverge_mark: got position %d, want 3", pos.Byte)
+	}
 	divergeRev := g.CurrentRevision()
 
 	// Fork 0 Rev 2: More changes after divergence point
 	cursor.SeekByte(0)
-	_, _ = cursor.InsertString("AA", nil, false)
+	_, err = cursor.InsertString("AA", nil, false)
+	if err != nil {
+		t.Fatalf("Insert AA failed: %v", err)
+	}
 	// "AADIVERGE" - diverge_mark slides to position 5
-	t.Logf("Fork 0 Rev 2: %q - diverge_mark@5 (slid by AA)", readContent())
+	pos, err = g.GetDecorationPosition("diverge_mark")
+	if err != nil {
+		t.Fatalf("GetDecorationPosition after AA failed: %v", err)
+	}
+	if pos.Byte != 5 {
+		t.Errorf("Fork 0 Rev 2 diverge_mark: got position %d, want 5", pos.Byte)
+	}
 
 	// Go back to divergence point
 	err = g.UndoSeek(divergeRev)
@@ -454,7 +571,13 @@ func TestDecorationStabilityAtDivergencePoint(t *testing.T) {
 	if content := readContent(); content != "DIVERGE" {
 		t.Errorf("At divergence point: got %q, want %q", content, "DIVERGE")
 	}
-	t.Logf("Back at divergence: %q - diverge_mark should be @3", readContent())
+	pos, err = g.GetDecorationPosition("diverge_mark")
+	if err != nil {
+		t.Fatalf("GetDecorationPosition at divergence failed: %v", err)
+	}
+	if pos.Byte != 3 {
+		t.Errorf("Back at divergence diverge_mark: got position %d, want 3", pos.Byte)
+	}
 
 	// Create fork 1 from divergence point
 	cursor.SeekByte(7) // End of "DIVERGE"
@@ -466,13 +589,28 @@ func TestDecorationStabilityAtDivergencePoint(t *testing.T) {
 		t.Errorf("Expected fork 1, got %d", g.CurrentFork())
 	}
 	// "DIVERGE_FORK1" - diverge_mark should still be @3
-	t.Logf("Fork 1 Rev 1: %q - diverge_mark should still be @3", readContent())
+	pos, err = g.GetDecorationPosition("diverge_mark")
+	if err != nil {
+		t.Fatalf("Fork 1 Rev 1 GetDecorationPosition failed: %v", err)
+	}
+	if pos.Byte != 3 {
+		t.Errorf("Fork 1 Rev 1 diverge_mark: got position %d, want 3", pos.Byte)
+	}
 
 	// Make changes before the divergence point in fork 1
 	cursor.SeekByte(0)
-	_, _ = cursor.InsertString("BB", nil, false)
+	_, err = cursor.InsertString("BB", nil, false)
+	if err != nil {
+		t.Fatalf("Insert BB failed: %v", err)
+	}
 	// "BBDIVERGE_FORK1" - diverge_mark slides to position 5
-	t.Logf("Fork 1 Rev 2: %q - diverge_mark@5 in this fork", readContent())
+	pos, err = g.GetDecorationPosition("diverge_mark")
+	if err != nil {
+		t.Fatalf("Fork 1 Rev 2 GetDecorationPosition failed: %v", err)
+	}
+	if pos.Byte != 5 {
+		t.Errorf("Fork 1 Rev 2 diverge_mark: got position %d, want 5", pos.Byte)
+	}
 
 	// Go back to fork 0 head - diverge_mark should be at position 5 (from "AA" insert)
 	err = g.ForkSeek(0)
@@ -487,7 +625,13 @@ func TestDecorationStabilityAtDivergencePoint(t *testing.T) {
 	if content := readContent(); content != "AADIVERGE" {
 		t.Errorf("Fork 0 HEAD: got %q, want %q", content, "AADIVERGE")
 	}
-	t.Logf("Fork 0 HEAD: %q - diverge_mark@5 (slid by AA)", readContent())
+	pos, err = g.GetDecorationPosition("diverge_mark")
+	if err != nil {
+		t.Fatalf("Fork 0 HEAD GetDecorationPosition failed: %v", err)
+	}
+	if pos.Byte != 5 {
+		t.Errorf("Fork 0 HEAD diverge_mark: got position %d, want 5", pos.Byte)
+	}
 
 	// Go to divergence point in fork 0 - diverge_mark should be @3
 	err = g.UndoSeek(divergeRev)
@@ -497,7 +641,13 @@ func TestDecorationStabilityAtDivergencePoint(t *testing.T) {
 	if content := readContent(); content != "DIVERGE" {
 		t.Errorf("Fork 0 at divergence: got %q, want %q", content, "DIVERGE")
 	}
-	t.Logf("Fork 0 at divergence: %q - diverge_mark@3 (original position)", readContent())
+	pos, err = g.GetDecorationPosition("diverge_mark")
+	if err != nil {
+		t.Fatalf("Fork 0 at divergence GetDecorationPosition failed: %v", err)
+	}
+	if pos.Byte != 3 {
+		t.Errorf("Fork 0 at divergence diverge_mark: got position %d, want 3", pos.Byte)
+	}
 }
 
 // TestDecorationNearCursorBoundaries tests decoration behavior at cursor boundary conditions.
@@ -540,16 +690,31 @@ func TestDecorationNearCursorBoundaries(t *testing.T) {
 	}
 
 	// "ABCDXXEFGH"
-	// Expected:
+	// Expected with insertBefore=false:
 	// mark_before: 3 (unchanged - strictly before)
-	// mark_at: 6 (was 4, slides by 2 - at insert point, moves right)
+	// mark_at: 4 (stays - insertBefore=false means decoration at insert point stays)
 	// mark_after: 7 (was 5, slides by 2)
 
 	if content := readContent(); content != "ABCDXXEFGH" {
 		t.Errorf("After insert: got %q, want %q", content, "ABCDXXEFGH")
 	}
-	t.Logf("After insert 'XX' at 4: %q", readContent())
-	t.Log("Expected: mark_before@3, mark_at@6, mark_after@7")
+
+	// Verify decoration positions
+	expectedPositions := map[string]int64{
+		"mark_before": 3, // unchanged - strictly before
+		"mark_at":     4, // stays - insertBefore=false
+		"mark_after":  7, // was 5, slides by 2
+	}
+
+	for key, expected := range expectedPositions {
+		pos, err := g.GetDecorationPosition(key)
+		if err != nil {
+			t.Fatalf("GetDecorationPosition(%s) failed: %v", key, err)
+		}
+		if pos.Byte != expected {
+			t.Errorf("Decoration %s: got position %d, want %d", key, pos.Byte, expected)
+		}
+	}
 }
 
 // TestDecorationInsertBeforeFlag tests the subtle distinction of decoration sliding
@@ -767,12 +932,36 @@ func TestDecorationInDistantNodes(t *testing.T) {
 		t.Fatalf("Insert failed: %v", err)
 	}
 
-	// Decorations before 20 should stay, decorations at/after 20 should slide by 5
-	// Expected: 0, 5, 10, 15 unchanged; 20->25, 25->30, 30->35, 35->40
+	// With insertBefore=false, decorations AT the insert point stay
+	// Decorations before 20 stay, decoration at 20 stays, decorations after 20 slide by 5
+	// Expected: 0, 5, 10, 15, 20 unchanged; 25->30, 30->35, 35->40
 
 	content := readContent()
-	t.Logf("After insert at 20: %q", content)
-	t.Log("Expected decoration positions: 0, 5, 10, 15, 25, 30, 35, 40")
+	if content != "AAAA|BBBB|CCCC|DDDD|XXXXXEEEE|FFFF|GGGG|HHHH" {
+		t.Errorf("Content: got %q, want %q", content, "AAAA|BBBB|CCCC|DDDD|XXXXXEEEE|FFFF|GGGG|HHHH")
+	}
+
+	// Verify decoration positions
+	expectedPositions := map[string]int64{
+		"mark_0": 0,  // unchanged
+		"mark_1": 5,  // unchanged
+		"mark_2": 10, // unchanged
+		"mark_3": 15, // unchanged
+		"mark_4": 20, // stays - at insert point with insertBefore=false
+		"mark_5": 30, // was 25, slides by 5
+		"mark_6": 35, // was 30, slides by 5
+		"mark_7": 40, // was 35, slides by 5
+	}
+
+	for key, expected := range expectedPositions {
+		pos, err := g.GetDecorationPosition(key)
+		if err != nil {
+			t.Fatalf("GetDecorationPosition(%s) failed: %v", key, err)
+		}
+		if pos.Byte != expected {
+			t.Errorf("Decoration %s: got position %d, want %d", key, pos.Byte, expected)
+		}
+	}
 }
 
 // TestDecorationPreservationAcrossMultipleUndoSeeks tests complex undo navigation
@@ -802,27 +991,63 @@ func TestDecorationPreservationAcrossMultipleUndoSeeks(t *testing.T) {
 
 	// Rev 1: Add decoration at position 5
 	cursor.SeekByte(5)
-	_, _ = cursor.InsertString("A", []RelativeDecoration{{Key: "tracked", Position: 0}}, false)
+	_, err = cursor.InsertString("A", []RelativeDecoration{{Key: "tracked", Position: 0}}, false)
+	if err != nil {
+		t.Fatalf("Insert A failed: %v", err)
+	}
 	// "01234A56789" - tracked@5
-	t.Logf("Rev 1: %q - tracked@5", readContent())
+	pos, err := g.GetDecorationPosition("tracked")
+	if err != nil {
+		t.Fatalf("Rev 1 GetDecorationPosition failed: %v", err)
+	}
+	if pos.Byte != 5 {
+		t.Errorf("Rev 1 tracked: got position %d, want 5", pos.Byte)
+	}
 
 	// Rev 2: Insert "BB" at position 2
 	cursor.SeekByte(2)
-	_, _ = cursor.InsertString("BB", nil, false)
+	_, err = cursor.InsertString("BB", nil, false)
+	if err != nil {
+		t.Fatalf("Insert BB failed: %v", err)
+	}
 	// "01BB234A56789" - tracked@7 (slid by 2)
-	t.Logf("Rev 2: %q - tracked@7", readContent())
+	pos, err = g.GetDecorationPosition("tracked")
+	if err != nil {
+		t.Fatalf("Rev 2 GetDecorationPosition failed: %v", err)
+	}
+	if pos.Byte != 7 {
+		t.Errorf("Rev 2 tracked: got position %d, want 7", pos.Byte)
+	}
 
 	// Rev 3: Insert "CCC" at position 0
 	cursor.SeekByte(0)
-	_, _ = cursor.InsertString("CCC", nil, false)
+	_, err = cursor.InsertString("CCC", nil, false)
+	if err != nil {
+		t.Fatalf("Insert CCC failed: %v", err)
+	}
 	// "CCC01BB234A56789" - tracked@10 (slid by 3)
-	t.Logf("Rev 3: %q - tracked@10", readContent())
+	pos, err = g.GetDecorationPosition("tracked")
+	if err != nil {
+		t.Fatalf("Rev 3 GetDecorationPosition failed: %v", err)
+	}
+	if pos.Byte != 10 {
+		t.Errorf("Rev 3 tracked: got position %d, want 10", pos.Byte)
+	}
 
 	// Rev 4: Delete 2 bytes at position 5
 	cursor.SeekByte(5)
-	_, _, _ = cursor.DeleteBytes(2, false)
+	_, _, err = cursor.DeleteBytes(2, false)
+	if err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
 	// "CCC01234A56789" - tracked@8 (slid left by 2)
-	t.Logf("Rev 4: %q - tracked@8", readContent())
+	pos, err = g.GetDecorationPosition("tracked")
+	if err != nil {
+		t.Fatalf("Rev 4 GetDecorationPosition failed: %v", err)
+	}
+	if pos.Byte != 8 {
+		t.Errorf("Rev 4 tracked: got position %d, want 8", pos.Byte)
+	}
 
 	// Now undo seek through all revisions and verify
 	t.Log("=== Traversing back through revisions ===")
@@ -831,35 +1056,70 @@ func TestDecorationPreservationAcrossMultipleUndoSeeks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UndoSeek(3) failed: %v", err)
 	}
-	t.Logf("Rev 3: %q - tracked should be @10", readContent())
+	pos, err = g.GetDecorationPosition("tracked")
+	if err != nil {
+		t.Fatalf("UndoSeek(3) GetDecorationPosition failed: %v", err)
+	}
+	if pos.Byte != 10 {
+		t.Errorf("After UndoSeek(3) tracked: got position %d, want 10", pos.Byte)
+	}
 
 	err = g.UndoSeek(2)
 	if err != nil {
 		t.Fatalf("UndoSeek(2) failed: %v", err)
 	}
-	t.Logf("Rev 2: %q - tracked should be @7", readContent())
+	pos, err = g.GetDecorationPosition("tracked")
+	if err != nil {
+		t.Fatalf("UndoSeek(2) GetDecorationPosition failed: %v", err)
+	}
+	if pos.Byte != 7 {
+		t.Errorf("After UndoSeek(2) tracked: got position %d, want 7", pos.Byte)
+	}
 
 	err = g.UndoSeek(1)
 	if err != nil {
 		t.Fatalf("UndoSeek(1) failed: %v", err)
 	}
-	t.Logf("Rev 1: %q - tracked should be @5", readContent())
+	pos, err = g.GetDecorationPosition("tracked")
+	if err != nil {
+		t.Fatalf("UndoSeek(1) GetDecorationPosition failed: %v", err)
+	}
+	if pos.Byte != 5 {
+		t.Errorf("After UndoSeek(1) tracked: got position %d, want 5", pos.Byte)
+	}
 
 	err = g.UndoSeek(0)
 	if err != nil {
 		t.Fatalf("UndoSeek(0) failed: %v", err)
 	}
-	t.Logf("Rev 0: %q - no tracked decoration yet", readContent())
+	// At Rev 0, decoration shouldn't exist
+	_, err = g.GetDecorationPosition("tracked")
+	if err == nil {
+		t.Error("After UndoSeek(0): tracked should not exist")
+	}
 
-	// Now traverse forward
+	// Now traverse forward and verify positions
 	t.Log("=== Traversing forward through revisions ===")
+
+	expectedForward := map[RevisionID]int64{
+		1: 5,
+		2: 7,
+		3: 10,
+		4: 8,
+	}
 
 	for rev := RevisionID(1); rev <= 4; rev++ {
 		err = g.UndoSeek(rev)
 		if err != nil {
 			t.Fatalf("UndoSeek(%d) failed: %v", rev, err)
 		}
-		t.Logf("Rev %d: %q", rev, readContent())
+		pos, err = g.GetDecorationPosition("tracked")
+		if err != nil {
+			t.Fatalf("Forward UndoSeek(%d) GetDecorationPosition failed: %v", rev, err)
+		}
+		if pos.Byte != expectedForward[rev] {
+			t.Errorf("Forward Rev %d tracked: got position %d, want %d", rev, pos.Byte, expectedForward[rev])
+		}
 	}
 }
 
