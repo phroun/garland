@@ -2,11 +2,89 @@ package garland
 
 import (
 	"bytes"
+	"io"
 	"regexp"
 	"strings"
 	"unicode"
 	"unicode/utf8"
 )
+
+// ropeRuneReader implements io.RuneReader for streaming regex operations.
+// It traverses the rope structure without loading the entire document into memory.
+type ropeRuneReader struct {
+	g         *Garland
+	bytePos   int64  // Current byte position in document
+	totalSize int64  // Total document size
+	leafData  []byte // Current leaf's data (cached)
+	leafStart int64  // Byte offset where current leaf starts
+	leafPos   int    // Position within leafData
+}
+
+// newRopeRuneReader creates a RuneReader starting at the given byte position.
+func (g *Garland) newRopeRuneReader(startPos int64) *ropeRuneReader {
+	return &ropeRuneReader{
+		g:         g,
+		bytePos:   startPos,
+		totalSize: g.totalBytes,
+		leafData:  nil,
+		leafStart: -1,
+		leafPos:   0,
+	}
+}
+
+// ReadRune implements io.RuneReader.
+func (r *ropeRuneReader) ReadRune() (rune, int, error) {
+	if r.bytePos >= r.totalSize {
+		return 0, 0, io.EOF
+	}
+
+	// If we need to load a new leaf
+	if r.leafData == nil || r.bytePos < r.leafStart || r.bytePos >= r.leafStart+int64(len(r.leafData)) {
+		if err := r.loadLeafAt(r.bytePos); err != nil {
+			return 0, 0, err
+		}
+	}
+
+	// Calculate position within current leaf
+	r.leafPos = int(r.bytePos - r.leafStart)
+
+	// Decode rune from current position
+	ru, size := utf8.DecodeRune(r.leafData[r.leafPos:])
+	if ru == utf8.RuneError && size <= 1 {
+		// Invalid UTF-8, advance by 1 byte
+		r.bytePos++
+		return utf8.RuneError, 1, nil
+	}
+
+	r.bytePos += int64(size)
+	return ru, size, nil
+}
+
+// loadLeafAt loads the leaf containing the given byte position.
+func (r *ropeRuneReader) loadLeafAt(pos int64) error {
+	leafResult, err := r.g.findLeafByByteUnlocked(pos)
+	if err != nil {
+		return err
+	}
+
+	// Get the leaf's snapshot and data
+	snap := leafResult.Node.snapshotAt(r.g.currentFork, r.g.currentRevision)
+	if snap == nil {
+		return ErrInternal
+	}
+
+	// Thaw if needed (cold/warm storage -> memory)
+	if snap.storageState != StorageMemory {
+		forkRev := ForkRevision{r.g.currentFork, r.g.currentRevision}
+		if err := r.g.thawSnapshot(leafResult.Node.id, forkRev, snap); err != nil {
+			return err
+		}
+	}
+
+	r.leafData = snap.data
+	r.leafStart = leafResult.LeafByteStart
+	return nil
+}
 
 // SearchResult contains information about a search match.
 type SearchResult struct {
@@ -379,115 +457,333 @@ func (c *Cursor) replaceRegexCount(pattern, replacement string, count int, opts 
 // Internal implementation methods
 
 func (g *Garland) findStringInternal(startPos int64, needle string, opts SearchOptions) (*SearchResult, error) {
-	// Read all content (could be optimized for large files)
-	data, err := g.readBytesRangeInternal(0, g.totalBytes)
-	if err != nil {
-		return nil, err
+	if opts.Backward {
+		return g.findStringBackwardInternal(startPos, needle, opts)
 	}
+	return g.findStringForwardInternal(startPos, needle, opts)
+}
 
-	searchData := data
-	searchNeedle := []byte(needle)
+// findStringForwardInternal searches forward using chunked loading.
+func (g *Garland) findStringForwardInternal(startPos int64, needle string, opts SearchOptions) (*SearchResult, error) {
+	const chunkSize = 1024 * 1024 // 1MB chunks
+
+	needleBytes := []byte(needle)
+	needleLen := int64(len(needleBytes))
 
 	if !opts.CaseSensitive {
-		searchData = bytes.ToLower(data)
-		searchNeedle = bytes.ToLower(searchNeedle)
+		needleBytes = bytes.ToLower(needleBytes)
 	}
 
-	if opts.Backward {
-		// Search backward from startPos
-		searchEnd := startPos
-		if searchEnd > int64(len(searchData)) {
-			searchEnd = int64(len(searchData))
+	// Process document in chunks from startPos
+	offset := startPos
+	for offset < g.totalBytes {
+		// Calculate chunk bounds - include overlap for boundary-spanning matches
+		chunkEnd := offset + chunkSize
+		if chunkEnd > g.totalBytes {
+			chunkEnd = g.totalBytes
 		}
 
-		// Find last occurrence before startPos
-		pos := int64(-1)
-		offset := int64(0)
-		for {
-			idx := bytes.Index(searchData[offset:searchEnd], searchNeedle)
+		// Read this chunk
+		chunkLen := chunkEnd - offset
+		if chunkLen <= 0 {
+			break
+		}
+		chunkData, err := g.readBytesRangeInternal(offset, chunkLen)
+		if err != nil {
+			return nil, err
+		}
+
+		searchData := chunkData
+		if !opts.CaseSensitive {
+			searchData = bytes.ToLower(chunkData)
+		}
+
+		// Search within chunk
+		localOffset := int64(0)
+		for localOffset < int64(len(searchData)) {
+			idx := bytes.Index(searchData[localOffset:], needleBytes)
 			if idx == -1 {
 				break
 			}
-			matchPos := offset + int64(idx)
-			if opts.WholeWord && !isWholeWord(data, matchPos, int64(len(needle))) {
-				offset = matchPos + 1
-				continue
+
+			matchPos := offset + localOffset + int64(idx)
+
+			// Check whole word if required
+			if opts.WholeWord {
+				if !g.isWholeWordChunked(matchPos, needleLen, opts.CaseSensitive) {
+					localOffset += int64(idx) + 1
+					continue
+				}
 			}
-			pos = matchPos
-			offset = matchPos + 1
+
+			// Found a match
+			return &SearchResult{
+				ByteStart: matchPos,
+				ByteEnd:   matchPos + needleLen,
+				Match:     string(chunkData[localOffset+int64(idx) : localOffset+int64(idx)+needleLen]),
+			}, nil
 		}
 
-		if pos == -1 {
-			return nil, nil
+		// Move to next chunk, but overlap by needle length - 1 to catch boundary matches
+		// Ensure we always make forward progress
+		nextOffset := chunkEnd - needleLen + 1
+		if nextOffset <= offset {
+			nextOffset = chunkEnd
 		}
-
-		return &SearchResult{
-			ByteStart: pos,
-			ByteEnd:   pos + int64(len(needle)),
-			Match:     string(data[pos : pos+int64(len(needle))]),
-		}, nil
-	}
-
-	// Search forward from startPos
-	offset := startPos
-	for offset < int64(len(searchData)) {
-		idx := bytes.Index(searchData[offset:], searchNeedle)
-		if idx == -1 {
-			return nil, nil
-		}
-
-		matchPos := offset + int64(idx)
-		if opts.WholeWord && !isWholeWord(data, matchPos, int64(len(needle))) {
-			offset = matchPos + 1
-			continue
-		}
-
-		return &SearchResult{
-			ByteStart: matchPos,
-			ByteEnd:   matchPos + int64(len(needle)),
-			Match:     string(data[matchPos : matchPos+int64(len(needle))]),
-		}, nil
+		offset = nextOffset
 	}
 
 	return nil, nil
 }
 
-func (g *Garland) findStringAllInternal(needle string, opts SearchOptions) ([]SearchResult, error) {
-	data, err := g.readBytesRangeInternal(0, g.totalBytes)
-	if err != nil {
-		return nil, err
-	}
+// findStringBackwardInternal searches backward using chunked loading.
+func (g *Garland) findStringBackwardInternal(startPos int64, needle string, opts SearchOptions) (*SearchResult, error) {
+	const chunkSize = 1024 * 1024 // 1MB chunks
 
-	searchData := data
-	searchNeedle := []byte(needle)
+	needleBytes := []byte(needle)
+	needleLen := int64(len(needleBytes))
 
 	if !opts.CaseSensitive {
-		searchData = bytes.ToLower(data)
-		searchNeedle = bytes.ToLower(searchNeedle)
+		needleBytes = bytes.ToLower(needleBytes)
+	}
+
+	var lastMatch *SearchResult
+
+	// Process document in chunks from beginning to startPos
+	for offset := int64(0); offset < startPos; {
+		chunkEnd := offset + chunkSize
+		if chunkEnd > startPos {
+			chunkEnd = startPos
+		}
+
+		chunkData, err := g.readBytesRangeInternal(offset, chunkEnd-offset)
+		if err != nil {
+			return nil, err
+		}
+
+		searchData := chunkData
+		if !opts.CaseSensitive {
+			searchData = bytes.ToLower(chunkData)
+		}
+
+		// Find all matches in chunk, keep the last valid one
+		localOffset := int64(0)
+		for localOffset < int64(len(searchData)) {
+			idx := bytes.Index(searchData[localOffset:], needleBytes)
+			if idx == -1 {
+				break
+			}
+
+			matchPos := offset + localOffset + int64(idx)
+			matchEnd := matchPos + needleLen
+
+			// Only consider matches that end before or at startPos
+			if matchEnd <= startPos {
+				if opts.WholeWord {
+					if !g.isWholeWordChunked(matchPos, needleLen, opts.CaseSensitive) {
+						localOffset += int64(idx) + 1
+						continue
+					}
+				}
+				lastMatch = &SearchResult{
+					ByteStart: matchPos,
+					ByteEnd:   matchEnd,
+					Match:     string(chunkData[localOffset+int64(idx) : localOffset+int64(idx)+needleLen]),
+				}
+			}
+
+			localOffset += int64(idx) + 1
+		}
+
+		// Handle boundary-spanning matches
+		if chunkEnd < startPos && len(chunkData) >= int(needleLen) {
+			overlapStart := chunkEnd - needleLen + 1
+			overlapEnd := min(chunkEnd+needleLen-1, startPos)
+
+			if overlapEnd > overlapStart {
+				overlapData, err := g.readBytesRangeInternal(overlapStart, overlapEnd-overlapStart)
+				if err == nil {
+					searchOverlap := overlapData
+					if !opts.CaseSensitive {
+						searchOverlap = bytes.ToLower(overlapData)
+					}
+
+					localOffset := int64(0)
+					for localOffset < int64(len(searchOverlap))-needleLen+1 {
+						idx := bytes.Index(searchOverlap[localOffset:], needleBytes)
+						if idx == -1 {
+							break
+						}
+
+						matchPos := overlapStart + localOffset + int64(idx)
+						matchEnd := matchPos + needleLen
+
+						// Only count if it spans the boundary
+						if matchPos < chunkEnd && matchEnd > chunkEnd && matchEnd <= startPos {
+							if opts.WholeWord {
+								if !g.isWholeWordChunked(matchPos, needleLen, opts.CaseSensitive) {
+									localOffset += int64(idx) + 1
+									continue
+								}
+							}
+							lastMatch = &SearchResult{
+								ByteStart: matchPos,
+								ByteEnd:   matchEnd,
+								Match:     string(overlapData[localOffset+int64(idx) : localOffset+int64(idx)+needleLen]),
+							}
+						}
+						localOffset += int64(idx) + 1
+					}
+				}
+			}
+		}
+
+		offset = chunkEnd
+	}
+
+	return lastMatch, nil
+}
+
+// isWholeWordChunked checks if match at position is a whole word using chunked reads.
+func (g *Garland) isWholeWordChunked(pos, length int64, caseSensitive bool) bool {
+	// Check character before match
+	if pos > 0 {
+		before, err := g.readBytesRangeInternal(pos-1, 1)
+		if err == nil && len(before) > 0 {
+			r, _ := utf8.DecodeRune(before)
+			if isWordChar(r) {
+				return false
+			}
+		}
+	}
+
+	// Check character after match
+	if pos+length < g.totalBytes {
+		after, err := g.readBytesRangeInternal(pos+length, 1)
+		if err == nil && len(after) > 0 {
+			r, _ := utf8.DecodeRune(after)
+			if isWordChar(r) {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+func (g *Garland) findStringAllInternal(needle string, opts SearchOptions) ([]SearchResult, error) {
+	const chunkSize = 1024 * 1024 // 1MB chunks
+
+	needleBytes := []byte(needle)
+	needleLen := int64(len(needleBytes))
+
+	if !opts.CaseSensitive {
+		needleBytes = bytes.ToLower(needleBytes)
 	}
 
 	var results []SearchResult
-	offset := int64(0)
+	seenPositions := make(map[int64]bool)
 
-	for offset < int64(len(searchData)) {
-		idx := bytes.Index(searchData[offset:], searchNeedle)
-		if idx == -1 {
+	// Process document in chunks
+	offset := int64(0)
+	for offset < g.totalBytes {
+		chunkEnd := offset + chunkSize
+		if chunkEnd > g.totalBytes {
+			chunkEnd = g.totalBytes
+		}
+
+		chunkLen := chunkEnd - offset
+		if chunkLen <= 0 {
 			break
 		}
-
-		matchPos := offset + int64(idx)
-		if opts.WholeWord && !isWholeWord(data, matchPos, int64(len(needle))) {
-			offset = matchPos + 1
-			continue
+		chunkData, err := g.readBytesRangeInternal(offset, chunkLen)
+		if err != nil {
+			return nil, err
 		}
 
-		results = append(results, SearchResult{
-			ByteStart: matchPos,
-			ByteEnd:   matchPos + int64(len(needle)),
-			Match:     string(data[matchPos : matchPos+int64(len(needle))]),
-		})
-		offset = matchPos + int64(len(needle))
+		searchData := chunkData
+		if !opts.CaseSensitive {
+			searchData = bytes.ToLower(chunkData)
+		}
+
+		// Find all matches in chunk
+		localOffset := int64(0)
+		for localOffset < int64(len(searchData)) {
+			idx := bytes.Index(searchData[localOffset:], needleBytes)
+			if idx == -1 {
+				break
+			}
+
+			matchPos := offset + localOffset + int64(idx)
+
+			if !seenPositions[matchPos] {
+				if opts.WholeWord {
+					if !g.isWholeWordChunked(matchPos, needleLen, opts.CaseSensitive) {
+						localOffset += int64(idx) + 1
+						continue
+					}
+				}
+
+				seenPositions[matchPos] = true
+				results = append(results, SearchResult{
+					ByteStart: matchPos,
+					ByteEnd:   matchPos + needleLen,
+					Match:     string(chunkData[localOffset+int64(idx) : localOffset+int64(idx)+needleLen]),
+				})
+			}
+
+			localOffset += int64(idx) + 1
+		}
+
+		// Handle boundary-spanning matches
+		if chunkEnd < g.totalBytes && len(chunkData) >= int(needleLen) {
+			overlapStart := chunkEnd - needleLen + 1
+			overlapEnd := min(chunkEnd+needleLen-1, g.totalBytes)
+
+			if overlapEnd > overlapStart {
+				overlapData, err := g.readBytesRangeInternal(overlapStart, overlapEnd-overlapStart)
+				if err == nil {
+					searchOverlap := overlapData
+					if !opts.CaseSensitive {
+						searchOverlap = bytes.ToLower(overlapData)
+					}
+
+					localOffset := int64(0)
+					for localOffset < int64(len(searchOverlap))-needleLen+1 {
+						idx := bytes.Index(searchOverlap[localOffset:], needleBytes)
+						if idx == -1 {
+							break
+						}
+
+						matchPos := overlapStart + localOffset + int64(idx)
+
+						// Only count if it spans the boundary and not seen
+						if matchPos < chunkEnd && matchPos+needleLen > chunkEnd && !seenPositions[matchPos] {
+							if opts.WholeWord {
+								if !g.isWholeWordChunked(matchPos, needleLen, opts.CaseSensitive) {
+									localOffset += int64(idx) + 1
+									continue
+								}
+							}
+
+							seenPositions[matchPos] = true
+							results = append(results, SearchResult{
+								ByteStart: matchPos,
+								ByteEnd:   matchPos + needleLen,
+								Match:     string(overlapData[localOffset+int64(idx) : localOffset+int64(idx)+needleLen]),
+							})
+						}
+						localOffset += int64(idx) + 1
+					}
+				}
+			}
+		}
+
+		offset = chunkEnd
 	}
+
+	// Sort results by position
+	sortSearchResults(results)
 
 	if opts.Backward {
 		// Reverse results for backward search
@@ -500,60 +796,178 @@ func (g *Garland) findStringAllInternal(needle string, opts SearchOptions) ([]Se
 }
 
 func (g *Garland) findRegexInternal(startPos int64, re *regexp.Regexp, opts RegexOptions) (*SearchResult, error) {
-	data, err := g.readBytesRangeInternal(0, g.totalBytes)
-	if err != nil {
-		return nil, err
-	}
-
 	if opts.Backward {
-		// Find all matches before startPos, return last one
-		searchData := data[:startPos]
-		matches := re.FindAllIndex(searchData, -1)
-		if len(matches) == 0 {
-			return nil, nil
-		}
-
-		last := matches[len(matches)-1]
-		return &SearchResult{
-			ByteStart: int64(last[0]),
-			ByteEnd:   int64(last[1]),
-			Match:     string(data[last[0]:last[1]]),
-		}, nil
+		// Backward regex search requires scanning from start to find last match before startPos.
+		// This uses chunked loading to avoid loading entire document at once.
+		return g.findRegexBackwardInternal(startPos, re)
 	}
 
-	// Forward search from startPos
-	searchData := data[startPos:]
-	loc := re.FindIndex(searchData)
+	// Forward search using streaming reader
+	reader := g.newRopeRuneReader(startPos)
+	loc := re.FindReaderIndex(reader)
 	if loc == nil {
 		return nil, nil
 	}
 
-	return &SearchResult{
-		ByteStart: startPos + int64(loc[0]),
-		ByteEnd:   startPos + int64(loc[1]),
-		Match:     string(searchData[loc[0]:loc[1]]),
-	}, nil
-}
+	// loc contains byte offsets relative to startPos
+	matchStart := startPos + int64(loc[0])
+	matchEnd := startPos + int64(loc[1])
 
-func (g *Garland) findRegexAllInternal(re *regexp.Regexp, opts RegexOptions) ([]SearchResult, error) {
-	data, err := g.readBytesRangeInternal(0, g.totalBytes)
+	// Read the matched text
+	matchData, err := g.readBytesRangeInternal(matchStart, matchEnd-matchStart)
 	if err != nil {
 		return nil, err
 	}
 
-	matches := re.FindAllIndex(data, -1)
-	if len(matches) == 0 {
-		return nil, nil
+	return &SearchResult{
+		ByteStart: matchStart,
+		ByteEnd:   matchEnd,
+		Match:     string(matchData),
+	}, nil
+}
+
+// findRegexBackwardInternal finds the last regex match before startPos.
+// Uses chunked scanning to avoid loading entire document into memory.
+func (g *Garland) findRegexBackwardInternal(startPos int64, re *regexp.Regexp) (*SearchResult, error) {
+	const chunkSize = 1024 * 1024 // 1MB chunks
+
+	var lastMatch *SearchResult
+
+	// Scan in chunks from beginning up to startPos
+	for offset := int64(0); offset < startPos; {
+		// Calculate chunk bounds
+		chunkEnd := offset + chunkSize
+		if chunkEnd > startPos {
+			chunkEnd = startPos
+		}
+
+		// Read this chunk
+		chunkData, err := g.readBytesRangeInternal(offset, chunkEnd-offset)
+		if err != nil {
+			return nil, err
+		}
+
+		// Find all matches in this chunk
+		matches := re.FindAllIndex(chunkData, -1)
+		for _, loc := range matches {
+			matchStart := offset + int64(loc[0])
+			matchEnd := offset + int64(loc[1])
+
+			// Only consider matches that end before startPos
+			if matchEnd <= startPos {
+				lastMatch = &SearchResult{
+					ByteStart: matchStart,
+					ByteEnd:   matchEnd,
+					Match:     string(chunkData[loc[0]:loc[1]]),
+				}
+			}
+		}
+
+		// Check for matches spanning chunk boundaries
+		// Look for partial match at end of chunk that might continue
+		if chunkEnd < startPos && len(chunkData) > 0 {
+			// Read overlap region to catch boundary-spanning matches
+			overlapStart := chunkEnd - int64(min(len(chunkData), 1024))
+			overlapEnd := min(chunkEnd+1024, startPos)
+			if overlapEnd > overlapStart {
+				overlapData, err := g.readBytesRangeInternal(overlapStart, overlapEnd-overlapStart)
+				if err == nil {
+					overlapMatches := re.FindAllIndex(overlapData, -1)
+					for _, loc := range overlapMatches {
+						matchStart := overlapStart + int64(loc[0])
+						matchEnd := overlapStart + int64(loc[1])
+						// Only consider matches that span the boundary and end before startPos
+						if matchStart < chunkEnd && matchEnd > chunkEnd && matchEnd <= startPos {
+							lastMatch = &SearchResult{
+								ByteStart: matchStart,
+								ByteEnd:   matchEnd,
+								Match:     string(overlapData[loc[0]:loc[1]]),
+							}
+						}
+					}
+				}
+			}
+		}
+
+		offset = chunkEnd
 	}
 
-	results := make([]SearchResult, len(matches))
-	for i, loc := range matches {
-		results[i] = SearchResult{
-			ByteStart: int64(loc[0]),
-			ByteEnd:   int64(loc[1]),
-			Match:     string(data[loc[0]:loc[1]]),
+	return lastMatch, nil
+}
+
+func (g *Garland) findRegexAllInternal(re *regexp.Regexp, opts RegexOptions) ([]SearchResult, error) {
+	const chunkSize = 1024 * 1024 // 1MB chunks
+
+	var results []SearchResult
+	seenPositions := make(map[int64]bool) // Track seen match starts to avoid duplicates from overlap
+
+	// Process document in chunks
+	for offset := int64(0); offset < g.totalBytes; {
+		// Calculate chunk bounds with overlap for boundary-spanning matches
+		chunkEnd := offset + chunkSize
+		if chunkEnd > g.totalBytes {
+			chunkEnd = g.totalBytes
 		}
+
+		// Read this chunk
+		chunkData, err := g.readBytesRangeInternal(offset, chunkEnd-offset)
+		if err != nil {
+			return nil, err
+		}
+
+		// Find all matches in this chunk
+		matches := re.FindAllIndex(chunkData, -1)
+		for _, loc := range matches {
+			matchStart := offset + int64(loc[0])
+			matchEnd := offset + int64(loc[1])
+
+			// Skip if we've seen this match start position (from overlap processing)
+			if seenPositions[matchStart] {
+				continue
+			}
+			seenPositions[matchStart] = true
+
+			results = append(results, SearchResult{
+				ByteStart: matchStart,
+				ByteEnd:   matchEnd,
+				Match:     string(chunkData[loc[0]:loc[1]]),
+			})
+		}
+
+		// Handle matches spanning chunk boundaries by reading overlap region
+		if chunkEnd < g.totalBytes && len(chunkData) > 0 {
+			// Look back 1KB and forward 1KB from boundary
+			overlapStart := chunkEnd - int64(min(len(chunkData), 1024))
+			overlapEnd := min(chunkEnd+1024, g.totalBytes)
+
+			if overlapEnd > overlapStart {
+				overlapData, err := g.readBytesRangeInternal(overlapStart, overlapEnd-overlapStart)
+				if err == nil {
+					overlapMatches := re.FindAllIndex(overlapData, -1)
+					for _, loc := range overlapMatches {
+						matchStart := overlapStart + int64(loc[0])
+						matchEnd := overlapStart + int64(loc[1])
+
+						// Only add matches that span the boundary and haven't been seen
+						if matchStart < chunkEnd && matchEnd > chunkEnd && !seenPositions[matchStart] {
+							seenPositions[matchStart] = true
+
+							results = append(results, SearchResult{
+								ByteStart: matchStart,
+								ByteEnd:   matchEnd,
+								Match:     string(overlapData[loc[0]:loc[1]]),
+							})
+						}
+					}
+				}
+			}
+		}
+
+		offset = chunkEnd
 	}
+
+	// Sort results by position (overlap processing may have added out of order)
+	sortSearchResults(results)
 
 	if opts.Backward {
 		// Reverse for backward iteration
@@ -563,6 +977,18 @@ func (g *Garland) findRegexAllInternal(re *regexp.Regexp, opts RegexOptions) ([]
 	}
 
 	return results, nil
+}
+
+// sortSearchResults sorts results by ByteStart position.
+func sortSearchResults(results []SearchResult) {
+	// Simple insertion sort - results are mostly sorted already
+	for i := 1; i < len(results); i++ {
+		j := i
+		for j > 0 && results[j-1].ByteStart > results[j].ByteStart {
+			results[j-1], results[j] = results[j], results[j-1]
+			j--
+		}
+	}
 }
 
 // compileRegex compiles a regex pattern with optional case insensitivity.
