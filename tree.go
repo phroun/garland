@@ -545,14 +545,9 @@ func (g *Garland) insertIntoLeaf(
 	// Partition existing decorations based on insertBefore flag
 	leftDecs, rightDecs := partitionDecorations(snap.decorations, splitPos, insertBefore)
 
-	// Adjust right decorations for insertion - but only if there's actual right data.
-	// For EOF nodes (empty right data), decorations stay at position 0 (the new EOF).
-	if len(rightData) > 0 {
-		insertLen := int64(len(data))
-		for i := range rightDecs {
-			rightDecs[i].Position += insertLen
-		}
-	}
+	// Note: rightDecs positions are already adjusted to be relative to rightData
+	// by partitionDecorations (subtracted splitPos). No further adjustment needed
+	// because the inserted content goes into its own leaf node.
 
 	// Create new left leaf (original content before insertion point)
 	var leftID NodeID
