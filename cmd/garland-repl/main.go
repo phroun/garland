@@ -29,6 +29,16 @@ func (r *REPL) cursor() *garland.Cursor {
 	return r.cursors[r.currentCursor]
 }
 
+// stripQuotes removes surrounding quotes from a string if present
+func stripQuotes(s string) string {
+	if len(s) >= 2 {
+		if (s[0] == '"' && s[len(s)-1] == '"') || (s[0] == '\'' && s[len(s)-1] == '\'') {
+			return s[1 : len(s)-1]
+		}
+	}
+	return s
+}
+
 func main() {
 	fmt.Println("Garland REPL - Interactive Text Editor Demo")
 	fmt.Println("Type 'help' for available commands, 'quit' to exit")
@@ -1786,7 +1796,7 @@ func (r *REPL) cmdDecorate(args []string) {
 func (r *REPL) parseDecorationSpec(spec string) (garland.DecorationEntry, string, error) {
 	// Check for key=value format
 	if idx := strings.Index(spec, "="); idx > 0 {
-		key := strings.TrimSpace(spec[:idx])
+		key := stripQuotes(strings.TrimSpace(spec[:idx]))
 		value := strings.TrimSpace(spec[idx+1:])
 
 		// Handle nil (deletion)
@@ -1849,7 +1859,7 @@ func (r *REPL) parseDecorationSpec(spec string) (garland.DecorationEntry, string
 	}
 
 	// Simple form: just key, use cursor position
-	key := spec
+	key := stripQuotes(spec)
 	cursor := r.cursor()
 	bytePos := cursor.BytePos()
 
@@ -1870,7 +1880,7 @@ func (r *REPL) cmdUndecorate(args []string) {
 		return
 	}
 
-	key := args[0]
+	key := stripQuotes(args[0])
 
 	entry := garland.DecorationEntry{
 		Key:     key,
@@ -1948,7 +1958,7 @@ func (r *REPL) cmdGetDecoration(args []string) {
 		return
 	}
 
-	key := args[0]
+	key := stripQuotes(args[0])
 
 	addr, err := r.garland.GetDecorationPosition(key)
 	if err != nil {
