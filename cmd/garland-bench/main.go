@@ -70,26 +70,90 @@ func main() {
 	fmt.Println(result)
 	fmt.Println()
 
-	// Initialize library
-	lib, err := garland.Init(garland.LibraryOptions{
-		ColdStoragePath: coldStorage,
-		MemorySoftLimit: 256 * 1024 * 1024, // 256 MB
-		MemoryHardLimit: 512 * 1024 * 1024, // 512 MB
+	// Helper to run and print each benchmark
+	runBench := func(name string, fn func() BenchResult) {
+		fmt.Printf("  %-40s ", name+"...")
+		result := fn()
+		fmt.Printf("%v\n", result.Duration.Round(time.Millisecond))
+		results = append(results, result)
+	}
+
+	// =======================================================================
+	// TEST 1: Memory pressure detection (no cold storage, low memory limit)
+	// =======================================================================
+	fmt.Println("Testing memory pressure detection (no cold storage)...")
+	fmt.Println()
+
+	libNoCold, err := garland.Init(garland.LibraryOptions{
+		// No ColdStoragePath - can't evict anywhere
+		MemorySoftLimit: 100 * 1024 * 1024, // 100 MB
+		MemoryHardLimit: 200 * 1024 * 1024, // 200 MB
 	})
 	if err != nil {
 		fmt.Printf("Failed to init library: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Run benchmarks
-	fmt.Println("Running benchmarks...")
+	fmt.Println("  Opening 1GB file with 200MB limit and no cold storage...")
+	fmt.Println("  (This should trigger memory pressure)")
+	gPressure, err := libNoCold.Open(garland.FileOptions{
+		FilePath:     testFile,
+		LoadingStyle: garland.MemoryOnly,
+	})
+	if err != nil {
+		fmt.Printf("  Open error: %v\n", err)
+	} else {
+		// Wait a bit for loading to progress and hit the limit
+		for i := 0; i < 50; i++ {
+			time.Sleep(100 * time.Millisecond)
+			stats := gPressure.MemoryUsage()
+			if stats.UnderPressure {
+				fmt.Printf("  Memory pressure detected after loading %d MB\n", stats.MemoryBytes/(1024*1024))
+				break
+			}
+			if gPressure.ByteCount().Complete {
+				break
+			}
+		}
+
+		stats := gPressure.MemoryUsage()
+		fmt.Printf("  Final state: %d MB loaded, pressure=%v\n", stats.MemoryBytes/(1024*1024), stats.UnderPressure)
+
+		// Check the error helper
+		if err := libNoCold.CheckMemoryPressureError(); err != nil {
+			fmt.Printf("  CheckMemoryPressureError() returned: %v\n", err)
+		} else {
+			fmt.Println("  CheckMemoryPressureError() returned: nil (no pressure)")
+		}
+
+		gPressure.Close()
+	}
 	fmt.Println()
 
-	// Open file benchmarks
-	results = append(results, benchOpenFile(lib, testFile, garland.MemoryOnly, "Open file (memory only)"))
-	results = append(results, benchOpenFile(lib, testFile, garland.AllStorage, "Open file (all storage tiers)"))
+	// =======================================================================
+	// TEST 2: Normal benchmarks with cold storage
+	// =======================================================================
+	fmt.Println("Running benchmarks with cold storage enabled...")
+	fmt.Println()
 
-	// Open and perform operations
+	// Initialize library with generous memory for benchmark
+	lib, err := garland.Init(garland.LibraryOptions{
+		ColdStoragePath: coldStorage,
+		MemorySoftLimit: 2 * 1024 * 1024 * 1024, // 2 GB
+		MemoryHardLimit: 4 * 1024 * 1024 * 1024, // 4 GB
+	})
+	if err != nil {
+		fmt.Printf("Failed to init library: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Open file benchmark
+	fmt.Println("File opening:")
+	runBench("Open file (all storage tiers)", func() BenchResult {
+		return benchOpenFile(lib, testFile, garland.AllStorage, "Open file (all storage tiers)")
+	})
+
+	// Open file for remaining operations
 	fmt.Println("\nOpening file for operation benchmarks...")
 	g, err := lib.Open(garland.FileOptions{
 		FilePath:     testFile,
@@ -100,33 +164,62 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Wait for file to be ready
+	for !g.ByteCount().Complete {
+		time.Sleep(100 * time.Millisecond)
+	}
+	fmt.Printf("File ready: %d bytes, %d lines\n\n", g.ByteCount().Value, g.LineCount().Value)
+
 	// Cursor operations
-	results = append(results, benchSeekOperations(g))
-	results = append(results, benchReadOperations(g))
+	fmt.Println("Cursor operations:")
+	runBench("Seek operations (byte)", func() BenchResult { return benchSeekOperations(g) })
+	runBench("Read operations (64KB chunks)", func() BenchResult { return benchReadOperations(g) })
 
 	// Edit operations
-	results = append(results, benchSmallInserts(g))
-	results = append(results, benchSmallDeletes(g))
-	results = append(results, benchMediumInserts(g))
-	results = append(results, benchLargeInserts(g))
+	fmt.Println("\nEdit operations:")
+	runBench("Small inserts (100 bytes x 1000)", func() BenchResult { return benchSmallInserts(g) })
+	runBench("Small deletes (100 bytes x 1000)", func() BenchResult { return benchSmallDeletes(g) })
+	runBench("Medium inserts (10KB x 100)", func() BenchResult { return benchMediumInserts(g) })
+	runBench("Large inserts (1MB x 10)", func() BenchResult { return benchLargeInserts(g) })
 
 	// Transaction operations
-	results = append(results, benchTransactions(g))
+	fmt.Println("\nTransaction operations:")
+	runBench("Transaction cycles", func() BenchResult { return benchTransactions(g) })
 
 	// Search operations
-	results = append(results, benchSearch(g))
-	results = append(results, benchSearchAll(g))
+	fmt.Println("\nSearch operations:")
+	runBench("Search (find first)", func() BenchResult { return benchSearch(g) })
+	runBench("Search all occurrences", func() BenchResult { return benchSearchAll(g) })
 
 	// Undo operations
-	results = append(results, benchUndoRedo(g))
+	fmt.Println("\nUndo/redo operations:")
+	runBench("Undo/redo cycles", func() BenchResult { return benchUndoRedo(g) })
 
 	// Decoration operations
-	results = append(results, benchDecorations(g))
+	fmt.Println("\nDecoration operations:")
+	runBench("Decoration add/query/remove", func() BenchResult { return benchDecorations(g) })
 
-	// Memory management
-	results = append(results, benchChill(g))
-
+	// Memory management - use a separate library with lower limits
+	fmt.Println("\nMemory management:")
 	g.Close()
+
+	// Re-init with lower memory to test chilling
+	lib2, _ := garland.Init(garland.LibraryOptions{
+		ColdStoragePath: coldStorage,
+		MemorySoftLimit: 256 * 1024 * 1024, // 256 MB
+		MemoryHardLimit: 512 * 1024 * 1024, // 512 MB
+	})
+	g2, _ := lib2.Open(garland.FileOptions{
+		FilePath:     testFile,
+		LoadingStyle: garland.AllStorage,
+	})
+	if g2 != nil {
+		for !g2.ByteCount().Complete {
+			time.Sleep(100 * time.Millisecond)
+		}
+		runBench("Chill unused data", func() BenchResult { return benchChill(g2) })
+		g2.Close()
+	}
 
 	// Print summary
 	fmt.Println("\n" + "=")

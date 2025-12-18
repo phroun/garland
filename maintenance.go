@@ -13,6 +13,7 @@ type MemoryStats struct {
 	InMemoryLeaves   int   // count of leaves with data in memory
 	ColdStoredLeaves int   // count of leaves with data in cold storage
 	WarmStoredLeaves int   // count of leaves with data in warm storage
+	UnderPressure    bool  // true if hard limit exceeded and can't reduce
 }
 
 // MaintenanceStats contains statistics from a maintenance run.
@@ -33,6 +34,9 @@ func (g *Garland) MemoryUsage() MemoryStats {
 	if g.lib != nil {
 		stats.SoftLimit = g.lib.memorySoftLimit
 		stats.HardLimit = g.lib.memoryHardLimit
+		g.lib.mu.RLock()
+		stats.UnderPressure = g.lib.memoryPressure
+		g.lib.mu.RUnlock()
 	}
 
 	// Count leaves by storage state
@@ -252,6 +256,7 @@ func (lib *Library) runMaintenanceTick() {
 
 // CheckMemoryPressure checks if memory limits are exceeded and performs
 // appropriate maintenance. Called after mutations.
+// Sets memoryPressure flag if hard limit exceeded and can't be reduced.
 func (g *Garland) CheckMemoryPressure() MaintenanceStats {
 	if g.lib == nil {
 		return MaintenanceStats{}
@@ -267,12 +272,28 @@ func (g *Garland) CheckMemoryPressure() MaintenanceStats {
 			for currentUsage > g.lib.memoryHardLimit {
 				s := g.lib.IncrementalChill(g.lib.chillBudgetPerTick)
 				if s.NodesChilled == 0 {
+					// Can't reduce memory - set pressure flag
+					g.lib.mu.Lock()
+					g.lib.memoryPressure = true
+					g.lib.mu.Unlock()
 					break
 				}
 				stats.NodesChilled += s.NodesChilled
 				stats.BytesChilled += s.BytesChilled
 				currentUsage = g.lib.TotalMemoryUsage()
 			}
+
+			// Clear pressure flag if we got under the limit
+			if currentUsage <= g.lib.memoryHardLimit {
+				g.lib.mu.Lock()
+				g.lib.memoryPressure = false
+				g.lib.mu.Unlock()
+			}
+		} else {
+			// Under hard limit - clear pressure flag
+			g.lib.mu.Lock()
+			g.lib.memoryPressure = false
+			g.lib.mu.Unlock()
 		}
 	}
 
@@ -287,6 +308,24 @@ func (g *Garland) CheckMemoryPressure() MaintenanceStats {
 	}
 
 	return stats
+}
+
+// MemoryPressure returns true if the library is under memory pressure
+// (hard limit exceeded and cannot be reduced). Applications should check
+// this before performing memory-intensive operations.
+func (lib *Library) MemoryPressure() bool {
+	lib.mu.RLock()
+	defer lib.mu.RUnlock()
+	return lib.memoryPressure
+}
+
+// CheckMemoryPressureError returns ErrMemoryPressure if the library is under
+// memory pressure, nil otherwise. Useful for checking before mutations.
+func (lib *Library) CheckMemoryPressureError() error {
+	if lib.MemoryPressure() {
+		return ErrMemoryPressure
+	}
+	return nil
 }
 
 // touchSnapshot marks a snapshot as recently accessed.
