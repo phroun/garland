@@ -3169,7 +3169,7 @@ func (g *Garland) countLinesBeforeByteInternal(node *Node, snap *NodeSnapshot, t
 // Mutation operations
 
 func (g *Garland) insertBytesAt(c *Cursor, pos int64, data []byte, decorations []RelativeDecoration, insertBefore bool) (ChangeResult, error) {
-	if len(data) == 0 {
+	if len(data) == 0 && len(decorations) == 0 {
 		return ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}, nil
 	}
 

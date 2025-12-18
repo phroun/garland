@@ -460,8 +460,10 @@ func (g *Garland) insertInternal(
 
 	leftEnd := offset + leftSnap.byteCount
 
-	// Use < so insertion at exact boundary goes to right subtree (start of next node)
-	if insertPos < leftEnd {
+	// Navigation depends on insertBefore flag when at exact boundary:
+	// - insertBefore=false: go RIGHT (insert at start of right subtree, decorations stay)
+	// - insertBefore=true: go LEFT (insert at end of left subtree, pushing right content)
+	if insertPos < leftEnd || (insertPos == leftEnd && insertBefore) {
 		// Insert into left subtree
 		newLeftID, err := g.insertInternal(leftNode, leftSnap, insertPos, offset, data, decorations, insertBefore)
 		if err != nil {

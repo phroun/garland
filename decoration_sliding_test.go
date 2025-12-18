@@ -600,8 +600,15 @@ func TestDecorationInsertBeforeFlag(t *testing.T) {
 		if content := readContent(); content != "ABCXXDEF" {
 			t.Errorf("Content: got %q, want %q", content, "ABCXXDEF")
 		}
-		t.Logf("After insert 'XX' at 3 (insertBefore=false): %q", readContent())
-		t.Log("Expected: mark_at_D stays at 3 (now points to 'X')")
+
+		// Verify decoration position
+		pos, err := g.GetDecorationPosition("mark_at_D")
+		if err != nil {
+			t.Fatalf("GetDecorationPosition failed: %v", err)
+		}
+		if pos.Byte != 3 {
+			t.Errorf("mark_at_D position: got %d, want 3 (should stay with insertBefore=false)", pos.Byte)
+		}
 	})
 
 	t.Run("insertBefore=true - decoration at insert point slides", func(t *testing.T) {
@@ -639,8 +646,15 @@ func TestDecorationInsertBeforeFlag(t *testing.T) {
 		if content := readContent(); content != "ABCXXDEF" {
 			t.Errorf("Content: got %q, want %q", content, "ABCXXDEF")
 		}
-		t.Logf("After insert 'XX' at 3 (insertBefore=true): %q", readContent())
-		t.Log("Expected: mark_at_D slides to 5 (still points to 'D')")
+
+		// Verify decoration position
+		pos, err := g.GetDecorationPosition("mark_at_D")
+		if err != nil {
+			t.Fatalf("GetDecorationPosition failed: %v", err)
+		}
+		if pos.Byte != 5 {
+			t.Errorf("mark_at_D position: got %d, want 5 (should slide with insertBefore=true)", pos.Byte)
+		}
 	})
 
 	t.Run("mixed - decorations before/at/after with both flags", func(t *testing.T) {
@@ -682,7 +696,31 @@ func TestDecorationInsertBeforeFlag(t *testing.T) {
 			t.Errorf("Content: got %q, want %q", content, "ABCDXXEFGH")
 		}
 		t.Logf("After insert 'XX' at 4 (insertBefore=true): %q", readContent())
-		t.Log("Expected with insertBefore=true: before@3, at@6, after@7")
+
+		// Verify decoration positions
+		beforePos, err := g.GetDecorationPosition("before")
+		if err != nil {
+			t.Fatalf("GetDecorationPosition(before) failed: %v", err)
+		}
+		if beforePos.Byte != 3 {
+			t.Errorf("Decoration 'before': got position %d, want 3 (strictly before insert)", beforePos.Byte)
+		}
+
+		atPos, err := g.GetDecorationPosition("at")
+		if err != nil {
+			t.Fatalf("GetDecorationPosition(at) failed: %v", err)
+		}
+		if atPos.Byte != 6 {
+			t.Errorf("Decoration 'at': got position %d, want 6 (should slide with insertBefore=true)", atPos.Byte)
+		}
+
+		afterPos, err := g.GetDecorationPosition("after")
+		if err != nil {
+			t.Fatalf("GetDecorationPosition(after) failed: %v", err)
+		}
+		if afterPos.Byte != 7 {
+			t.Errorf("Decoration 'after': got position %d, want 7 (strictly after insert)", afterPos.Byte)
+		}
 	})
 }
 
