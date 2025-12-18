@@ -208,6 +208,26 @@ go test ./...
 
 Tests are located alongside source files following Go conventions.
 
+## Benchmarking
+
+A stress test tool is included that creates a 1GB test file and measures performance of common operations:
+
+```bash
+go run ./cmd/garland-bench
+```
+
+The benchmark tests:
+- File generation and opening (memory-only and tiered storage modes)
+- Seek and read operations across the file
+- Insert and delete operations at various sizes
+- Transaction cycles
+- Search operations
+- Undo/redo performance
+- Decoration operations
+- Memory management (chill to cold storage)
+
+Expected runtime is 2-5 minutes on a modern machine (e.g., M2 MacBook). The benchmark creates temporary files that are automatically cleaned up on completion.
+
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
