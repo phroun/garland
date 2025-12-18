@@ -48,7 +48,7 @@ func main() {
 
 	// Main loop
 	for {
-		fmt.Print("garland> ")
+		fmt.Print("\x1b[1;97mgarland>\x1b[0m ")
 		input, err := repl.reader.ReadString('\n')
 		if err != nil {
 			fmt.Println("\nGoodbye!")
