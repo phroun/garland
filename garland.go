@@ -542,6 +542,9 @@ func (lib *Library) Open(options FileOptions) (*Garland, error) {
 	lib.activeGarlands[g.id] = g
 	lib.mu.Unlock()
 
+	// Check memory pressure after loading (will set pressure flag if over limit and can't evict)
+	g.CheckMemoryPressure()
+
 	return g, nil
 }
 
@@ -2435,6 +2438,9 @@ func (g *Garland) channelLoaderRoutine() {
 				g.streamCond.Broadcast()
 
 				g.mu.Unlock()
+
+				// Check memory pressure after loading completes
+				g.CheckMemoryPressure()
 				return
 			}
 			if len(data) > 0 {
