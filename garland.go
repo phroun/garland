@@ -1662,15 +1662,10 @@ func (g *Garland) pruneCursorHistory(cursor *Cursor, fork ForkID, prunedUpTo Rev
 
 // DeleteFork soft-deletes a fork, preventing further navigation to it.
 // The fork's data remains until no other forks depend on it.
-// Cannot delete the current fork or fork 0.
+// Cannot delete the current fork or the last remaining non-deleted fork.
 func (g *Garland) DeleteFork(fork ForkID) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-
-	// Can't delete fork 0
-	if fork == 0 {
-		return ErrInvalidPosition
-	}
 
 	// Can't delete current fork
 	if fork == g.currentFork {
@@ -1685,6 +1680,17 @@ func (g *Garland) DeleteFork(fork ForkID) error {
 	// Already deleted?
 	if forkInfo.Deleted {
 		return nil
+	}
+
+	// Can't delete if it would leave no non-deleted forks
+	nonDeletedCount := 0
+	for _, f := range g.forks {
+		if !f.Deleted && f.ID != fork {
+			nonDeletedCount++
+		}
+	}
+	if nonDeletedCount == 0 {
+		return ErrInvalidPosition
 	}
 
 	// Mark as deleted

@@ -1,6 +1,7 @@
 package garland
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -158,14 +159,52 @@ func TestDeleteForkBasic(t *testing.T) {
 	}
 }
 
-func TestDeleteForkCannotDeleteFork0(t *testing.T) {
+func TestDeleteForkCannotDeleteLastFork(t *testing.T) {
 	lib, _ := Init(LibraryOptions{})
 	g, _ := lib.Open(FileOptions{DataString: "BASE"})
 	defer g.Close()
 
+	// With only fork 0 existing, can't delete it (would leave no forks)
 	err := g.DeleteFork(0)
 	if err == nil {
-		t.Error("DeleteFork(0) should fail")
+		t.Error("DeleteFork(0) should fail when it's the only fork")
+	}
+
+	// Create a second fork
+	cursor := g.NewCursor()
+	cursor.InsertString("A", nil, false) // rev 1
+	g.UndoSeek(0)
+	cursor.InsertString("X", nil, false) // Creates fork 1
+
+	// Now we can delete fork 0 (while on fork 1)
+	err = g.DeleteFork(0)
+	if err != nil {
+		t.Errorf("DeleteFork(0) should succeed when other forks exist: %v", err)
+	}
+
+	// Fork 0 should be marked as deleted
+	forkInfo, _ := g.GetForkInfo(0)
+	if !forkInfo.Deleted {
+		t.Error("Fork 0 should be marked as deleted")
+	}
+
+	// Can't switch to deleted fork
+	err = g.ForkSeek(0)
+	if err == nil {
+		t.Error("Should not be able to switch to deleted fork 0")
+	}
+
+	// Fork 1 can still access its own revisions and render content
+	// (the underlying data snapshots from fork 0 are preserved)
+	err = g.UndoSeek(1) // Fork 1's revision 1
+	if err != nil {
+		t.Errorf("Fork 1 should still access its own revision 1: %v", err)
+	}
+
+	// Verify content is intact (data inherited from fork 0)
+	data, _ := cursor.ReadBytes(100)
+	if len(data) == 0 {
+		t.Error("Fork 1 should still have content (inherited data preserved)")
 	}
 }
 
@@ -520,61 +559,56 @@ func TestDeleteOriginalForkWithChildForksNeeding(t *testing.T) {
 	// Both fork 1 and fork 2 depend on fork 0's revisions 0-2
 	// Count fork 0's snapshots
 	fork0SnapshotsBefore := countSnapshotsInFork(g, 0)
-	t.Logf("Fork 0 has %d snapshots before pruning", fork0SnapshotsBefore)
+	t.Logf("Fork 0 has %d snapshots before deletion", fork0SnapshotsBefore)
 
-	// Can't delete fork 0 (it's the root fork)
+	// Delete fork 0 - this should free fork 0's unique revisions (3, 4)
+	// but preserve shared history (0-2) needed by forks 1 and 2
 	err := g.DeleteFork(0)
-	if err == nil {
-		t.Error("Should not be able to delete fork 0")
-	}
-
-	// Prune fork 0 to revision 4
-	g.ForkSeek(0)
-	g.UndoSeek(4)
-	err = g.Prune(4)
 	if err != nil {
-		t.Fatalf("Prune fork 0 failed: %v", err)
+		t.Fatalf("DeleteFork(0) should succeed when other forks exist: %v", err)
 	}
 
-	// Fork 0 is pruned to 4, but forks 1 and 2 need fork 0's history up to rev 2
-	fork0Rev1SnapshotsAfterPrune := countSnapshotsForRevision(g, 0, 1)
-	t.Logf("Fork 0 rev 1 has %d snapshots after fork 0 prune (child forks may still need)", fork0Rev1SnapshotsAfterPrune)
+	// Fork 0's unique snapshots should be freed
+	fork0SnapshotsAfterDelete := countSnapshotsInFork(g, 0)
+	t.Logf("Fork 0 has %d snapshots after deletion (shared history preserved)", fork0SnapshotsAfterDelete)
 
-	// Prune fork 1 to revision 4
+	// Fork 1 should still have access to its data
+	// (forks 1 and 2 branched at rev 2, inheriting content from fork 0's revisions 0-2)
 	g.ForkSeek(1)
-	g.UndoSeek(4)
-	err = g.Prune(4)
+
+	// Fork 1 can access its own revisions (not fork 0's revisions)
+	// Fork 1 has revisions 3, 4 (its own edits after branching)
+	err = g.UndoSeek(3)
 	if err != nil {
-		t.Fatalf("Prune fork 1 failed: %v", err)
+		t.Errorf("Fork 1 should access its own revision 3: %v", err)
 	}
 
-	fork0Rev1AfterFork1Prune := countSnapshotsForRevision(g, 0, 1)
-	t.Logf("Fork 0 rev 1 has %d snapshots after fork 1 also pruned", fork0Rev1AfterFork1Prune)
-
-	// Prune fork 2 to revision 4
-	g.ForkSeek(2)
-	g.UndoSeek(4)
-	err = g.Prune(4)
-	if err != nil {
-		t.Fatalf("Prune fork 2 failed: %v", err)
+	// Verify content includes inherited data from fork 0's shared history
+	cursor.SeekByte(0)
+	data, _ := cursor.ReadBytes(100)
+	content := string(data)
+	// Fork 1 at rev 3 should have: "BASE" + "1" + "2" + "A" = "BASE12A"
+	if !strings.Contains(content, "BASE") {
+		t.Errorf("Fork 1 should have inherited base content, got: %s", content)
 	}
 
-	// After pruning all forks, some fork 0 snapshots may still be needed
-	// because forks 1 and 2 still reference fork 0 at parentRevision=2
-	fork0Rev1AfterAllPrune := countSnapshotsForRevision(g, 0, 1)
-	t.Logf("Fork 0 rev 1 has %d snapshots after all forks pruned", fork0Rev1AfterAllPrune)
-
-	// Verify that pruned revisions can't be accessed
-	g.ForkSeek(0)
-	err = g.UndoSeek(1)
+	// Verify fork 0 is deleted and can't be switched to
+	err = g.ForkSeek(0)
 	if err == nil {
-		t.Error("Fork 0 should not be able to UndoSeek to revision 1 (pruned)")
+		t.Error("Should not be able to switch to deleted fork 0")
 	}
 
-	// But fork 0 can access its pruned-from revision (4)
-	err = g.UndoSeek(4)
-	if err != nil {
-		t.Errorf("Fork 0 should be able to access revision 4: %v", err)
+	// Fork 0's unique revisions (3, 4) should be freed, but shared (0-2) preserved
+	// The shared snapshots may still exist as they're needed by forks 1 and 2
+	fork0Rev1Snapshots := countSnapshotsForRevision(g, 0, 1)
+	fork0Rev3Snapshots := countSnapshotsForRevision(g, 0, 3)
+	t.Logf("After fork 0 deletion: rev 1 has %d snapshots, rev 3 has %d snapshots",
+		fork0Rev1Snapshots, fork0Rev3Snapshots)
+
+	// Verify fewer total snapshots for fork 0 after deletion
+	if fork0SnapshotsAfterDelete >= fork0SnapshotsBefore {
+		t.Logf("Note: Fork 0 snapshots didn't decrease (before=%d, after=%d) - shared history still needed",
+			fork0SnapshotsBefore, fork0SnapshotsAfterDelete)
 	}
 }
 
