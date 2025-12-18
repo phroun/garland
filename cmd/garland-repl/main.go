@@ -1266,7 +1266,7 @@ func (r *REPL) cmdDump() {
 	}
 
 	// Build output with markers inserted at their positions
-	// ANSI: \x1b[1;32m = bold green (cursors), \x1b[41m = red background (decorations), \x1b[0m = reset
+	// ANSI: \x1b[1;32m = bold green (cursors), \x1b[2;31m = dark red (decorations), \x1b[0m = reset
 	var output strings.Builder
 	dataStr := string(data)
 	lastPos := int64(0)
@@ -1303,9 +1303,9 @@ func (r *REPL) cmdDump() {
 			output.WriteString(")\x1b[0m")
 		}
 
-		// Output decoration marker(s) - red background with asterisks
+		// Output decoration marker(s) - dark red foreground with asterisks
 		if len(decorationsHere) > 0 {
-			output.WriteString("\x1b[41m*")
+			output.WriteString("\x1b[2;31m*")
 			output.WriteString(strings.Join(decorationsHere, ","))
 			output.WriteString("*\x1b[0m")
 		}
