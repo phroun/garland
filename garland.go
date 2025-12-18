@@ -269,10 +269,37 @@ type ForkDivergence struct {
 	Direction     DivergenceDirection // relationship to current fork
 }
 
-// DecorationCacheEntry is a hint for finding a decoration quickly.
+// CacheTier indicates the priority level of a cached decoration.
+type CacheTier int
+
+const (
+	// CacheTierWarm is for decorations seen during traversal but not actively used.
+	CacheTierWarm CacheTier = iota
+	// CacheTierHot is for decorations actively requested by the application.
+	CacheTierHot
+)
+
+// DecorationCacheEntry caches the last known location of a decoration.
+// The presence of an entry indicates the key has been used at some point.
+// The cached location is a hint - it may be stale if fork/revision differs.
 type DecorationCacheEntry struct {
-	NodeID         NodeID
-	RelativeOffset int64
+	// Last known location (hint for search)
+	LastKnownFork   ForkID
+	LastKnownRev    RevisionID
+	LastKnownNode   NodeID     // 0 means "confirmed not present at this fork/revision"
+	LastKnownOffset int64
+
+	// Cache management
+	Tier       CacheTier // Hot = actively used, Warm = seen during traversal
+	LastAccess time.Time
+}
+
+// pendingDecorationUpdate holds information for cache updates that will be
+// applied when recordMutation is called with the new revision number.
+type pendingDecorationUpdate struct {
+	Key    string
+	NodeID NodeID
+	Offset int64
 }
 
 // TransactionState holds the state of an active transaction.
@@ -331,6 +358,9 @@ type Garland struct {
 
 	// Decoration cache (hints only)
 	decorationCache map[string]*DecorationCacheEntry
+
+	// Pending decoration cache updates (applied when recordMutation is called)
+	pendingDecorationUpdates []pendingDecorationUpdate
 
 	// Loading state
 	loader         *Loader
@@ -1169,6 +1199,22 @@ func (g *Garland) thawSnapshot(nodeID NodeID, forkRev ForkRevision, snap *NodeSn
 			}
 		} else {
 			snap.decorations = decodeDecorations(decData)
+		}
+
+		// Add restored decorations to cache for existence checking
+		// Note: The offset is unknown, so we set it to 0 as a hint
+		// GetDecorationPosition will update with correct offset on access
+		for _, d := range snap.decorations {
+			if _, exists := g.decorationCache[d.Key]; !exists {
+				g.decorationCache[d.Key] = &DecorationCacheEntry{
+					LastKnownFork:   forkRev.Fork,
+					LastKnownRev:    forkRev.Revision,
+					LastKnownNode:   nodeID,
+					LastKnownOffset: 0, // Unknown, will be corrected on access
+					Tier:            CacheTierWarm,
+					LastAccess:      time.Now(),
+				}
+			}
 		}
 	}
 
@@ -4188,6 +4234,9 @@ func (g *Garland) recordMutation() ChangeResult {
 		StreamKnownBytes: streamKnown,
 	}
 
+	// Apply pending decoration cache updates with the correct revision
+	g.applyPendingDecorationUpdates(g.currentFork, g.currentRevision)
+
 	// Update cursor version tracking to new revision
 	for _, cursor := range g.cursors {
 		cursor.lastFork = g.currentFork
@@ -4704,21 +4753,192 @@ func (g *Garland) Decorate(entries []DecorationEntry) (ChangeResult, error) {
 }
 
 // GetDecorationPosition returns the current position of a decoration by key.
+// Uses registry-based O(1) existence check and cached location hints for fast lookup.
 func (g *Garland) GetDecorationPosition(key string) (AbsoluteAddress, error) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
+
+	// O(1) existence check: if not in registry, it was never created
+	cacheEntry, exists := g.decorationCache[key]
+	if !exists {
+		return AbsoluteAddress{}, ErrDecorationNotFound
+	}
 
 	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
 	if rootSnap == nil {
 		return AbsoluteAddress{}, ErrDecorationNotFound
 	}
 
-	bytePos, found := g.findDecorationByKeyInternal(g.root, rootSnap, key, 0)
+	// During a transaction, always search the tree since decorations may have moved
+	// as a side effect of inserts/deletes (cache doesn't track these movements)
+	inTransaction := g.transaction != nil && g.transaction.hasMutations
+
+	// Check if cached location is current (same fork/revision) and not in transaction
+	if !inTransaction && cacheEntry.LastKnownFork == g.currentFork && cacheEntry.LastKnownRev == g.currentRevision {
+		// NodeID == 0 means "confirmed not present at this fork/revision"
+		if cacheEntry.LastKnownNode == 0 {
+			return AbsoluteAddress{}, ErrDecorationNotFound
+		}
+
+		// Try cached location directly - O(1) if still valid
+		if node, ok := g.nodeRegistry[cacheEntry.LastKnownNode]; ok {
+			if snap := node.snapshotAt(g.currentFork, g.currentRevision); snap != nil && snap.isLeaf {
+				for _, d := range snap.decorations {
+					if d.Key == key {
+						// Cache hit! Update access time
+						cacheEntry.LastAccess = time.Now()
+						cacheEntry.Tier = CacheTierHot
+						return ByteAddress(cacheEntry.LastKnownOffset + d.Position), nil
+					}
+				}
+			}
+		}
+	}
+
+	// Cache miss or stale - need to search the tree
+	// Use cached offset as hint for middle-out search
+	bytePos, nodeID, nodeOffset, found := g.findDecorationWithHint(key, cacheEntry.LastKnownOffset)
 	if !found {
+		// Decoration not present at this revision - mark as confirmed absent
+		cacheEntry.LastKnownFork = g.currentFork
+		cacheEntry.LastKnownRev = g.currentRevision
+		cacheEntry.LastKnownNode = 0 // 0 = confirmed not present
+		cacheEntry.LastAccess = time.Now()
 		return AbsoluteAddress{}, ErrDecorationNotFound
 	}
 
+	// Update cache with new location
+	cacheEntry.LastKnownFork = g.currentFork
+	cacheEntry.LastKnownRev = g.currentRevision
+	cacheEntry.LastKnownNode = nodeID
+	cacheEntry.LastKnownOffset = nodeOffset
+	cacheEntry.Tier = CacheTierHot
+	cacheEntry.LastAccess = time.Now()
+
 	return ByteAddress(bytePos), nil
+}
+
+// findDecorationWithHint searches for a decoration using a position hint.
+// Starts near the hint and expands outward (middle-out search).
+// Returns absolute byte position, containing node ID, node's byte offset, and whether found.
+func (g *Garland) findDecorationWithHint(key string, hintOffset int64) (int64, NodeID, int64, bool) {
+	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
+	if rootSnap == nil {
+		return 0, 0, 0, false
+	}
+
+	// Clamp hint to valid range
+	if hintOffset < 0 {
+		hintOffset = 0
+	}
+	if hintOffset > rootSnap.byteCount {
+		hintOffset = rootSnap.byteCount
+	}
+
+	// Find the leaf containing the hint position
+	hintLeaf, hintLeafOffset := g.findLeafAtOffset(hintOffset)
+	if hintLeaf == nil {
+		// Fall back to full tree search
+		pos, found := g.findDecorationByKeyInternal(g.root, rootSnap, key, 0)
+		if found {
+			// Need to find which node contains this - do another search
+			leaf, leafOffset := g.findLeafAtOffset(pos)
+			if leaf != nil {
+				return pos, leaf.id, leafOffset, true
+			}
+		}
+		return 0, 0, 0, false
+	}
+
+	// Check hint leaf first
+	hintSnap := hintLeaf.snapshotAt(g.currentFork, g.currentRevision)
+	if hintSnap != nil {
+		for _, d := range hintSnap.decorations {
+			if d.Key == key {
+				return hintLeafOffset + d.Position, hintLeaf.id, hintLeafOffset, true
+			}
+		}
+	}
+
+	// Middle-out search: alternate between left and right of hint
+	// This is a simplification - we'll just do a full tree search for now
+	// TODO: Implement true middle-out search for even better locality
+	pos, found := g.findDecorationByKeyInternal(g.root, rootSnap, key, 0)
+	if found {
+		// Find containing node for cache update
+		leaf, leafOffset := g.findLeafAtOffset(pos)
+		if leaf != nil {
+			return pos, leaf.id, leafOffset, true
+		}
+		return pos, 0, 0, true
+	}
+	return 0, 0, 0, false
+}
+
+// updateDecorationCacheForNode queues decoration cache updates to be applied when
+// recordMutation is called. This ensures the cache is updated with the correct
+// revision number (which isn't known until after the mutation completes).
+func (g *Garland) updateDecorationCacheForNode(nodeID NodeID, nodeOffset int64, decorations []Decoration) {
+	for _, d := range decorations {
+		g.pendingDecorationUpdates = append(g.pendingDecorationUpdates, pendingDecorationUpdate{
+			Key:    d.Key,
+			NodeID: nodeID,
+			Offset: nodeOffset,
+		})
+	}
+}
+
+// applyPendingDecorationUpdates applies queued cache updates with the given revision.
+func (g *Garland) applyPendingDecorationUpdates(fork ForkID, rev RevisionID) {
+	now := time.Now()
+	for _, update := range g.pendingDecorationUpdates {
+		g.decorationCache[update.Key] = &DecorationCacheEntry{
+			LastKnownFork:   fork,
+			LastKnownRev:    rev,
+			LastKnownNode:   update.NodeID,
+			LastKnownOffset: update.Offset,
+			Tier:            CacheTierHot,
+			LastAccess:      now,
+		}
+	}
+	g.pendingDecorationUpdates = g.pendingDecorationUpdates[:0] // Clear slice, keep capacity
+}
+
+// findLeafAtOffset finds the leaf node containing the given byte offset.
+// Returns the leaf node and the byte offset at the start of that leaf.
+func (g *Garland) findLeafAtOffset(offset int64) (*Node, int64) {
+	node := g.root
+	snap := node.snapshotAt(g.currentFork, g.currentRevision)
+	if snap == nil {
+		return nil, 0
+	}
+
+	currentOffset := int64(0)
+	for !snap.isLeaf {
+		leftNode := g.nodeRegistry[snap.leftID]
+		leftSnap := leftNode.snapshotAt(g.currentFork, g.currentRevision)
+		if leftSnap == nil {
+			return nil, 0
+		}
+
+		if offset < currentOffset+leftSnap.byteCount {
+			// Go left
+			node = leftNode
+			snap = leftSnap
+		} else {
+			// Go right
+			currentOffset += leftSnap.byteCount
+			rightNode := g.nodeRegistry[snap.rightID]
+			rightSnap := rightNode.snapshotAt(g.currentFork, g.currentRevision)
+			if rightSnap == nil {
+				return nil, 0
+			}
+			node = rightNode
+			snap = rightSnap
+		}
+	}
+
+	return node, currentOffset
 }
 
 // findDecorationByKeyInternal recursively searches for a decoration by key.
@@ -5094,6 +5314,15 @@ func (g *Garland) addDecorationInternal(key string, bytePos int64) (NodeID, erro
 	g.nodeRegistry[newLeaf.id] = newLeaf
 	newSnap := createLeafSnapshot(snap.data, newDecs, snap.originalFileOffset)
 	newLeaf.setSnapshot(g.currentFork, g.currentRevision, newSnap)
+
+	// Queue cache update to be applied when recordMutation is called
+	// Note: Offset is the absolute byte position where the leaf starts (LeafByteStart),
+	// not the relative position within the leaf (ByteOffset)
+	g.pendingDecorationUpdates = append(g.pendingDecorationUpdates, pendingDecorationUpdate{
+		Key:    key,
+		NodeID: newLeaf.id,
+		Offset: leafResult.LeafByteStart,
+	})
 
 	// Rebuild the tree from this leaf up to the root
 	return g.rebuildFromLeaf(leafResult, newLeaf.id)
