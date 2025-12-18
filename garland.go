@@ -572,9 +572,6 @@ func (g *Garland) Save() error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	// Collect all data from the tree
-	data := g.collectLeaves(g.root.id)
-
 	// Determine which filesystem to use
 	fs := g.sourceFS
 	if fs == nil {
@@ -587,8 +584,8 @@ func (g *Garland) Save() error {
 		g.sourceHandle = nil
 	}
 
-	// Write the file
-	if err := fs.WriteFile(g.sourcePath, data); err != nil {
+	// Stream write to file
+	if err := g.streamWriteToFile(fs, g.sourcePath); err != nil {
 		return err
 	}
 
@@ -611,10 +608,64 @@ func (g *Garland) SaveAs(fs FileSystemInterface, name string) error {
 	}
 
 	g.mu.RLock()
-	data := g.collectLeaves(g.root.id)
-	g.mu.RUnlock()
+	defer g.mu.RUnlock()
 
-	return fs.WriteFile(name, data)
+	return g.streamWriteToFile(fs, name)
+}
+
+// streamWriteToFile writes the document to a file using streaming (no full materialization).
+func (g *Garland) streamWriteToFile(fs FileSystemInterface, path string) error {
+	// Open file for writing
+	handle, err := fs.Open(path, OpenModeWrite)
+	if err != nil {
+		return err
+	}
+	defer fs.Close(handle)
+
+	// Truncate the file
+	if err := fs.Truncate(handle, 0); err != nil {
+		// Truncate might not be supported, try seeking to start
+		if err := fs.SeekByte(handle, 0); err != nil {
+			return err
+		}
+	}
+
+	// Stream write leaf data
+	return g.streamWriteNode(fs, handle, g.root.id)
+}
+
+// streamWriteNode recursively writes node data to a file handle.
+func (g *Garland) streamWriteNode(fs FileSystemInterface, handle FileHandle, nodeID NodeID) error {
+	node := g.nodeRegistry[nodeID]
+	if node == nil {
+		return nil
+	}
+
+	snap := node.snapshotAt(g.currentFork, g.currentRevision)
+	if snap == nil {
+		return nil
+	}
+
+	if snap.isLeaf {
+		// Thaw if needed
+		if snap.storageState != StorageMemory {
+			forkRev := ForkRevision{g.currentFork, g.currentRevision}
+			if err := g.thawSnapshot(nodeID, forkRev, snap); err != nil {
+				return err
+			}
+		}
+		// Write leaf data directly to file
+		if len(snap.data) > 0 {
+			return fs.WriteBytes(handle, snap.data)
+		}
+		return nil
+	}
+
+	// Internal node: recurse left then right
+	if err := g.streamWriteNode(fs, handle, snap.leftID); err != nil {
+		return err
+	}
+	return g.streamWriteNode(fs, handle, snap.rightID)
 }
 
 // Chill moves data to cold storage based on the specified aggressiveness level.
