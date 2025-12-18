@@ -295,6 +295,16 @@ func (r *REPL) handleCommand(input string) bool {
 	case "snapshots":
 		r.cmdSnapshots()
 
+	// Optimized region commands
+	case "checkpoint":
+		r.cmdCheckpoint()
+
+	case "region":
+		r.cmdRegion(args)
+
+	case "cursormode":
+		r.cmdCursorMode(args)
+
 	default:
 		fmt.Printf("Unknown command: %s. Type 'help' for available commands.\n", cmd)
 	}
@@ -446,6 +456,18 @@ MEMORY MANAGEMENT:
 Note: Memory management is automatic when soft/hard limits are configured in
 LibraryOptions. These commands allow manual intervention for debugging.
 
+OPTIMIZED REGIONS:
+  checkpoint                Commit all active cursor regions to tree
+  region                    Show current cursor's region info
+  region begin <s> <e>      Create region from byte s to e for current cursor
+  cursormode                Show current cursor mode
+  cursormode human          Auto-create regions on edit (default)
+  cursormode process        Use explicit transactions, no auto-regions
+
+Note: Optimized regions batch rapid edits in memory before committing to the
+rope tree. Human cursors auto-manage regions; process cursors require explicit
+transactions. Region serial numbers help track lifecycle for debugging.
+
 OTHER:
   help                      Show this help message
   quit, exit                Exit the REPL
@@ -567,8 +589,16 @@ func (r *REPL) cmdCursor(args []string) {
 					marker = "> "
 				}
 				line, lineRune := c.LinePos()
-				fmt.Printf("%s%s: byte=%d, rune=%d, line=%d:%d\n",
-					marker, name, c.BytePos(), c.RunePos(), line, lineRune)
+				regionInfo := "region=none"
+				if c.HasOptimizedRegion() {
+					regionInfo = fmt.Sprintf("region=#%d", c.OptimizedRegionSerial())
+				}
+				modeStr := "human"
+				if c.Mode() == garland.CursorModeProcess {
+					modeStr = "process"
+				}
+				fmt.Printf("%s%s: byte=%d, rune=%d, line=%d:%d, mode=%s, %s\n",
+					marker, name, c.BytePos(), c.RunePos(), line, lineRune, modeStr, regionInfo)
 			}
 			return
 		}
@@ -617,6 +647,20 @@ func (r *REPL) cmdCursor(args []string) {
 	fmt.Printf("  Line:     %d\n", line)
 	fmt.Printf("  LineRune: %d\n", lineRune)
 	fmt.Printf("  Ready:    %v\n", cursor.IsReady())
+	modeStr := "human"
+	if cursor.Mode() == garland.CursorModeProcess {
+		modeStr = "process"
+	}
+	fmt.Printf("  Mode:     %s\n", modeStr)
+	if cursor.HasOptimizedRegion() {
+		serial := cursor.OptimizedRegionSerial()
+		start, end, _ := cursor.OptimizedRegionBounds()
+		graceStart, graceEnd, _ := cursor.OptimizedRegionGraceWindow()
+		fmt.Printf("  Region:   serial=%d, bytes=[%d,%d), grace=[%d,%d)\n",
+			serial, start, end, graceStart, graceEnd)
+	} else {
+		fmt.Printf("  Region:   none\n")
+	}
 }
 
 func (r *REPL) cmdSeek(args []string) {
@@ -3201,6 +3245,115 @@ func (r *REPL) cmdSnapshots() {
 			}
 			fmt.Printf("  Fork %d: %d snapshots%s\n", forkID, count, status)
 		}
+	}
+}
+
+// Optimized region commands
+
+func (r *REPL) cmdCheckpoint() {
+	if !r.ensureGarland() {
+		return
+	}
+
+	err := r.garland.Checkpoint()
+	if err != nil {
+		fmt.Printf("Checkpoint error: %v\n", err)
+		return
+	}
+
+	fmt.Println("Checkpoint completed - all active regions committed")
+}
+
+func (r *REPL) cmdRegion(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	cursor := r.cursor()
+	if cursor == nil {
+		fmt.Println("No cursor available")
+		return
+	}
+
+	if len(args) == 0 {
+		// Show current region info
+		if cursor.HasOptimizedRegion() {
+			serial := cursor.OptimizedRegionSerial()
+			start, end, _ := cursor.OptimizedRegionBounds()
+			graceStart, graceEnd, _ := cursor.OptimizedRegionGraceWindow()
+			fmt.Printf("Region #%d:\n", serial)
+			fmt.Printf("  Content: bytes [%d, %d) (%d bytes)\n", start, end, end-start)
+			fmt.Printf("  Grace:   bytes [%d, %d) (%d bytes)\n", graceStart, graceEnd, graceEnd-graceStart)
+		} else {
+			fmt.Println("No active region for current cursor")
+		}
+		return
+	}
+
+	subcmd := strings.ToLower(args[0])
+	switch subcmd {
+	case "begin":
+		if len(args) < 3 {
+			fmt.Println("Usage: region begin <startByte> <endByte>")
+			return
+		}
+		startByte, err := strconv.ParseInt(args[1], 10, 64)
+		if err != nil {
+			fmt.Printf("Invalid start byte: %v\n", err)
+			return
+		}
+		endByte, err := strconv.ParseInt(args[2], 10, 64)
+		if err != nil {
+			fmt.Printf("Invalid end byte: %v\n", err)
+			return
+		}
+		err = cursor.BeginOptimizedRegion(startByte, endByte)
+		if err != nil {
+			fmt.Printf("Region begin error: %v\n", err)
+			return
+		}
+		serial := cursor.OptimizedRegionSerial()
+		start, end, _ := cursor.OptimizedRegionBounds()
+		graceStart, graceEnd, _ := cursor.OptimizedRegionGraceWindow()
+		fmt.Printf("Created region #%d: content=[%d,%d), grace=[%d,%d)\n",
+			serial, start, end, graceStart, graceEnd)
+
+	default:
+		fmt.Println("Usage: region | region begin <startByte> <endByte>")
+	}
+}
+
+func (r *REPL) cmdCursorMode(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+
+	cursor := r.cursor()
+	if cursor == nil {
+		fmt.Println("No cursor available")
+		return
+	}
+
+	if len(args) == 0 {
+		// Show current mode
+		modeStr := "human"
+		if cursor.Mode() == garland.CursorModeProcess {
+			modeStr = "process"
+		}
+		fmt.Printf("Current cursor mode: %s\n", modeStr)
+		return
+	}
+
+	mode := strings.ToLower(args[0])
+	switch mode {
+	case "human":
+		cursor.SetMode(garland.CursorModeHuman)
+		fmt.Println("Cursor mode set to 'human' (auto-creates regions on edit)")
+	case "process":
+		cursor.SetMode(garland.CursorModeProcess)
+		fmt.Println("Cursor mode set to 'process' (uses explicit transactions)")
+	default:
+		fmt.Println("Usage: cursormode [human|process]")
 	}
 }
 
