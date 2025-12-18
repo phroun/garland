@@ -174,7 +174,7 @@ lib, err := garland.Init(garland.LibraryOptions{
 })
 
 // Query memory usage
-stats := g.GetMemoryStats()
+stats := g.MemoryUsage()
 ```
 
 ## Architecture

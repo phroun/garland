@@ -1,5 +1,6 @@
 # Compiled binaries (in root directory only)
 /garland-repl
+/garland-bench
 *.exe
 *.exe~
 *.dll
