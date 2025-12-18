@@ -35,6 +35,12 @@ type Cursor struct {
 	ready     bool
 	readyMu   sync.Mutex
 	readyCond *sync.Cond
+
+	// Cursor mode determines auto-region behavior
+	mode CursorMode
+
+	// Active optimized region (nil if none)
+	region *OptimizedRegionHandle
 }
 
 // newCursor creates a new cursor at position 0.
@@ -49,6 +55,8 @@ func newCursor(g *Garland) *Cursor {
 		lastRevision:    g.currentRevision,
 		positionHistory: make(map[ForkRevision]*CursorPosition),
 		ready:           false,
+		mode:            CursorModeHuman,
+		region:          nil,
 	}
 	c.readyCond = sync.NewCond(&c.readyMu)
 
@@ -117,6 +125,60 @@ func (c *Cursor) setReady(ready bool) {
 	if ready {
 		c.readyCond.Broadcast()
 	}
+}
+
+// Mode returns the cursor's current mode.
+func (c *Cursor) Mode() CursorMode {
+	return c.mode
+}
+
+// SetMode sets the cursor's mode.
+// Changing mode does not affect any currently active optimized region.
+func (c *Cursor) SetMode(mode CursorMode) {
+	c.mode = mode
+}
+
+// HasOptimizedRegion returns true if the cursor has an active optimized region.
+func (c *Cursor) HasOptimizedRegion() bool {
+	return c.region != nil
+}
+
+// OptimizedRegionSerial returns the serial number of the cursor's active region,
+// or -1 if no region is active. Useful for debugging region lifecycle.
+func (c *Cursor) OptimizedRegionSerial() int64 {
+	if c.region == nil {
+		return -1
+	}
+	return int64(c.region.serial)
+}
+
+// OptimizedRegionBounds returns the content bounds of the active region.
+// Returns (0, 0, false) if no region is active.
+func (c *Cursor) OptimizedRegionBounds() (start, end int64, ok bool) {
+	if c.region == nil {
+		return 0, 0, false
+	}
+	start, end = c.region.ContentBounds()
+	return start, end, true
+}
+
+// OptimizedRegionGraceWindow returns the grace window bounds of the active region.
+// Returns (0, 0, false) if no region is active.
+func (c *Cursor) OptimizedRegionGraceWindow() (start, end int64, ok bool) {
+	if c.region == nil {
+		return 0, 0, false
+	}
+	start, end = c.region.GraceWindow()
+	return start, end, true
+}
+
+// BeginOptimizedRegion explicitly starts an optimized region at the specified bounds.
+// This works regardless of cursor mode and dissolves any existing region first.
+func (c *Cursor) BeginOptimizedRegion(startByte, endByte int64) error {
+	if c.garland == nil {
+		return ErrCursorNotFound
+	}
+	return c.garland.beginOptimizedRegionForCursor(c, startByte, endByte)
 }
 
 // SeekByte moves the cursor to an absolute byte position.

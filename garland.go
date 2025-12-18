@@ -347,8 +347,8 @@ type Garland struct {
 	sourceFS     FileSystemInterface
 	sourceHandle FileHandle
 
-	// Optimized regions
-	optimizedRegions []*OptimizedRegionHandle
+	// Optimized region configuration
+	graceWindowSize int64 // bytes to capture around cursor when auto-creating regions
 
 	// Transaction state
 	transaction *TransactionState
@@ -421,9 +421,10 @@ func (lib *Library) Open(options FileOptions) (*Garland, error) {
 			All:   options.ReadAheadAll,
 		},
 
-		maxLeafSize:    maxLeaf,
-		targetLeafSize: targetLeaf,
-		minLeafSize:    minLeaf,
+		maxLeafSize:     maxLeaf,
+		targetLeafSize:  targetLeaf,
+		minLeafSize:     minLeaf,
+		graceWindowSize: 128, // default grace window for auto-created regions
 
 		nodeRegistry:            make(map[NodeID]*Node),
 		nextNodeID:              1,
@@ -1481,6 +1482,12 @@ func (g *Garland) TransactionDepth() int {
 // TransactionStart begins a new transaction with an optional descriptive name.
 func (g *Garland) TransactionStart(name string) error {
 	if g.transaction == nil {
+		// Top-level transaction: checkpoint any active optimized regions first
+		// This ensures the transaction has a clean baseline to rollback to
+		if err := g.checkpointUnlocked(); err != nil {
+			return err
+		}
+
 		// Record cursor positions in history before starting transaction
 		// This allows UndoSeek to restore positions from before the transaction
 		g.recordCursorPositionsInHistory()
@@ -1520,9 +1527,15 @@ func (g *Garland) TransactionCommit() (ChangeResult, error) {
 	// Outermost commit
 	if g.transaction.poisoned {
 		// Poisoned: rollback instead
+		g.discardAllRegions()
 		g.rollbackToPreTransaction()
 		g.transaction = nil
 		return ChangeResult{}, ErrTransactionPoisoned
+	}
+
+	// Dissolve any active regions before committing
+	if err := g.dissolveAllRegions(); err != nil {
+		return ChangeResult{}, err
 	}
 
 	// ALWAYS create a new revision, even if no mutations
@@ -1566,7 +1579,8 @@ func (g *Garland) TransactionRollback() error {
 	g.transaction.depth--
 
 	if g.transaction.depth == 0 {
-		// Outermost level: perform actual rollback
+		// Outermost level: discard regions and perform actual rollback
+		g.discardAllRegions()
 		g.rollbackToPreTransaction()
 		g.transaction = nil
 	}

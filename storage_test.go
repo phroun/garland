@@ -364,20 +364,35 @@ func TestStorageStateConstants(t *testing.T) {
 }
 
 func TestOptimizedRegionHandle(t *testing.T) {
-	handle := OptimizedRegionHandle{
-		startByte: 100,
-		endByte:   200,
-		region:    nil, // no actual region for this test
+	// Create a region with some initial content
+	buffer := NewByteBufferRegion([]byte("Hello World"))
+
+	handle := &OptimizedRegionHandle{
+		serial:       1,
+		graceStart:   90,
+		graceEnd:     210,
+		contentStart: 100,
+		buffer:       buffer,
+		decorations:  nil,
+		cursor:       nil,
 	}
 
-	if handle.StartByte() != 100 {
-		t.Errorf("StartByte() = %d, want 100", handle.StartByte())
+	if handle.Serial() != 1 {
+		t.Errorf("Serial() = %d, want 1", handle.Serial())
 	}
-	if handle.EndByte() != 200 {
-		t.Errorf("EndByte() = %d, want 200", handle.EndByte())
+
+	graceStart, graceEnd := handle.GraceWindow()
+	if graceStart != 90 || graceEnd != 210 {
+		t.Errorf("GraceWindow() = (%d, %d), want (90, 210)", graceStart, graceEnd)
 	}
-	if handle.Region() != nil {
-		t.Error("Region() should be nil")
+
+	contentStart, contentEnd := handle.ContentBounds()
+	if contentStart != 100 || contentEnd != 111 { // 100 + len("Hello World")
+		t.Errorf("ContentBounds() = (%d, %d), want (100, 111)", contentStart, contentEnd)
+	}
+
+	if handle.ByteCount() != 11 {
+		t.Errorf("ByteCount() = %d, want 11", handle.ByteCount())
 	}
 }
 
