@@ -1,6 +1,13 @@
 # Garland
 
-A rope-based text buffer library for Go, designed for text editors and applications requiring efficient document manipulation with version control.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+Garland:  A rope-based text buffer library for Go, designed for text editors and applications requiring
+efficient document manipulation with version control.
+
+*If you use this, please support me on ko-fi:  [https://ko-fi.com/jeffday](https://ko-fi.com/F2F61JR2B4)*
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/F2F61JR2B4)
 
 ## Features
 
