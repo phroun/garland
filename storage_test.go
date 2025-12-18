@@ -213,7 +213,8 @@ func TestLocalFileSystemHasChanged(t *testing.T) {
 
 func TestFileColdStorage(t *testing.T) {
 	tmpDir := t.TempDir()
-	cs := newFileColdStorage(tmpDir)
+	fs := &localFileSystem{}
+	cs := newFSColdStorage(fs, tmpDir)
 
 	// Set data
 	testData := []byte("test cold storage data")
@@ -251,7 +252,8 @@ func TestFileColdStorage(t *testing.T) {
 
 func TestFileColdStorageMultipleFolders(t *testing.T) {
 	tmpDir := t.TempDir()
-	cs := newFileColdStorage(tmpDir)
+	fs := &localFileSystem{}
+	cs := newFSColdStorage(fs, tmpDir)
 
 	// Create blocks in different folders
 	cs.Set("file1", "data", []byte("file1 data"))
@@ -278,7 +280,8 @@ func TestFileColdStorageMultipleFolders(t *testing.T) {
 
 func TestFileColdStorageGetNotFound(t *testing.T) {
 	tmpDir := t.TempDir()
-	cs := newFileColdStorage(tmpDir)
+	fs := &localFileSystem{}
+	cs := newFSColdStorage(fs, tmpDir)
 
 	_, err := cs.Get("nonexistent", "block")
 	if err == nil {
@@ -288,7 +291,8 @@ func TestFileColdStorageGetNotFound(t *testing.T) {
 
 func TestFileColdStorageOverwrite(t *testing.T) {
 	tmpDir := t.TempDir()
-	cs := newFileColdStorage(tmpDir)
+	fs := &localFileSystem{}
+	cs := newFSColdStorage(fs, tmpDir)
 
 	cs.Set("folder", "block", []byte("original"))
 	cs.Set("folder", "block", []byte("overwritten"))
@@ -296,6 +300,36 @@ func TestFileColdStorageOverwrite(t *testing.T) {
 	data, _ := cs.Get("folder", "block")
 	if string(data) != "overwritten" {
 		t.Errorf("After overwrite: %q, want %q", string(data), "overwritten")
+	}
+}
+
+func TestFileColdStorageDeleteFolder(t *testing.T) {
+	tmpDir := t.TempDir()
+	fs := &localFileSystem{}
+	cs := newFSColdStorage(fs, tmpDir)
+
+	// Create a block
+	cs.Set("testfolder", "block1", []byte("data"))
+
+	// Try to delete non-empty folder (should fail)
+	err := cs.DeleteFolder("testfolder")
+	if err == nil {
+		t.Error("DeleteFolder on non-empty folder should fail")
+	}
+
+	// Delete the block first
+	cs.Delete("testfolder", "block1")
+
+	// Now delete empty folder
+	err = cs.DeleteFolder("testfolder")
+	if err != nil {
+		t.Errorf("DeleteFolder on empty folder failed: %v", err)
+	}
+
+	// Verify folder is gone
+	folderPath := filepath.Join(tmpDir, "testfolder")
+	if _, err := os.Stat(folderPath); !os.IsNotExist(err) {
+		t.Error("Folder should be deleted")
 	}
 }
 
@@ -330,20 +364,35 @@ func TestStorageStateConstants(t *testing.T) {
 }
 
 func TestOptimizedRegionHandle(t *testing.T) {
-	handle := OptimizedRegionHandle{
-		startByte: 100,
-		endByte:   200,
-		region:    nil, // no actual region for this test
+	// Create a region with some initial content
+	buffer := NewByteBufferRegion([]byte("Hello World"))
+
+	handle := &OptimizedRegionHandle{
+		serial:       1,
+		graceStart:   90,
+		graceEnd:     210,
+		contentStart: 100,
+		buffer:       buffer,
+		decorations:  nil,
+		cursor:       nil,
 	}
 
-	if handle.StartByte() != 100 {
-		t.Errorf("StartByte() = %d, want 100", handle.StartByte())
+	if handle.Serial() != 1 {
+		t.Errorf("Serial() = %d, want 1", handle.Serial())
 	}
-	if handle.EndByte() != 200 {
-		t.Errorf("EndByte() = %d, want 200", handle.EndByte())
+
+	graceStart, graceEnd := handle.GraceWindow()
+	if graceStart != 90 || graceEnd != 210 {
+		t.Errorf("GraceWindow() = (%d, %d), want (90, 210)", graceStart, graceEnd)
 	}
-	if handle.Region() != nil {
-		t.Error("Region() should be nil")
+
+	contentStart, contentEnd := handle.ContentBounds()
+	if contentStart != 100 || contentEnd != 111 { // 100 + len("Hello World")
+		t.Errorf("ContentBounds() = (%d, %d), want (100, 111)", contentStart, contentEnd)
+	}
+
+	if handle.ByteCount() != 11 {
+		t.Errorf("ByteCount() = %d, want 11", handle.ByteCount())
 	}
 }
 
@@ -370,5 +419,223 @@ func TestLoaderStruct(t *testing.T) {
 	}
 	if loader.eofReached {
 		t.Error("eofReached should be false")
+	}
+}
+
+func TestSave(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalPath := filepath.Join(tmpDir, "test.txt")
+
+	// Create initial file
+	if err := os.WriteFile(originalPath, []byte("Hello World"), 0644); err != nil {
+		t.Fatalf("Failed to create test file: %v", err)
+	}
+
+	// Open file with garland
+	lib, _ := Init(LibraryOptions{})
+	g, err := lib.Open(FileOptions{FilePath: originalPath})
+	if err != nil {
+		t.Fatalf("Failed to open file: %v", err)
+	}
+
+	// Modify content
+	cursor := g.NewCursor()
+	cursor.SeekByte(5)
+	cursor.DeleteRunes(1, false) // Delete space
+	cursor.InsertString("-", nil, true)
+
+	// Save
+	err = g.Save()
+	if err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+
+	g.Close()
+
+	// Verify file was modified
+	data, err := os.ReadFile(originalPath)
+	if err != nil {
+		t.Fatalf("Failed to read file: %v", err)
+	}
+	if string(data) != "Hello-World" {
+		t.Errorf("After save: %q, want %q", string(data), "Hello-World")
+	}
+}
+
+func TestSaveNoSource(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	g, _ := lib.Open(FileOptions{DataString: "Hello World"})
+
+	err := g.Save()
+	if err != ErrNoDataSource {
+		t.Errorf("Save with no source returned %v, want ErrNoDataSource", err)
+	}
+}
+
+func TestSaveAs(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	lib, _ := Init(LibraryOptions{})
+	g, _ := lib.Open(FileOptions{DataString: "Hello World"})
+
+	// Modify content
+	cursor := g.NewCursor()
+	cursor.SeekByte(11)
+	cursor.InsertString("!", nil, true)
+
+	// SaveAs
+	fs := &localFileSystem{}
+	newPath := filepath.Join(tmpDir, "saved.txt")
+	err := g.SaveAs(fs, newPath)
+	if err != nil {
+		t.Fatalf("SaveAs failed: %v", err)
+	}
+
+	// Verify new file
+	data, err := os.ReadFile(newPath)
+	if err != nil {
+		t.Fatalf("Failed to read saved file: %v", err)
+	}
+	if string(data) != "Hello World!" {
+		t.Errorf("After SaveAs: %q, want %q", string(data), "Hello World!")
+	}
+}
+
+func TestSaveAsNilFS(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	g, _ := lib.Open(FileOptions{DataString: "Hello World"})
+
+	err := g.SaveAs(nil, "/tmp/test.txt")
+	if err != ErrNotSupported {
+		t.Errorf("SaveAs with nil fs returned %v, want ErrNotSupported", err)
+	}
+}
+
+func TestAutoThawOnRead(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// Initialize library with cold storage
+	lib, err := Init(LibraryOptions{
+		ColdStoragePath: tempDir,
+	})
+	if err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	// Create a garland with some content
+	g, err := lib.Open(FileOptions{DataString: "Hello World! This is a test of auto-thaw."})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer g.Close()
+
+	// Make an edit to create revision 1
+	cursor := g.NewCursor()
+	cursor.InsertString(" More content.", nil, false)
+
+	// Read content before chill
+	cursor.SeekByte(0)
+	beforeChill, err := cursor.ReadBytes(g.ByteCount().Value)
+	if err != nil {
+		t.Fatalf("ReadBytes before chill failed: %v", err)
+	}
+	t.Logf("Before chill: %q (%d bytes)", string(beforeChill), len(beforeChill))
+
+	// Chill everything to cold storage
+	err = g.Chill(ChillEverything)
+	if err != nil {
+		t.Fatalf("Chill failed: %v", err)
+	}
+	t.Log("Chilled everything to cold storage")
+
+	// Verify cold storage files were created
+	files, _ := filepath.Glob(filepath.Join(tempDir, "*", "*"))
+	t.Logf("Cold storage files: %d", len(files))
+	if len(files) == 0 {
+		t.Error("Expected cold storage files to be created")
+	}
+
+	// Reading should auto-thaw
+	cursor.SeekByte(0)
+	afterChill, err := cursor.ReadBytes(g.ByteCount().Value)
+	if err != nil {
+		t.Fatalf("ReadBytes after chill failed: %v", err)
+	}
+	t.Logf("After chill (auto-thawed): %q (%d bytes)", string(afterChill), len(afterChill))
+
+	// Verify content is the same
+	if string(beforeChill) != string(afterChill) {
+		t.Errorf("Content mismatch after chill/thaw:\nbefore: %q\nafter: %q", string(beforeChill), string(afterChill))
+	}
+}
+
+func TestThawRevisionRange(t *testing.T) {
+	tempDir := t.TempDir()
+
+	lib, err := Init(LibraryOptions{
+		ColdStoragePath: tempDir,
+	})
+	if err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	g, err := lib.Open(FileOptions{DataString: "Base"})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer g.Close()
+
+	cursor := g.NewCursor()
+
+	// Create revisions
+	cursor.InsertString("A", nil, false) // Rev 1
+	cursor.InsertString("B", nil, false) // Rev 2
+	cursor.InsertString("C", nil, false) // Rev 3
+
+	// Chill everything
+	err = g.Chill(ChillEverything)
+	if err != nil {
+		t.Fatalf("Chill failed: %v", err)
+	}
+
+	// Thaw only revision 2
+	err = g.ThawRevision(2, 2)
+	if err != nil {
+		t.Fatalf("ThawRevision failed: %v", err)
+	}
+
+	// Verify we can read current content (should auto-thaw if needed)
+	cursor.SeekByte(0)
+	content, err := cursor.ReadBytes(g.ByteCount().Value)
+	if err != nil {
+		t.Fatalf("ReadBytes failed: %v", err)
+	}
+	t.Logf("Content after ThawRevision: %q", string(content))
+}
+
+func TestDecorationEncodeDecode(t *testing.T) {
+	// Test encoding
+	decs := []Decoration{
+		{Key: "mark1", Position: 5},
+		{Key: "mark2", Position: 10},
+		{Key: "bookmark-long-name", Position: 12345},
+	}
+
+	encoded := encodeDecorations(decs)
+	t.Logf("Encoded decorations: %d bytes", len(encoded))
+
+	// Test decoding
+	decoded := decodeDecorations(encoded)
+	if len(decoded) != len(decs) {
+		t.Fatalf("Decoded count mismatch: got %d, want %d", len(decoded), len(decs))
+	}
+
+	for i, d := range decoded {
+		if d.Key != decs[i].Key {
+			t.Errorf("Key mismatch at %d: got %q, want %q", i, d.Key, decs[i].Key)
+		}
+		if d.Position != decs[i].Position {
+			t.Errorf("Position mismatch at %d: got %d, want %d", i, d.Position, decs[i].Position)
+		}
 	}
 }

@@ -1,6 +1,9 @@
 package garland
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // CursorPosition stores a cursor's position in all coordinate systems.
 type CursorPosition struct {
@@ -32,6 +35,12 @@ type Cursor struct {
 	ready     bool
 	readyMu   sync.Mutex
 	readyCond *sync.Cond
+
+	// Cursor mode determines auto-region behavior
+	mode CursorMode
+
+	// Active optimized region (nil if none)
+	region *OptimizedRegionHandle
 }
 
 // newCursor creates a new cursor at position 0.
@@ -46,6 +55,8 @@ func newCursor(g *Garland) *Cursor {
 		lastRevision:    g.currentRevision,
 		positionHistory: make(map[ForkRevision]*CursorPosition),
 		ready:           false,
+		mode:            CursorModeHuman,
+		region:          nil,
 	}
 	c.readyCond = sync.NewCond(&c.readyMu)
 
@@ -116,15 +127,78 @@ func (c *Cursor) setReady(ready bool) {
 	}
 }
 
+// Mode returns the cursor's current mode.
+func (c *Cursor) Mode() CursorMode {
+	return c.mode
+}
+
+// SetMode sets the cursor's mode.
+// Changing mode does not affect any currently active optimized region.
+func (c *Cursor) SetMode(mode CursorMode) {
+	c.mode = mode
+}
+
+// HasOptimizedRegion returns true if the cursor has an active optimized region.
+func (c *Cursor) HasOptimizedRegion() bool {
+	return c.region != nil
+}
+
+// OptimizedRegionSerial returns the serial number of the cursor's active region,
+// or -1 if no region is active. Useful for debugging region lifecycle.
+func (c *Cursor) OptimizedRegionSerial() int64 {
+	if c.region == nil {
+		return -1
+	}
+	return int64(c.region.serial)
+}
+
+// OptimizedRegionBounds returns the content bounds of the active region.
+// Returns (0, 0, false) if no region is active.
+func (c *Cursor) OptimizedRegionBounds() (start, end int64, ok bool) {
+	if c.region == nil {
+		return 0, 0, false
+	}
+	start, end = c.region.ContentBounds()
+	return start, end, true
+}
+
+// OptimizedRegionGraceWindow returns the grace window bounds of the active region.
+// Returns (0, 0, false) if no region is active.
+func (c *Cursor) OptimizedRegionGraceWindow() (start, end int64, ok bool) {
+	if c.region == nil {
+		return 0, 0, false
+	}
+	start, end = c.region.GraceWindow()
+	return start, end, true
+}
+
+// BeginOptimizedRegion explicitly starts an optimized region at the specified bounds.
+// This works regardless of cursor mode and dissolves any existing region first.
+func (c *Cursor) BeginOptimizedRegion(startByte, endByte int64) error {
+	if c.garland == nil {
+		return ErrCursorNotFound
+	}
+	return c.garland.beginOptimizedRegionForCursor(c, startByte, endByte)
+}
+
 // SeekByte moves the cursor to an absolute byte position.
-// Blocks until the position is available during lazy loading.
+// Blocks indefinitely until the position is available during lazy loading.
+// Use SeekByteWithTimeout for timeout control, or check IsByteReady first for non-blocking.
 func (c *Cursor) SeekByte(pos int64) error {
+	return c.SeekByteWithTimeout(pos, -1) // -1 = block indefinitely
+}
+
+// SeekByteWithTimeout moves the cursor to an absolute byte position with timeout control.
+// If timeout is 0, returns ErrNotReady immediately if position not available.
+// If timeout is negative, blocks indefinitely.
+// If timeout is positive, waits up to that duration before returning ErrTimeout.
+func (c *Cursor) SeekByteWithTimeout(pos int64, timeout time.Duration) error {
 	if c.garland == nil {
 		return ErrCursorNotFound
 	}
 
 	// Wait for position to be available
-	if err := c.garland.waitForBytePosition(pos); err != nil {
+	if err := c.garland.waitForBytePosition(pos, timeout); err != nil {
 		return err
 	}
 
@@ -144,14 +218,23 @@ func (c *Cursor) SeekByte(pos int64) error {
 }
 
 // SeekRune moves the cursor to an absolute rune position.
-// Blocks until the position is available during lazy loading.
+// Blocks indefinitely until the position is available during lazy loading.
+// Use SeekRuneWithTimeout for timeout control, or check IsRuneReady first for non-blocking.
 func (c *Cursor) SeekRune(pos int64) error {
+	return c.SeekRuneWithTimeout(pos, -1) // -1 = block indefinitely
+}
+
+// SeekRuneWithTimeout moves the cursor to an absolute rune position with timeout control.
+// If timeout is 0, returns ErrNotReady immediately if position not available.
+// If timeout is negative, blocks indefinitely.
+// If timeout is positive, waits up to that duration before returning ErrTimeout.
+func (c *Cursor) SeekRuneWithTimeout(pos int64, timeout time.Duration) error {
 	if c.garland == nil {
 		return ErrCursorNotFound
 	}
 
 	// Wait for position to be available
-	if err := c.garland.waitForRunePosition(pos); err != nil {
+	if err := c.garland.waitForRunePosition(pos, timeout); err != nil {
 		return err
 	}
 
@@ -172,14 +255,23 @@ func (c *Cursor) SeekRune(pos int64) error {
 
 // SeekLine moves the cursor to a line and rune-within-line position.
 // Line and rune are both 0-indexed. The newline is the last character of its line.
-// Blocks until the position is available during lazy loading.
+// Blocks indefinitely until the position is available during lazy loading.
+// Use SeekLineWithTimeout for timeout control, or check IsLineReady first for non-blocking.
 func (c *Cursor) SeekLine(line, runeInLine int64) error {
+	return c.SeekLineWithTimeout(line, runeInLine, -1) // -1 = block indefinitely
+}
+
+// SeekLineWithTimeout moves the cursor to a line and rune-within-line position with timeout control.
+// If timeout is 0, returns ErrNotReady immediately if position not available.
+// If timeout is negative, blocks indefinitely.
+// If timeout is positive, waits up to that duration before returning ErrTimeout.
+func (c *Cursor) SeekLineWithTimeout(line, runeInLine int64, timeout time.Duration) error {
 	if c.garland == nil {
 		return ErrCursorNotFound
 	}
 
 	// Wait for line to be available
-	if err := c.garland.waitForLine(line); err != nil {
+	if err := c.garland.waitForLine(line, timeout); err != nil {
 		return err
 	}
 
@@ -228,6 +320,36 @@ func (c *Cursor) SeekRelativeRunes(delta int64) error {
 	}
 	// Clamp to rune count (will be validated by SeekRune)
 	return c.SeekRune(newPos)
+}
+
+// SeekByWord moves the cursor by n words.
+// Positive n moves forward, negative n moves backward.
+// A word is defined as a sequence of alphanumeric/underscore characters,
+// or a sequence of non-whitespace non-word characters.
+// Returns the number of words actually moved (may be less than requested at boundaries).
+func (c *Cursor) SeekByWord(n int) (int, error) {
+	if c.garland == nil {
+		return 0, ErrCursorNotFound
+	}
+	return c.garland.seekByWordAt(c, n)
+}
+
+// SeekLineStart moves the cursor to the beginning of the current line.
+func (c *Cursor) SeekLineStart() error {
+	if c.garland == nil {
+		return ErrCursorNotFound
+	}
+	// Simply set lineRune to 0 and recalculate byte/rune positions
+	return c.SeekLine(c.line, 0)
+}
+
+// SeekLineEnd moves the cursor to the end of the current line.
+// The cursor is positioned after the last character before the newline (or at EOF).
+func (c *Cursor) SeekLineEnd() error {
+	if c.garland == nil {
+		return ErrCursorNotFound
+	}
+	return c.garland.seekLineEndAt(c)
 }
 
 // updatePosition updates the cursor's position and records history if needed.
@@ -348,6 +470,61 @@ func (c *Cursor) DeleteBytes(length int64, includeLineDecorations bool) ([]Relat
 		return nil, ChangeResult{}, ErrCursorNotFound
 	}
 	return c.garland.deleteBytesAt(c, c.bytePos, length, includeLineDecorations)
+}
+
+// OverwriteBytes replaces `length` bytes at cursor position with new data.
+// This is more efficient than separate delete + insert for binary editing.
+// The operation properly accounts for changes in line counts (newlines)
+// and rune counts (UTF-8 sequences).
+// Returns decorations that were in the overwritten range.
+// Cursor position is not changed after the operation.
+func (c *Cursor) OverwriteBytes(length int64, newData []byte) ([]RelativeDecoration, ChangeResult, error) {
+	if c.garland == nil {
+		return nil, ChangeResult{}, ErrCursorNotFound
+	}
+	return c.garland.overwriteBytesAt(c, c.bytePos, length, newData)
+}
+
+// OverwriteBytesWithDecorations replaces bytes with new data, adding decorations.
+// - decorationsToAdd: decorations to add to the new content (relative to new content start)
+// - insertBefore: if true, displaced decorations consolidate to end; if false, to start
+// Returns the original decorations from the overwritten range with their original relative positions.
+func (c *Cursor) OverwriteBytesWithDecorations(length int64, newData []byte, decorationsToAdd []RelativeDecoration, insertBefore bool) ([]RelativeDecoration, ChangeResult, error) {
+	if c.garland == nil {
+		return nil, ChangeResult{}, ErrCursorNotFound
+	}
+	return c.garland.overwriteBytesAtInternal(c, c.bytePos, length, newData, decorationsToAdd, insertBefore)
+}
+
+// MoveBytes moves a byte range to a new location.
+// All addresses are interpreted as positions in the original document before any changes.
+// Source and destination ranges cannot overlap for Move.
+// Decorations in the source range move with the content.
+// Decorations in the destination range are consolidated and returned.
+// - srcStart, srcEnd: source byte range [srcStart, srcEnd)
+// - dstStart, dstEnd: destination byte range to replace [dstStart, dstEnd)
+// - insertBefore: if true, displaced decorations consolidate to end of new content
+// Returns MoveResult with the displaced decorations from the destination range.
+func (c *Cursor) MoveBytes(srcStart, srcEnd, dstStart, dstEnd int64, insertBefore bool) (MoveResult, error) {
+	if c.garland == nil {
+		return MoveResult{}, ErrCursorNotFound
+	}
+	return c.garland.moveBytesAt(c, srcStart, srcEnd, dstStart, dstEnd, insertBefore)
+}
+
+// CopyBytes copies a byte range to a new location.
+// All addresses are interpreted as positions in the original document before any changes.
+// Source and destination ranges may overlap for Copy (source is snapshotted first).
+// - srcStart, srcEnd: source byte range [srcStart, srcEnd)
+// - dstStart, dstEnd: destination byte range to replace [dstStart, dstEnd)
+// - decorationsToAdd: decorations to add to the copied content (like Insert)
+// - insertBefore: if true, displaced decorations consolidate to end of new content
+// Returns CopyResult with the displaced decorations from the destination range.
+func (c *Cursor) CopyBytes(srcStart, srcEnd, dstStart, dstEnd int64, decorationsToAdd []RelativeDecoration, insertBefore bool) (CopyResult, error) {
+	if c.garland == nil {
+		return CopyResult{}, ErrCursorNotFound
+	}
+	return c.garland.copyBytesAt(c, srcStart, srcEnd, dstStart, dstEnd, decorationsToAdd, insertBefore)
 }
 
 // DeleteRunes deletes `length` runes starting at cursor position.

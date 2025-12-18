@@ -407,3 +407,347 @@ func TestCursorPositionTypes(t *testing.T) {
 		t.Errorf("LineRune = %d, want 10", pos.LineRune)
 	}
 }
+
+func TestSeekByWordForward(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	g, _ := lib.Open(FileOptions{DataString: "hello world foo bar"})
+	defer g.Close()
+
+	c := g.NewCursor()
+
+	// Move forward 1 word - goes to START of next word
+	moved, err := c.SeekByWord(1)
+	if err != nil {
+		t.Fatalf("SeekByWord(1) error: %v", err)
+	}
+	if moved != 1 {
+		t.Errorf("SeekByWord(1) moved = %d, want 1", moved)
+	}
+	// Should be at position 6 (start of "world")
+	if c.BytePos() != 6 {
+		t.Errorf("After SeekByWord(1): BytePos = %d, want 6", c.BytePos())
+	}
+
+	// Move forward 2 more words
+	moved, err = c.SeekByWord(2)
+	if err != nil {
+		t.Fatalf("SeekByWord(2) error: %v", err)
+	}
+	if moved != 2 {
+		t.Errorf("SeekByWord(2) moved = %d, want 2", moved)
+	}
+	// Should be at position 16 (start of "bar")
+	if c.BytePos() != 16 {
+		t.Errorf("After SeekByWord(2): BytePos = %d, want 16", c.BytePos())
+	}
+}
+
+func TestSeekByWordBackward(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	g, _ := lib.Open(FileOptions{DataString: "hello world foo bar"})
+	defer g.Close()
+
+	c := g.NewCursor()
+
+	// Move to end of content
+	c.SeekByte(19)
+
+	// Move backward 1 word - returns absolute count of words moved
+	moved, err := c.SeekByWord(-1)
+	if err != nil {
+		t.Fatalf("SeekByWord(-1) error: %v", err)
+	}
+	if moved != 1 {
+		t.Errorf("SeekByWord(-1) moved = %d, want 1", moved)
+	}
+	// Should be at start of "bar" (position 16)
+	if c.BytePos() != 16 {
+		t.Errorf("After SeekByWord(-1) from end: BytePos = %d, want 16", c.BytePos())
+	}
+
+	// Move backward 2 more words
+	moved, err = c.SeekByWord(-2)
+	if err != nil {
+		t.Fatalf("SeekByWord(-2) error: %v", err)
+	}
+	if moved != 2 {
+		t.Errorf("SeekByWord(-2) moved = %d, want 2", moved)
+	}
+	// Should be at start of "world" (position 6)
+	if c.BytePos() != 6 {
+		t.Errorf("After SeekByWord(-2): BytePos = %d, want 6", c.BytePos())
+	}
+}
+
+func TestSeekByWordAtBoundaries(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	g, _ := lib.Open(FileOptions{DataString: "hello world"})
+	defer g.Close()
+
+	c := g.NewCursor()
+
+	// Try to move backward from start - should return 0
+	moved, err := c.SeekByWord(-1)
+	if err != nil {
+		t.Fatalf("SeekByWord(-1) from start error: %v", err)
+	}
+	if moved != 0 {
+		t.Errorf("SeekByWord(-1) from start: moved = %d, want 0", moved)
+	}
+	if c.BytePos() != 0 {
+		t.Errorf("Should still be at position 0")
+	}
+
+	// Move to end
+	c.SeekByte(11)
+
+	// Try to move forward from end - should return 0
+	moved, err = c.SeekByWord(1)
+	if err != nil {
+		t.Fatalf("SeekByWord(1) from end error: %v", err)
+	}
+	if moved != 0 {
+		t.Errorf("SeekByWord(1) from end: moved = %d, want 0", moved)
+	}
+}
+
+func TestSeekByWordZero(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	g, _ := lib.Open(FileOptions{DataString: "hello world"})
+	defer g.Close()
+
+	c := g.NewCursor()
+	c.SeekByte(5)
+
+	// SeekByWord(0) should not move
+	moved, err := c.SeekByWord(0)
+	if err != nil {
+		t.Fatalf("SeekByWord(0) error: %v", err)
+	}
+	if moved != 0 {
+		t.Errorf("SeekByWord(0) moved = %d, want 0", moved)
+	}
+	if c.BytePos() != 5 {
+		t.Errorf("Position should not change: BytePos = %d, want 5", c.BytePos())
+	}
+}
+
+func TestSeekByWordMultipleSpaces(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	g, _ := lib.Open(FileOptions{DataString: "hello   world"})
+	defer g.Close()
+
+	c := g.NewCursor()
+
+	// Move forward - goes to start of next word (skipping multiple spaces)
+	moved, err := c.SeekByWord(1)
+	if err != nil {
+		t.Fatalf("SeekByWord(1) error: %v", err)
+	}
+	if moved != 1 {
+		t.Errorf("SeekByWord(1) moved = %d, want 1", moved)
+	}
+	// Should be at position 8 (start of "world" after 3 spaces)
+	if c.BytePos() != 8 {
+		t.Errorf("After SeekByWord(1): BytePos = %d, want 8", c.BytePos())
+	}
+
+	// From "world", moving forward goes to end of word then finds no next word
+	moved, err = c.SeekByWord(1)
+	if err != nil {
+		t.Fatalf("Second SeekByWord(1) error: %v", err)
+	}
+	// Should move to end of "world" (position 13) but count as 1 word
+	t.Logf("Second move: moved=%d, pos=%d", moved, c.BytePos())
+	// Verifying it ends at position 13 (end of content)
+	if c.BytePos() != 13 {
+		t.Errorf("After second SeekByWord(1): BytePos = %d, want 13", c.BytePos())
+	}
+}
+
+func TestSeekLineStart(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	g, _ := lib.Open(FileOptions{DataString: "hello\nworld\nfoo"})
+	defer g.Close()
+
+	c := g.NewCursor()
+
+	// Move to middle of first line
+	c.SeekByte(3) // "hel|lo"
+
+	err := c.SeekLineStart()
+	if err != nil {
+		t.Fatalf("SeekLineStart error: %v", err)
+	}
+	if c.BytePos() != 0 {
+		t.Errorf("SeekLineStart on line 0: BytePos = %d, want 0", c.BytePos())
+	}
+	line, lineRune := c.LinePos()
+	if lineRune != 0 {
+		t.Errorf("SeekLineStart: lineRune = %d, want 0", lineRune)
+	}
+	if line != 0 {
+		t.Errorf("SeekLineStart: line = %d, want 0", line)
+	}
+
+	// Move to middle of second line
+	c.SeekLine(1, 3) // "wor|ld"
+
+	err = c.SeekLineStart()
+	if err != nil {
+		t.Fatalf("SeekLineStart on line 1 error: %v", err)
+	}
+	if c.BytePos() != 6 {
+		t.Errorf("SeekLineStart on line 1: BytePos = %d, want 6", c.BytePos())
+	}
+	line, lineRune = c.LinePos()
+	if lineRune != 0 {
+		t.Errorf("SeekLineStart on line 1: lineRune = %d, want 0", lineRune)
+	}
+	if line != 1 {
+		t.Errorf("SeekLineStart on line 1: line = %d, want 1", line)
+	}
+}
+
+func TestSeekLineEnd(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	g, _ := lib.Open(FileOptions{DataString: "hello\nworld\nfoo"})
+	defer g.Close()
+
+	c := g.NewCursor()
+
+	// Start at beginning of first line
+	err := c.SeekLineEnd()
+	if err != nil {
+		t.Fatalf("SeekLineEnd error: %v", err)
+	}
+	// Should be at position 5 (just before newline)
+	if c.BytePos() != 5 {
+		t.Errorf("SeekLineEnd on line 0: BytePos = %d, want 5", c.BytePos())
+	}
+
+	// Move to second line
+	c.SeekLine(1, 0)
+
+	err = c.SeekLineEnd()
+	if err != nil {
+		t.Fatalf("SeekLineEnd on line 1 error: %v", err)
+	}
+	// Should be at position 11 (just before second newline)
+	if c.BytePos() != 11 {
+		t.Errorf("SeekLineEnd on line 1: BytePos = %d, want 11", c.BytePos())
+	}
+
+	// Move to last line (no newline at end)
+	c.SeekLine(2, 0)
+
+	err = c.SeekLineEnd()
+	if err != nil {
+		t.Fatalf("SeekLineEnd on last line error: %v", err)
+	}
+	// Should be at position 15 (end of file)
+	if c.BytePos() != 15 {
+		t.Errorf("SeekLineEnd on last line: BytePos = %d, want 15", c.BytePos())
+	}
+}
+
+func TestSeekLineStartAlreadyAtStart(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	g, _ := lib.Open(FileOptions{DataString: "hello\nworld"})
+	defer g.Close()
+
+	c := g.NewCursor()
+
+	// Already at start of line 0
+	err := c.SeekLineStart()
+	if err != nil {
+		t.Fatalf("SeekLineStart error: %v", err)
+	}
+	if c.BytePos() != 0 {
+		t.Errorf("Should stay at position 0")
+	}
+}
+
+func TestSeekLineEndAlreadyAtEnd(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	g, _ := lib.Open(FileOptions{DataString: "hello\nworld"})
+	defer g.Close()
+
+	c := g.NewCursor()
+
+	// Go to end of first line
+	c.SeekByte(5)
+
+	err := c.SeekLineEnd()
+	if err != nil {
+		t.Fatalf("SeekLineEnd error: %v", err)
+	}
+	if c.BytePos() != 5 {
+		t.Errorf("Should stay at position 5")
+	}
+}
+
+func TestSeekByWordUTF8(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	// Chinese: "你好 世界" (hello world)
+	g, _ := lib.Open(FileOptions{DataString: "你好 世界"})
+	defer g.Close()
+
+	c := g.NewCursor()
+
+	// Move forward 1 word - goes to start of next word
+	moved, err := c.SeekByWord(1)
+	if err != nil {
+		t.Fatalf("SeekByWord(1) UTF8 error: %v", err)
+	}
+	if moved != 1 {
+		t.Errorf("SeekByWord(1) UTF8 moved = %d, want 1", moved)
+	}
+	// "你好" is 6 bytes (3 bytes per character), space is 1 byte
+	// So start of "世界" is at position 7
+	if c.BytePos() != 7 {
+		t.Errorf("After SeekByWord(1) UTF8: BytePos = %d, want 7", c.BytePos())
+	}
+}
+
+func TestSeekByWordRemovedCursor(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	g, _ := lib.Open(FileOptions{DataString: "hello world"})
+	defer g.Close()
+
+	c := g.NewCursor()
+	g.RemoveCursor(c)
+
+	_, err := c.SeekByWord(1)
+	if err != ErrCursorNotFound {
+		t.Errorf("SeekByWord on removed cursor: expected ErrCursorNotFound, got %v", err)
+	}
+}
+
+func TestSeekLineStartRemovedCursor(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	g, _ := lib.Open(FileOptions{DataString: "hello world"})
+	defer g.Close()
+
+	c := g.NewCursor()
+	g.RemoveCursor(c)
+
+	err := c.SeekLineStart()
+	if err != ErrCursorNotFound {
+		t.Errorf("SeekLineStart on removed cursor: expected ErrCursorNotFound, got %v", err)
+	}
+}
+
+func TestSeekLineEndRemovedCursor(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	g, _ := lib.Open(FileOptions{DataString: "hello world"})
+	defer g.Close()
+
+	c := g.NewCursor()
+	g.RemoveCursor(c)
+
+	err := c.SeekLineEnd()
+	if err != ErrCursorNotFound {
+		t.Errorf("SeekLineEnd on removed cursor: expected ErrCursorNotFound, got %v", err)
+	}
+}

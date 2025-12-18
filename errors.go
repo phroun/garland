@@ -12,8 +12,15 @@ var (
 	// ErrInvalidPosition indicates that a position is out of bounds.
 	ErrInvalidPosition = errors.New("position out of bounds")
 
+	// ErrTimeout indicates that a blocking wait operation timed out.
+	ErrTimeout = errors.New("operation timed out")
+
 	// ErrInvalidUTF8 indicates that an operation would split a UTF-8 sequence.
 	ErrInvalidUTF8 = errors.New("invalid UTF-8 sequence")
+
+	// ErrOverlappingRanges indicates that source and destination ranges overlap
+	// in an operation that doesn't allow overlap (e.g., Move).
+	ErrOverlappingRanges = errors.New("source and destination ranges overlap")
 )
 
 // Decoration errors
@@ -44,6 +51,12 @@ var (
 
 	// ErrNotFromOriginalFile indicates warm storage is not available for this node.
 	ErrNotFromOriginalFile = errors.New("node is not from original file")
+
+	// ErrMemoryPressure indicates that memory limits are exceeded and cannot be reduced.
+	// This occurs when hard memory limit is set but no cold storage is configured,
+	// or when cold storage is full/unavailable. The application should handle this
+	// by closing unused garlands, reducing operations, or configuring cold storage.
+	ErrMemoryPressure = errors.New("memory limit exceeded and cannot be reduced")
 )
 
 // File system errors
@@ -86,6 +99,9 @@ var (
 var (
 	// ErrNotALeaf indicates that an operation expected a leaf node but got an internal node.
 	ErrNotALeaf = errors.New("expected leaf node")
+
+	// ErrInternal indicates an internal consistency error (should not happen).
+	ErrInternal = errors.New("internal error")
 )
 
 // Configuration errors
@@ -98,4 +114,7 @@ var (
 
 	// ErrNoColdStorage indicates that cold storage is required but not configured.
 	ErrNoColdStorage = errors.New("cold storage not configured")
+
+	// ErrDataNotLoaded indicates that data is in cold/warm storage and needs to be thawed.
+	ErrDataNotLoaded = errors.New("data not loaded - call Thaw() first")
 )

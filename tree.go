@@ -109,6 +109,15 @@ func (g *Garland) findLeafByRune(pos int64) (*LeafSearchResult, error) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
+	return g.findLeafByRuneUnlocked(pos)
+}
+
+// findLeafByRuneUnlocked is the internal version that assumes caller holds a lock.
+func (g *Garland) findLeafByRuneUnlocked(pos int64) (*LeafSearchResult, error) {
+	if pos < 0 {
+		return nil, ErrInvalidPosition
+	}
+
 	if g.root == nil {
 		return nil, ErrInvalidPosition
 	}
@@ -192,6 +201,15 @@ func (g *Garland) findLeafByLine(line, runeInLine int64) (*LineSearchResult, err
 
 	g.mu.RLock()
 	defer g.mu.RUnlock()
+
+	return g.findLeafByLineUnlocked(line, runeInLine)
+}
+
+// findLeafByLineUnlocked is the internal version that assumes caller holds a lock.
+func (g *Garland) findLeafByLineUnlocked(line, runeInLine int64) (*LineSearchResult, error) {
+	if line < 0 || runeInLine < 0 {
+		return nil, ErrInvalidPosition
+	}
 
 	if g.root == nil {
 		return nil, ErrInvalidPosition
@@ -283,10 +301,9 @@ func (g *Garland) findLeafByLineInternal(
 	// The target line relative to start
 	relTargetLine := targetLine - lineStart
 
-	// Use <= because if left has N newlines, line N starts in the left subtree
-	// (after the Nth newline) even though the line might extend into the right subtree
-	if relTargetLine <= leftLines {
-		// Target line starts within left subtree
+	// Determine which subtree to descend into
+	if relTargetLine < leftLines {
+		// Line is entirely in left subtree
 		return g.findLeafByLineInternal(
 			leftNode,
 			leftSnap,
@@ -298,7 +315,26 @@ func (g *Garland) findLeafByLineInternal(
 		)
 	}
 
-	// Target line is in right subtree (or spans the boundary, but we go right)
+	if relTargetLine == leftLines {
+		// Line starts in left subtree (or at boundary) and may extend into right.
+		// Check if the requested rune position is within the left subtree's portion.
+		if runeInLine < leftSnap.runesAfterLastNewline {
+			// Rune is in left subtree
+			return g.findLeafByLineInternal(
+				leftNode,
+				leftSnap,
+				targetLine,
+				runeInLine,
+				byteStart,
+				runeStart,
+				lineStart,
+			)
+		}
+		// Rune is in right subtree - adjust runeInLine by subtracting what's in left
+		runeInLine -= leftSnap.runesAfterLastNewline
+	}
+
+	// Target line (or remaining runes) is in right subtree
 	rightNode := g.nodeRegistry[snap.rightID]
 	if rightNode == nil {
 		return nil, ErrInvalidPosition
@@ -339,8 +375,8 @@ func (g *Garland) splitLeaf(node *Node, snap *NodeSnapshot, bytePos int64) (Node
 	leftData := snap.data[:splitPos]
 	rightData := snap.data[splitPos:]
 
-	// Partition decorations
-	leftDecs, rightDecs := partitionDecorations(snap.decorations, splitPos)
+	// Partition decorations (decorations at exact split point go to right)
+	leftDecs, rightDecs := partitionDecorations(snap.decorations, splitPos, true)
 
 	// Create left leaf
 	g.nextNodeID++
@@ -426,7 +462,7 @@ func (g *Garland) insertInternal(
 	if snap.isLeaf {
 		// We've found the leaf to insert into
 		localPos := insertPos - offset
-		return g.insertIntoLeaf(snap, localPos, data, decorations, insertBefore)
+		return g.insertIntoLeaf(snap, localPos, offset, data, decorations, insertBefore)
 	}
 
 	// Internal node: determine which child contains the insertion point
@@ -442,8 +478,10 @@ func (g *Garland) insertInternal(
 
 	leftEnd := offset + leftSnap.byteCount
 
-	// Use < so insertion at exact boundary goes to right subtree (start of next node)
-	if insertPos < leftEnd {
+	// Navigation depends on insertBefore flag when at exact boundary:
+	// - insertBefore=false: go RIGHT (insert at start of right subtree, decorations stay)
+	// - insertBefore=true: go LEFT (insert at end of left subtree, pushing right content)
+	if insertPos < leftEnd || (insertPos == leftEnd && insertBefore) {
 		// Insert into left subtree
 		newLeftID, err := g.insertInternal(leftNode, leftSnap, insertPos, offset, data, decorations, insertBefore)
 		if err != nil {
@@ -476,9 +514,11 @@ func (g *Garland) insertInternal(
 
 // insertIntoLeaf handles insertion within a leaf node.
 // Returns the ID of the new subtree (which may be a single leaf or internal nodes).
+// absoluteOffset is the byte offset where this leaf starts in the document.
 func (g *Garland) insertIntoLeaf(
 	snap *NodeSnapshot,
 	localPos int64,
+	absoluteOffset int64,
 	data []byte,
 	decorations []RelativeDecoration,
 	insertBefore bool,
@@ -504,17 +544,16 @@ func (g *Garland) insertIntoLeaf(
 	leftData := snap.data[:splitPos]
 	rightData := snap.data[splitPos:]
 
-	// Partition existing decorations
-	leftDecs, rightDecs := partitionDecorations(snap.decorations, splitPos)
+	// Partition existing decorations based on insertBefore flag
+	leftDecs, rightDecs := partitionDecorations(snap.decorations, splitPos, insertBefore)
 
-	// Adjust right decorations for insertion
-	insertLen := int64(len(data))
-	for i := range rightDecs {
-		rightDecs[i].Position += insertLen
-	}
+	// Note: rightDecs positions are already adjusted to be relative to rightData
+	// by partitionDecorations (subtracted splitPos). No further adjustment needed
+	// because the inserted content goes into its own leaf node.
 
 	// Create new left leaf (original content before insertion point)
 	var leftID NodeID
+	leftOffset := absoluteOffset
 	if len(leftData) > 0 || len(leftDecs) > 0 {
 		g.nextNodeID++
 		leftNode := newNode(g.nextNodeID, g)
@@ -522,9 +561,13 @@ func (g *Garland) insertIntoLeaf(
 		leftSnap := createLeafSnapshot(leftData, leftDecs, -1)
 		leftNode.setSnapshot(g.currentFork, g.currentRevision, leftSnap)
 		leftID = leftNode.id
+
+		// Update cache for decorations in left node
+		g.updateDecorationCacheForNode(leftID, leftOffset, leftDecs)
 	}
 
 	// Create new middle leaf (inserted content)
+	middleOffset := absoluteOffset + int64(len(leftData))
 	g.nextNodeID++
 	middleNode := newNode(g.nextNodeID, g)
 	g.nodeRegistry[middleNode.id] = middleNode
@@ -532,8 +575,12 @@ func (g *Garland) insertIntoLeaf(
 	middleNode.setSnapshot(g.currentFork, g.currentRevision, middleSnap)
 	middleID := middleNode.id
 
+	// Update cache for newly inserted decorations
+	g.updateDecorationCacheForNode(middleID, middleOffset, absoluteDecs)
+
 	// Create new right leaf (original content after insertion point)
 	var rightID NodeID
+	rightOffset := middleOffset + int64(len(data))
 	if len(rightData) > 0 || len(rightDecs) > 0 {
 		g.nextNodeID++
 		rightNode := newNode(g.nextNodeID, g)
@@ -541,6 +588,9 @@ func (g *Garland) insertIntoLeaf(
 		rightSnap := createLeafSnapshot(rightData, rightDecs, -1)
 		rightNode.setSnapshot(g.currentFork, g.currentRevision, rightSnap)
 		rightID = rightNode.id
+
+		// Update cache for decorations in right node
+		g.updateDecorationCacheForNode(rightID, rightOffset, rightDecs)
 	}
 
 	// Build the result subtree

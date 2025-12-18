@@ -283,7 +283,7 @@ func TestPartitionDecorations(t *testing.T) {
 		{Key: "c", Position: 15},
 	}
 
-	left, right := partitionDecorations(decorations, 10)
+	left, right := partitionDecorations(decorations, 10, true)
 
 	if len(left) != 1 {
 		t.Errorf("Expected 1 left decoration, got %d", len(left))
@@ -495,7 +495,7 @@ func TestForkSeek(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ForkSeek to 0 failed: %v", err)
 	}
-	
+
 	// Need to seek to revision 1 in fork 0 to see "ABase"
 	err = g.UndoSeek(1)
 	if err != nil {

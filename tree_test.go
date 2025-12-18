@@ -560,7 +560,7 @@ func TestByteToRuneOffset(t *testing.T) {
 	data := []byte("Hello, 世界!")
 
 	tests := []struct {
-		byteOff int64
+		byteOff  int64
 		wantRune int64
 	}{
 		{0, 0},
@@ -818,5 +818,84 @@ func TestDeleteRangeWithDecorations(t *testing.T) {
 	data := g.collectLeaves(newRootID)
 	if !bytes.Equal(data, []byte("HelloWorld!")) {
 		t.Errorf("after delete: %q, want %q", string(data), "HelloWorld!")
+	}
+}
+
+func TestFindLeafByLineSpanningLeaves(t *testing.T) {
+	// This test verifies that line:rune addressing works when a line spans
+	// multiple leaves. This can happen after inserts that split the tree.
+	lib, _ := Init(LibraryOptions{})
+	g, _ := lib.Open(FileOptions{DataString: "Hello\nWorld"})
+	defer g.Close()
+
+	// Insert at position 6 (start of "World") to create a split
+	// This should result in: left="Hello\n", right="XXX"+"World"
+	cursor := g.NewCursor()
+	err := cursor.SeekByte(6)
+	if err != nil {
+		t.Fatalf("SeekByte failed: %v", err)
+	}
+	_, err = cursor.InsertBytes([]byte("XXX"), nil, false)
+	if err != nil {
+		t.Fatalf("InsertBytes failed: %v", err)
+	}
+
+	// Content is now "Hello\nXXXWorld"
+	// Line 0 = "Hello\n" (in left leaf)
+	// Line 1 = "XXXWorld" (starts in right leaf)
+
+	// Verify we can find line 1, rune 0 (the 'X')
+	result, err := g.findLeafByLine(1, 0)
+	if err != nil {
+		t.Fatalf("findLeafByLine(1, 0) failed: %v", err)
+	}
+	if result.LineByteStart != 6 {
+		t.Errorf("LineByteStart = %d, want 6", result.LineByteStart)
+	}
+
+	// Verify we can find line 1, rune 3 (the 'W')
+	result, err = g.findLeafByLine(1, 3)
+	if err != nil {
+		t.Fatalf("findLeafByLine(1, 3) failed: %v", err)
+	}
+	// Should be at byte 9 (6 + 3)
+	gotByte := result.LeafResult.LeafByteStart + result.LeafResult.ByteOffset
+	if gotByte != 9 {
+		t.Errorf("Line 1 rune 3 at byte %d, want 9", gotByte)
+	}
+
+	// Also test when the newline is exactly at the leaf boundary
+	g2, _ := lib.Open(FileOptions{DataString: "AB\nCD"})
+	defer g2.Close()
+
+	// Insert right after the newline to split: left="AB\n", right="X"+"CD"
+	cursor2 := g2.NewCursor()
+	err = cursor2.SeekByte(3)
+	if err != nil {
+		t.Fatalf("SeekByte failed: %v", err)
+	}
+	_, err = cursor2.InsertBytes([]byte("X"), nil, false)
+	if err != nil {
+		t.Fatalf("InsertBytes failed: %v", err)
+	}
+
+	// Content is now "AB\nXCD"
+	// Line 1 is "XCD" starting at byte 3
+
+	result, err = g2.findLeafByLine(1, 0)
+	if err != nil {
+		t.Fatalf("g2.findLeafByLine(1, 0) failed: %v", err)
+	}
+	if result.LineByteStart != 3 {
+		t.Errorf("g2 LineByteStart = %d, want 3", result.LineByteStart)
+	}
+
+	result, err = g2.findLeafByLine(1, 2)
+	if err != nil {
+		t.Fatalf("g2.findLeafByLine(1, 2) failed: %v", err)
+	}
+	gotByte = result.LeafResult.LeafByteStart + result.LeafResult.ByteOffset
+	if gotByte != 5 {
+		t.Errorf("g2 Line 1 rune 2 at byte %d, want 5", gotByte)
 	}
 }

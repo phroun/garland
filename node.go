@@ -2,6 +2,7 @@ package garland
 
 import (
 	"crypto/sha256"
+	"time"
 	"unicode/utf8"
 )
 
@@ -58,11 +59,11 @@ type NodeSnapshot struct {
 	rightID NodeID
 
 	// For leaf nodes: data and decorations
-	data            []byte
-	decorations     []Decoration
-	storageState    StorageState
-	dataHash        []byte // SHA-256 hash for verification
-	decorationHash  []byte // SHA-256 hash for decoration verification
+	data           []byte
+	decorations    []Decoration
+	storageState   StorageState
+	dataHash       []byte // SHA-256 hash for verification
+	decorationHash []byte // SHA-256 hash for decoration verification
 
 	// originalFileOffset is the byte offset in the original file where this
 	// content came from. -1 if not from the original file (not eligible for warm storage).
@@ -73,9 +74,19 @@ type NodeSnapshot struct {
 	runeCount int64
 	lineCount int64 // number of newlines
 
+	// runesAfterLastNewline is the number of runes after the last newline in this subtree.
+	// For a leaf with no newlines, this equals runeCount.
+	// For a leaf ending with a newline, this is 0.
+	// For internal nodes, this is derived from children.
+	runesAfterLastNewline int64
+
 	// lineStarts contains the starting positions of each line within this leaf.
 	// Only populated for leaf nodes.
 	lineStarts []LineStart
+
+	// lastAccessTime tracks when this snapshot's data was last accessed.
+	// Used for LRU-based memory management. Zero value means never accessed.
+	lastAccessTime time.Time
 }
 
 // newNode creates a new node with the given ID and Garland reference.
@@ -96,31 +107,50 @@ func (n *Node) ID() NodeID {
 // It searches backwards through revisions if an exact match isn't found,
 // and follows parent forks as needed.
 func (n *Node) snapshotAt(fork ForkID, rev RevisionID) *NodeSnapshot {
+	snap, _ := n.snapshotAtWithKey(fork, rev)
+	return snap
+}
+
+// snapshotAtWithKey returns the node's snapshot and its actual ForkRevision key.
+// It finds the highest revision ≤ target for the given fork, and follows parent forks as needed.
+// Optimized to be O(len(history)) instead of O(revisions).
+func (n *Node) snapshotAtWithKey(fork ForkID, rev RevisionID) (*NodeSnapshot, ForkRevision) {
 	// Try exact match first
-	if snap, ok := n.history[ForkRevision{fork, rev}]; ok {
-		return snap
+	key := ForkRevision{fork, rev}
+	if snap, ok := n.history[key]; ok {
+		return snap, key
 	}
 
-	// Walk back through revisions in this fork
-	for r := rev; r > 0; r-- {
-		if snap, ok := n.history[ForkRevision{fork, r - 1}]; ok {
-			return snap
+	// Find the highest revision ≤ rev for this fork by iterating through actual history entries
+	// This is O(len(history)) which is typically very small (1-2 entries per node)
+	var bestSnap *NodeSnapshot
+	var bestKey ForkRevision
+	bestRev := RevisionID(0)
+	found := false
+
+	for k, snap := range n.history {
+		if k.Fork == fork && k.Revision <= rev {
+			if !found || k.Revision > bestRev {
+				bestSnap = snap
+				bestKey = k
+				bestRev = k.Revision
+				found = true
+			}
 		}
 	}
 
-	// Check revision 0
-	if snap, ok := n.history[ForkRevision{fork, 0}]; ok {
-		return snap
+	if found {
+		return bestSnap, bestKey
 	}
 
 	// If fork has a parent, try parent fork
 	if n.file != nil {
 		if forkInfo, ok := n.file.forks[fork]; ok && forkInfo.ParentFork != fork {
-			return n.snapshotAt(forkInfo.ParentFork, forkInfo.ParentRevision)
+			return n.snapshotAtWithKey(forkInfo.ParentFork, forkInfo.ParentRevision)
 		}
 	}
 
-	return nil // node didn't exist at this version
+	return nil, ForkRevision{} // node didn't exist at this version
 }
 
 // setSnapshot sets the node's snapshot for the given fork and revision.
@@ -136,6 +166,7 @@ func createLeafSnapshot(data []byte, decorations []Decoration, originalOffset in
 		decorations:        decorations,
 		storageState:       StorageMemory,
 		originalFileOffset: originalOffset,
+		lastAccessTime:     time.Now(), // Initialize access time for LRU tracking
 	}
 
 	// Calculate weights
@@ -163,6 +194,18 @@ func createLeafSnapshot(data []byte, decorations []Decoration, originalOffset in
 		runeOffset++
 	}
 
+	// Calculate runes after last newline from lineStarts
+	if snap.lineCount == 0 {
+		// No newlines - all runes are on line 0
+		snap.runesAfterLastNewline = snap.runeCount
+	} else if int(snap.lineCount) < len(snap.lineStarts) {
+		// There's content after the last newline
+		snap.runesAfterLastNewline = snap.runeCount - snap.lineStarts[snap.lineCount].RuneOffset
+	} else {
+		// Leaf ends with newline
+		snap.runesAfterLastNewline = 0
+	}
+
 	// Compute hash
 	snap.dataHash = computeHash(data)
 	if len(decorations) > 0 {
@@ -174,13 +217,24 @@ func createLeafSnapshot(data []byte, decorations []Decoration, originalOffset in
 
 // createInternalSnapshot creates a new internal (non-leaf) snapshot.
 func createInternalSnapshot(leftID, rightID NodeID, leftSnap, rightSnap *NodeSnapshot) *NodeSnapshot {
+	// Calculate runesAfterLastNewline:
+	// - If right has newlines, the last line is entirely in right
+	// - If right has no newlines, the last line spans from left into right
+	var runesAfterLastNewline int64
+	if rightSnap.lineCount > 0 {
+		runesAfterLastNewline = rightSnap.runesAfterLastNewline
+	} else {
+		runesAfterLastNewline = leftSnap.runesAfterLastNewline + rightSnap.runeCount
+	}
+
 	return &NodeSnapshot{
-		isLeaf:    false,
-		leftID:    leftID,
-		rightID:   rightID,
-		byteCount: leftSnap.byteCount + rightSnap.byteCount,
-		runeCount: leftSnap.runeCount + rightSnap.runeCount,
-		lineCount: leftSnap.lineCount + rightSnap.lineCount,
+		isLeaf:                false,
+		leftID:                leftID,
+		rightID:               rightID,
+		byteCount:             leftSnap.byteCount + rightSnap.byteCount,
+		runeCount:             leftSnap.runeCount + rightSnap.runeCount,
+		lineCount:             leftSnap.lineCount + rightSnap.lineCount,
+		runesAfterLastNewline: runesAfterLastNewline,
 	}
 }
 
@@ -244,12 +298,14 @@ func computeDecorationHash(decorations []Decoration) []byte {
 	return computeHash(data)
 }
 
-// partitionDecorations splits decorations at a given byte position.
-// Decorations before pos go to left, decorations at or after pos go to right.
+// partitionDecorations splits decorations at a given position.
+// When insertBefore=true: decorations at pos go to right (will be shifted)
+// When insertBefore=false: decorations at pos go to left (stay in place)
 // Right decorations have their positions adjusted by -pos.
-func partitionDecorations(decorations []Decoration, pos int64) (left, right []Decoration) {
+func partitionDecorations(decorations []Decoration, pos int64, insertBefore bool) (left, right []Decoration) {
 	for _, d := range decorations {
-		if d.Position < pos {
+		goesToLeft := d.Position < pos || (!insertBefore && d.Position == pos)
+		if goesToLeft {
 			left = append(left, d)
 		} else {
 			right = append(right, Decoration{
@@ -267,12 +323,15 @@ type ForkInfo struct {
 	ParentFork      ForkID
 	ParentRevision  RevisionID // revision at which this fork split from parent
 	HighestRevision RevisionID
+	PrunedUpTo      RevisionID // revisions < this have been pruned from this fork's view
+	Deleted         bool       // true if fork is soft-deleted (data may still exist for child forks)
 }
 
 // RevisionInfo contains metadata about a revision for undo history display.
 type RevisionInfo struct {
-	Revision   RevisionID
-	Name       string // from TransactionStart
-	HasChanges bool   // true if actual mutations occurred
-	RootID     NodeID // root node ID at this revision (for UndoSeek)
+	Revision         RevisionID
+	Name             string // from TransactionStart
+	HasChanges       bool   // true if actual mutations occurred
+	RootID           NodeID // root node ID at this revision (for UndoSeek)
+	StreamKnownBytes int64  // bytes of streaming content known when revision was created (-1 if complete)
 }

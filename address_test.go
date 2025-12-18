@@ -42,8 +42,8 @@ func TestAbsoluteAddressStruct(t *testing.T) {
 	// Test manual construction
 	addr := AbsoluteAddress{
 		Mode:     LineRuneMode,
-		Byte:     0,    // not used for this mode
-		Rune:     0,    // not used for this mode
+		Byte:     0, // not used for this mode
+		Rune:     0, // not used for this mode
 		Line:     10,
 		LineRune: 5,
 	}

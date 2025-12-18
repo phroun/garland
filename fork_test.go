@@ -63,6 +63,8 @@ func TestExtensiveForkOperationsWithDecorations(t *testing.T) {
 	}
 
 	// Fork 1: Insert "X" with decoration "mark_X" (different path)
+	// With fork revision inheritance, fork 1 inherits rev 0-1 from parent,
+	// so this edit becomes revision 2 in fork 1
 	cursor.SeekByte(1)
 	_, err = cursor.InsertString("X", []RelativeDecoration{{Key: "mark_X", Position: 0}}, false)
 	if err != nil {
@@ -71,7 +73,10 @@ func TestExtensiveForkOperationsWithDecorations(t *testing.T) {
 	if g.CurrentFork() != 1 {
 		t.Errorf("Expected fork 1, got %d", g.CurrentFork())
 	}
-	t.Logf("Fork 1 Rev 1: %q with mark_X (fork=%d, rev=%d)", readContent(), g.CurrentFork(), g.CurrentRevision())
+	if g.CurrentRevision() != 2 {
+		t.Errorf("Expected revision 2 after fork, got %d", g.CurrentRevision())
+	}
+	t.Logf("Fork 1 Rev 2: %q with mark_X (fork=%d, rev=%d)", readContent(), g.CurrentFork(), g.CurrentRevision())
 
 	// Add more to fork 1 with multiple decorations
 	cursor.SeekByte(2)
@@ -82,25 +87,40 @@ func TestExtensiveForkOperationsWithDecorations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Insert YZ failed: %v", err)
 	}
-	t.Logf("Fork 1 Rev 2: %q with mark_Y,mark_Z (fork=%d, rev=%d)", readContent(), g.CurrentFork(), g.CurrentRevision())
+	if g.CurrentRevision() != 3 {
+		t.Errorf("Expected revision 3 after second edit in fork, got %d", g.CurrentRevision())
+	}
+	t.Logf("Fork 1 Rev 3: %q with mark_Y,mark_Z (fork=%d, rev=%d)", readContent(), g.CurrentFork(), g.CurrentRevision())
 
 	// === Test UndoSeek within Fork 1 ===
 	t.Log("=== UndoSeek within Fork 1 ===")
 
+	// UndoSeek to rev 1 should show parent's content at rev 1
 	err = g.UndoSeek(1)
 	if err != nil {
 		t.Fatalf("UndoSeek to 1 in fork 1 failed: %v", err)
 	}
-	if content := readContent(); content != "AXBASE" {
-		t.Errorf("Fork 1 rev 1: got %q, want %q", content, "AXBASE")
+	if content := readContent(); content != "ABASE" {
+		t.Errorf("Fork 1 rev 1 (from parent): got %q, want %q", content, "ABASE")
 	}
+	t.Logf("Fork 1 at rev 1 (inherited from parent): %q", readContent())
 
+	// UndoSeek to rev 2 should show first fork 1 edit
 	err = g.UndoSeek(2)
 	if err != nil {
 		t.Fatalf("UndoSeek to 2 in fork 1 failed: %v", err)
 	}
+	if content := readContent(); content != "AXBASE" {
+		t.Errorf("Fork 1 rev 2: got %q, want %q", content, "AXBASE")
+	}
+
+	// UndoSeek to rev 3 should show second fork 1 edit
+	err = g.UndoSeek(3)
+	if err != nil {
+		t.Fatalf("UndoSeek to 3 in fork 1 failed: %v", err)
+	}
 	if content := readContent(); content != "AXYZBASE" {
-		t.Errorf("Fork 1 rev 2: got %q, want %q", content, "AXYZBASE")
+		t.Errorf("Fork 1 rev 3: got %q, want %q", content, "AXYZBASE")
 	}
 
 	// === Switch to Fork 0 and verify content preserved ===
@@ -295,6 +315,8 @@ func TestExtensiveForkOperations(t *testing.T) {
 	t.Logf("After UndoSeek(2): %q (fork=%d, rev=%d)", readContent(), g.CurrentFork(), g.CurrentRevision())
 
 	// === Create Fork 1 by editing from revision 2 ===
+	// With fork revision inheritance, fork 1 inherits rev 0-2 from parent,
+	// so the first edit in fork 1 becomes revision 3
 	t.Log("=== Creating Fork 1 by editing from revision 2 ===")
 	cursor.SeekByte(2)
 	_, err = cursor.InsertString("X", nil, false)
@@ -304,10 +326,13 @@ func TestExtensiveForkOperations(t *testing.T) {
 	if g.CurrentFork() != 1 {
 		t.Errorf("After edit from rev 2: fork=%d, want 1", g.CurrentFork())
 	}
+	if g.CurrentRevision() != 3 {
+		t.Errorf("After edit from rev 2: rev=%d, want 3 (inherited 0-2, new is 3)", g.CurrentRevision())
+	}
 	if content := readContent(); content != "ABXBASE" {
 		t.Errorf("After X: got %q, want %q", content, "ABXBASE")
 	}
-	t.Logf("Fork 1 Rev 1: %q (fork=%d, rev=%d)", readContent(), g.CurrentFork(), g.CurrentRevision())
+	t.Logf("Fork 1 Rev 3: %q (fork=%d, rev=%d)", readContent(), g.CurrentFork(), g.CurrentRevision())
 
 	// More changes on Fork 1
 	cursor.SeekByte(3)
@@ -318,7 +343,7 @@ func TestExtensiveForkOperations(t *testing.T) {
 	if content := readContent(); content != "ABXYBASE" {
 		t.Errorf("After Y: got %q, want %q", content, "ABXYBASE")
 	}
-	t.Logf("Fork 1 Rev 2: %q (fork=%d, rev=%d)", readContent(), g.CurrentFork(), g.CurrentRevision())
+	t.Logf("Fork 1 Rev 4: %q (fork=%d, rev=%d)", readContent(), g.CurrentFork(), g.CurrentRevision())
 
 	cursor.SeekByte(4)
 	_, err = cursor.InsertString("Z", nil, false)
@@ -328,41 +353,51 @@ func TestExtensiveForkOperations(t *testing.T) {
 	if content := readContent(); content != "ABXYZBASE" {
 		t.Errorf("After Z: got %q, want %q", content, "ABXYZBASE")
 	}
-	t.Logf("Fork 1 Rev 3: %q (fork=%d, rev=%d)", readContent(), g.CurrentFork(), g.CurrentRevision())
+	t.Logf("Fork 1 Rev 5: %q (fork=%d, rev=%d)", readContent(), g.CurrentFork(), g.CurrentRevision())
 
-	// Now Fork 1 has revisions 0-3 (0 is inherited from fork 0 rev 2)
-	if g.CurrentFork() != 1 || g.CurrentRevision() != 3 {
-		t.Fatalf("After fork 1 changes: fork=%d rev=%d, want fork=1 rev=3", g.CurrentFork(), g.CurrentRevision())
+	// Now Fork 1 has revisions 0-5 (0-2 inherited from fork 0, 3-5 are new)
+	if g.CurrentFork() != 1 || g.CurrentRevision() != 5 {
+		t.Fatalf("After fork 1 changes: fork=%d rev=%d, want fork=1 rev=5", g.CurrentFork(), g.CurrentRevision())
 	}
 
 	// === UndoSeek within Fork 1 ===
 	t.Log("=== UndoSeek within Fork 1 ===")
 
-	// Go back to rev 1 in fork 1
+	// UndoSeek to rev 1 - shows parent's content at rev 1 (before divergence)
 	err = g.UndoSeek(1)
 	if err != nil {
 		t.Fatalf("UndoSeek to 1 in fork 1 failed: %v", err)
 	}
-	if content := readContent(); content != "ABXBASE" {
-		t.Errorf("Fork 1 after UndoSeek(1): got %q, want %q", content, "ABXBASE")
+	if content := readContent(); content != "ABASE" {
+		t.Errorf("Fork 1 after UndoSeek(1) (from parent): got %q, want %q", content, "ABASE")
 	}
-	if g.CurrentFork() != 1 || g.CurrentRevision() != 1 {
-		t.Errorf("After UndoSeek(1): fork=%d rev=%d, want fork=1 rev=1", g.CurrentFork(), g.CurrentRevision())
-	}
-	t.Logf("Fork 1 after UndoSeek(1): %q (fork=%d, rev=%d)", readContent(), g.CurrentFork(), g.CurrentRevision())
+	t.Logf("Fork 1 after UndoSeek(1) (inherited from parent): %q (fork=%d, rev=%d)", readContent(), g.CurrentFork(), g.CurrentRevision())
 
-	// Go forward to rev 3 in fork 1
+	// UndoSeek to rev 3 - shows first fork 1 edit
 	err = g.UndoSeek(3)
 	if err != nil {
 		t.Fatalf("UndoSeek to 3 in fork 1 failed: %v", err)
 	}
-	if content := readContent(); content != "ABXYZBASE" {
-		t.Errorf("Fork 1 after UndoSeek(3): got %q, want %q", content, "ABXYZBASE")
+	if content := readContent(); content != "ABXBASE" {
+		t.Errorf("Fork 1 after UndoSeek(3): got %q, want %q", content, "ABXBASE")
 	}
 	if g.CurrentFork() != 1 || g.CurrentRevision() != 3 {
 		t.Errorf("After UndoSeek(3): fork=%d rev=%d, want fork=1 rev=3", g.CurrentFork(), g.CurrentRevision())
 	}
 	t.Logf("Fork 1 after UndoSeek(3): %q (fork=%d, rev=%d)", readContent(), g.CurrentFork(), g.CurrentRevision())
+
+	// Go forward to rev 5 in fork 1
+	err = g.UndoSeek(5)
+	if err != nil {
+		t.Fatalf("UndoSeek to 5 in fork 1 failed: %v", err)
+	}
+	if content := readContent(); content != "ABXYZBASE" {
+		t.Errorf("Fork 1 after UndoSeek(5): got %q, want %q", content, "ABXYZBASE")
+	}
+	if g.CurrentFork() != 1 || g.CurrentRevision() != 5 {
+		t.Errorf("After UndoSeek(5): fork=%d rev=%d, want fork=1 rev=5", g.CurrentFork(), g.CurrentRevision())
+	}
+	t.Logf("Fork 1 after UndoSeek(5): %q (fork=%d, rev=%d)", readContent(), g.CurrentFork(), g.CurrentRevision())
 
 	// === Switch to Fork 0 ===
 	t.Log("=== Switch to Fork 0 ===")
@@ -433,19 +468,20 @@ func TestExtensiveForkOperations(t *testing.T) {
 	}
 	t.Logf("Fork 1 HEAD: %q (fork=%d, rev=%d)", readContent(), g.CurrentFork(), g.CurrentRevision())
 
-	// Seek back to rev 0 in fork 1 (should see parent fork's rev 2 content)
+	// Seek back to rev 0 in fork 1 - with fork inheritance, rev 0 shows
+	// the actual revision 0 content from the parent fork
 	err = g.UndoSeek(0)
 	if err != nil {
 		t.Fatalf("UndoSeek to 0 in fork 1 failed: %v", err)
 	}
-	// Fork 1 branched from fork 0 rev 2, so rev 0 of fork 1 = fork 0 rev 2 = "ABBASE"
-	if content := readContent(); content != "ABBASE" {
-		t.Errorf("Fork 1 rev 0: got %q, want %q", content, "ABBASE")
+	// Fork 1 inherits rev 0 from fork 0, so rev 0 = "BASE"
+	if content := readContent(); content != "BASE" {
+		t.Errorf("Fork 1 rev 0 (inherited): got %q, want %q", content, "BASE")
 	}
 	if g.CurrentFork() != 1 || g.CurrentRevision() != 0 {
 		t.Errorf("After UndoSeek(0) in fork 1: fork=%d rev=%d, want fork=1 rev=0", g.CurrentFork(), g.CurrentRevision())
 	}
-	t.Logf("Fork 1 rev 0: %q (fork=%d, rev=%d)", readContent(), g.CurrentFork(), g.CurrentRevision())
+	t.Logf("Fork 1 rev 0 (inherited from parent): %q (fork=%d, rev=%d)", readContent(), g.CurrentFork(), g.CurrentRevision())
 
 	// === Create Fork 2 from Fork 1 ===
 	t.Log("=== Create Fork 2 from Fork 1 rev 0 ===")
@@ -457,8 +493,9 @@ func TestExtensiveForkOperations(t *testing.T) {
 	if g.CurrentFork() != 2 {
 		t.Errorf("After edit from fork 1 rev 0: fork=%d, want 2", g.CurrentFork())
 	}
-	if content := readContent(); content != "!ABBASE" {
-		t.Errorf("Fork 2 rev 1: got %q, want %q", content, "!ABBASE")
+	// Fork 2 branches from Fork 1 at rev 0, which has content "BASE"
+	if content := readContent(); content != "!BASE" {
+		t.Errorf("Fork 2 rev 1: got %q, want %q", content, "!BASE")
 	}
 	t.Logf("Fork 2 Rev 1: %q (fork=%d, rev=%d)", readContent(), g.CurrentFork(), g.CurrentRevision())
 
@@ -629,4 +666,200 @@ func TestCursorPositionAcrossVersions(t *testing.T) {
 		t.Errorf("Cursor position %d exceeds content length %d", cursor.BytePos(), g.ByteCount().Value)
 	}
 	t.Logf("After UndoSeek, cursor at: %d (content: %d bytes)", cursor.BytePos(), g.ByteCount().Value)
+}
+
+// TestFindForksBetween tests the FindForksBetween function for fork analysis
+func TestFindForksBetween(t *testing.T) {
+	lib, err := Init(LibraryOptions{})
+	if err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	t.Run("no forks in range", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "Test"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		cursor := g.NewCursor()
+		cursor.InsertString("A", nil, false)
+		cursor.InsertString("B", nil, false)
+
+		// Query range with no fork divergences
+		divergences, err := g.FindForksBetween(0, 2)
+		if err != nil {
+			t.Fatalf("FindForksBetween failed: %v", err)
+		}
+
+		if len(divergences) != 0 {
+			t.Errorf("Expected 0 divergences, got %d", len(divergences))
+		}
+		t.Log("Correctly found no divergences in simple linear history")
+	})
+
+	t.Run("child fork BranchedInto", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "Test"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		cursor := g.NewCursor()
+
+		// Create revisions 1, 2, 3 on fork 0
+		cursor.InsertString("A", nil, false) // rev 1
+		cursor.InsertString("B", nil, false) // rev 2
+		cursor.InsertString("C", nil, false) // rev 3
+
+		// Go back to rev 1 and create a new fork
+		err = g.UndoSeek(1)
+		if err != nil {
+			t.Fatalf("UndoSeek failed: %v", err)
+		}
+
+		cursor.InsertString("X", nil, false) // Creates fork 1, rev 2
+
+		// Return to fork 0
+		err = g.ForkSeek(0)
+		if err != nil {
+			t.Fatalf("ForkSeek failed: %v", err)
+		}
+
+		// From fork 0's perspective, find divergences in range [0, 3]
+		divergences, err := g.FindForksBetween(0, 3)
+		if err != nil {
+			t.Fatalf("FindForksBetween failed: %v", err)
+		}
+
+		if len(divergences) != 1 {
+			t.Errorf("Expected 1 divergence, got %d", len(divergences))
+		}
+
+		if len(divergences) > 0 {
+			d := divergences[0]
+			if d.Fork != 1 {
+				t.Errorf("Expected fork 1, got %d", d.Fork)
+			}
+			if d.DivergenceRev != 1 {
+				t.Errorf("Expected divergence at rev 1, got %d", d.DivergenceRev)
+			}
+			if d.Direction != BranchedInto {
+				t.Errorf("Expected BranchedInto, got %v", d.Direction)
+			}
+			t.Logf("Found divergence: fork=%d at rev=%d direction=%v", d.Fork, d.DivergenceRev, d.Direction)
+		}
+	})
+
+	t.Run("parent fork BranchedFrom", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "Test"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		cursor := g.NewCursor()
+
+		// Create revisions on fork 0
+		cursor.InsertString("A", nil, false) // rev 1
+		cursor.InsertString("B", nil, false) // rev 2
+
+		t.Logf("After creating fork 0: fork=%d, rev=%d", g.CurrentFork(), g.CurrentRevision())
+
+		// Go back and create fork 1
+		err = g.UndoSeek(1)
+		if err != nil {
+			t.Fatalf("UndoSeek failed: %v", err)
+		}
+
+		cursor.InsertString("X", nil, false) // Fork 1, rev 2
+		cursor.InsertString("Y", nil, false) // Fork 1, rev 3
+
+		t.Logf("After creating fork 1: fork=%d, rev=%d", g.CurrentFork(), g.CurrentRevision())
+
+		// We are now on fork 1
+		if g.CurrentFork() != 1 {
+			t.Fatalf("Expected fork 1, got %d", g.CurrentFork())
+		}
+
+		// Get fork info
+		forkInfo, _ := g.GetForkInfo(1)
+		t.Logf("Fork 1 info: highest=%d, parent=%d, parentRev=%d", forkInfo.HighestRevision, forkInfo.ParentFork, forkInfo.ParentRevision)
+
+		// From fork 1's perspective, find divergences
+		// This should show we BranchedFrom fork 0 at rev 1
+		divergences, err := g.FindForksBetween(0, forkInfo.HighestRevision)
+		if err != nil {
+			t.Fatalf("FindForksBetween failed: %v", err)
+		}
+
+		if len(divergences) != 1 {
+			t.Errorf("Expected 1 divergence, got %d", len(divergences))
+		}
+
+		if len(divergences) > 0 {
+			d := divergences[0]
+			if d.Fork != 0 {
+				t.Errorf("Expected parent fork 0, got %d", d.Fork)
+			}
+			if d.DivergenceRev != 1 {
+				t.Errorf("Expected divergence at rev 1, got %d", d.DivergenceRev)
+			}
+			if d.Direction != BranchedFrom {
+				t.Errorf("Expected BranchedFrom, got %v", d.Direction)
+			}
+			t.Logf("Found divergence: fork=%d at rev=%d direction=%v", d.Fork, d.DivergenceRev, d.Direction)
+		}
+	})
+
+	t.Run("multiple divergences", func(t *testing.T) {
+		g, err := lib.Open(FileOptions{DataString: "Test"})
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer g.Close()
+
+		cursor := g.NewCursor()
+
+		// Create revisions on fork 0
+		cursor.InsertString("A", nil, false) // rev 1
+		cursor.InsertString("B", nil, false) // rev 2
+		cursor.InsertString("C", nil, false) // rev 3
+		cursor.InsertString("D", nil, false) // rev 4
+
+		// Create fork 1 from rev 1
+		g.UndoSeek(1)
+		cursor.InsertString("X1", nil, false) // fork 1
+
+		// Go back to fork 0
+		g.ForkSeek(0)
+
+		// Create fork 2 from rev 3
+		g.UndoSeek(3)
+		cursor.InsertString("X2", nil, false) // fork 2
+
+		// Go back to fork 0
+		g.ForkSeek(0)
+
+		// From fork 0, find all divergences in [0, 4]
+		divergences, err := g.FindForksBetween(0, 4)
+		if err != nil {
+			t.Fatalf("FindForksBetween failed: %v", err)
+		}
+
+		if len(divergences) != 2 {
+			t.Errorf("Expected 2 divergences, got %d", len(divergences))
+		}
+
+		// Should be sorted by revision
+		for i, d := range divergences {
+			t.Logf("Divergence %d: fork=%d at rev=%d direction=%v", i, d.Fork, d.DivergenceRev, d.Direction)
+		}
+
+		if len(divergences) >= 2 {
+			if divergences[0].DivergenceRev > divergences[1].DivergenceRev {
+				t.Error("Expected divergences sorted by revision")
+			}
+		}
+	})
 }
