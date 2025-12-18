@@ -4579,8 +4579,9 @@ func (g *Garland) GetDecorationsInByteRange(start, end int64) ([]DecorationEntry
 	if start > g.totalBytes {
 		return nil, ErrInvalidPosition
 	}
-	if end > g.totalBytes {
-		end = g.totalBytes
+	// Allow end up to totalBytes+1 to include EOF decorations
+	if end > g.totalBytes+1 {
+		end = g.totalBytes + 1
 	}
 
 	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
@@ -4602,7 +4603,8 @@ func (g *Garland) collectDecorationsInRangeInternal(node *Node, snap *NodeSnapsh
 	nodeEnd := offset + snap.byteCount
 
 	// Skip if this node is entirely outside the range
-	if nodeEnd <= start || offset >= end {
+	// Use < for nodeEnd to include nodes that may have EOF decorations at nodeEnd
+	if nodeEnd < start || offset >= end {
 		return
 	}
 

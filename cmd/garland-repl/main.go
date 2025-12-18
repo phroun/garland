@@ -1249,9 +1249,9 @@ func (r *REPL) cmdDump() {
 		markers = append(markers, markerInfo{pos: c.BytePos(), name: name, isCursor: true})
 	}
 
-	// Collect decoration positions
+	// Collect decoration positions (use byteCount+1 to include EOF decorations)
 	byteCount := r.garland.ByteCount().Value
-	decorations, _ := r.garland.GetDecorationsInByteRange(0, byteCount)
+	decorations, _ := r.garland.GetDecorationsInByteRange(0, byteCount+1)
 	for _, dec := range decorations {
 		if dec.Address != nil {
 			markers = append(markers, markerInfo{pos: dec.Address.Byte, name: dec.Key, isCursor: false})
@@ -1928,9 +1928,9 @@ func (r *REPL) cmdDecorations(args []string) {
 		return
 	}
 
-	// Otherwise show all decorations in the file
+	// Otherwise show all decorations in the file (use byteCount+1 to include EOF decorations)
 	byteCount := r.garland.ByteCount().Value
-	decs, err := r.garland.GetDecorationsInByteRange(0, byteCount)
+	decs, err := r.garland.GetDecorationsInByteRange(0, byteCount+1)
 	if err != nil {
 		fmt.Printf("Error getting decorations: %v\n", err)
 		return
