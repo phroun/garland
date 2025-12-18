@@ -326,3 +326,409 @@ func TestRegionSerialIncrement(t *testing.T) {
 		t.Errorf("Serial numbers should increment: s1=%d, s2=%d", s1, s2)
 	}
 }
+
+// Integration tests
+
+func TestTransactionStartCheckpointsRegions(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	g, err := lib.Open(FileOptions{DataString: "Hello World"})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer g.Close()
+
+	cursor := g.NewCursor()
+
+	// Begin a region
+	err = cursor.BeginOptimizedRegion(0, 5)
+	if err != nil {
+		t.Fatalf("BeginOptimizedRegion failed: %v", err)
+	}
+
+	if !cursor.HasOptimizedRegion() {
+		t.Fatal("Should have region after BeginOptimizedRegion")
+	}
+
+	// TransactionStart should checkpoint (dissolve) the region
+	err = g.TransactionStart("test")
+	if err != nil {
+		t.Fatalf("TransactionStart failed: %v", err)
+	}
+
+	if cursor.HasOptimizedRegion() {
+		t.Error("TransactionStart should have dissolved the region")
+	}
+
+	g.TransactionCommit()
+}
+
+func TestTransactionCommitDissolvesRegions(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	g, err := lib.Open(FileOptions{DataString: "Hello World"})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer g.Close()
+
+	cursor := g.NewCursor()
+	cursor.SetMode(CursorModeProcess) // Process mode to avoid auto-region on transaction start
+
+	// Start transaction first
+	err = g.TransactionStart("test")
+	if err != nil {
+		t.Fatalf("TransactionStart failed: %v", err)
+	}
+
+	// Explicitly begin a region inside the transaction
+	err = cursor.BeginOptimizedRegion(0, 5)
+	if err != nil {
+		t.Fatalf("BeginOptimizedRegion failed: %v", err)
+	}
+
+	if !cursor.HasOptimizedRegion() {
+		t.Fatal("Should have region after BeginOptimizedRegion")
+	}
+
+	// Commit should dissolve the region
+	_, err = g.TransactionCommit()
+	if err != nil {
+		t.Fatalf("TransactionCommit failed: %v", err)
+	}
+
+	if cursor.HasOptimizedRegion() {
+		t.Error("TransactionCommit should have dissolved the region")
+	}
+}
+
+func TestTransactionRollbackDiscardsRegions(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	g, err := lib.Open(FileOptions{DataString: "Hello World"})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer g.Close()
+
+	cursor := g.NewCursor()
+	cursor.SetMode(CursorModeProcess)
+
+	// Start transaction
+	err = g.TransactionStart("test")
+	if err != nil {
+		t.Fatalf("TransactionStart failed: %v", err)
+	}
+
+	// Begin a region
+	err = cursor.BeginOptimizedRegion(0, 5)
+	if err != nil {
+		t.Fatalf("BeginOptimizedRegion failed: %v", err)
+	}
+
+	// Rollback should discard the region
+	err = g.TransactionRollback()
+	if err != nil {
+		t.Fatalf("TransactionRollback failed: %v", err)
+	}
+
+	if cursor.HasOptimizedRegion() {
+		t.Error("TransactionRollback should have discarded the region")
+	}
+}
+
+func TestMultipleCursorsIndependentRegions(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	g, err := lib.Open(FileOptions{DataString: "Hello World Test Data"})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer g.Close()
+
+	cursor1 := g.NewCursor()
+	cursor2 := g.NewCursor()
+
+	// Both start in Human mode
+	if cursor1.Mode() != CursorModeHuman || cursor2.Mode() != CursorModeHuman {
+		t.Error("Cursors should default to Human mode")
+	}
+
+	// Begin regions on both cursors
+	err = cursor1.BeginOptimizedRegion(0, 5)
+	if err != nil {
+		t.Fatalf("cursor1.BeginOptimizedRegion failed: %v", err)
+	}
+
+	err = cursor2.BeginOptimizedRegion(10, 15)
+	if err != nil {
+		t.Fatalf("cursor2.BeginOptimizedRegion failed: %v", err)
+	}
+
+	// Both should have independent regions
+	if !cursor1.HasOptimizedRegion() || !cursor2.HasOptimizedRegion() {
+		t.Error("Both cursors should have regions")
+	}
+
+	// Serial numbers should be different
+	if cursor1.OptimizedRegionSerial() == cursor2.OptimizedRegionSerial() {
+		t.Error("Region serial numbers should be different")
+	}
+
+	// Bounds should be independent
+	s1, e1, _ := cursor1.OptimizedRegionBounds()
+	s2, e2, _ := cursor2.OptimizedRegionBounds()
+
+	if s1 != 0 || e1 != 5 {
+		t.Errorf("cursor1 bounds = (%d, %d), want (0, 5)", s1, e1)
+	}
+	if s2 != 10 || e2 != 15 {
+		t.Errorf("cursor2 bounds = (%d, %d), want (10, 15)", s2, e2)
+	}
+
+	// Checkpoint should dissolve both
+	err = g.Checkpoint()
+	if err != nil {
+		t.Fatalf("Checkpoint failed: %v", err)
+	}
+
+	if cursor1.HasOptimizedRegion() || cursor2.HasOptimizedRegion() {
+		t.Error("Checkpoint should have dissolved both regions")
+	}
+}
+
+func TestGraceWindowBounds(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	g, err := lib.Open(FileOptions{DataString: "Hello World Test Data Here"})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer g.Close()
+
+	cursor := g.NewCursor()
+
+	// Begin region at position 10-15
+	err = cursor.BeginOptimizedRegion(10, 15)
+	if err != nil {
+		t.Fatalf("BeginOptimizedRegion failed: %v", err)
+	}
+
+	// Check grace window is larger than content bounds
+	graceStart, graceEnd, ok := cursor.OptimizedRegionGraceWindow()
+	if !ok {
+		t.Fatal("Should have grace window")
+	}
+
+	contentStart, contentEnd, _ := cursor.OptimizedRegionBounds()
+
+	// Grace window should encompass content bounds
+	if graceStart > contentStart || graceEnd < contentEnd {
+		t.Errorf("Grace window (%d, %d) should encompass content bounds (%d, %d)",
+			graceStart, graceEnd, contentStart, contentEnd)
+	}
+
+	// Grace window should be larger (by graceWindowSize)
+	if graceEnd-graceStart <= contentEnd-contentStart {
+		t.Error("Grace window should be larger than content bounds")
+	}
+}
+
+func TestRegionContentPreservation(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	g, err := lib.Open(FileOptions{DataString: "Hello World"})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer g.Close()
+
+	cursor := g.NewCursor()
+
+	// Create region covering "Hello"
+	err = cursor.BeginOptimizedRegion(0, 5)
+	if err != nil {
+		t.Fatalf("BeginOptimizedRegion failed: %v", err)
+	}
+
+	// Read original content
+	originalBytes := g.ByteCount().Value
+
+	// Checkpoint to dissolve back to tree
+	err = g.Checkpoint()
+	if err != nil {
+		t.Fatalf("Checkpoint failed: %v", err)
+	}
+
+	// Verify content is preserved
+	afterBytes := g.ByteCount().Value
+
+	if afterBytes != originalBytes {
+		t.Errorf("ByteCount after checkpoint = %d, want %d", afterBytes, originalBytes)
+	}
+
+	// Read actual content
+	data, err := g.readBytesAt(0, afterBytes)
+	if err != nil {
+		t.Fatalf("readBytesAt failed: %v", err)
+	}
+
+	if string(data) != "Hello World" {
+		t.Errorf("Content after checkpoint = %q, want %q", data, "Hello World")
+	}
+}
+
+func TestRegionBeginDissolvesExisting(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	g, err := lib.Open(FileOptions{DataString: "Hello World Test"})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer g.Close()
+
+	cursor := g.NewCursor()
+
+	// Begin first region
+	err = cursor.BeginOptimizedRegion(0, 5)
+	if err != nil {
+		t.Fatalf("First BeginOptimizedRegion failed: %v", err)
+	}
+
+	firstSerial := cursor.OptimizedRegionSerial()
+
+	// Begin second region (should dissolve first)
+	err = cursor.BeginOptimizedRegion(10, 15)
+	if err != nil {
+		t.Fatalf("Second BeginOptimizedRegion failed: %v", err)
+	}
+
+	secondSerial := cursor.OptimizedRegionSerial()
+
+	// Should have a new region with different serial
+	if secondSerial == firstSerial {
+		t.Error("Second region should have different serial")
+	}
+
+	// Bounds should be for second region
+	start, end, _ := cursor.OptimizedRegionBounds()
+	if start != 10 || end != 15 {
+		t.Errorf("Bounds = (%d, %d), want (10, 15)", start, end)
+	}
+}
+
+func TestProcessCursorNoAutoRegion(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	g, err := lib.Open(FileOptions{DataString: "Hello World"})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer g.Close()
+
+	cursor := g.NewCursor()
+	cursor.SetMode(CursorModeProcess)
+
+	// Process cursor should not have region initially
+	if cursor.HasOptimizedRegion() {
+		t.Error("Process cursor should not have auto-region")
+	}
+
+	// Can still explicitly create region
+	err = cursor.BeginOptimizedRegion(0, 5)
+	if err != nil {
+		t.Fatalf("BeginOptimizedRegion failed: %v", err)
+	}
+
+	if !cursor.HasOptimizedRegion() {
+		t.Error("Process cursor should have region after explicit Begin")
+	}
+}
+
+func TestByteBufferRegionBoundaryConditions(t *testing.T) {
+	t.Run("empty region", func(t *testing.T) {
+		r := NewByteBufferRegion([]byte{})
+		if r.ByteCount() != 0 {
+			t.Errorf("Empty region ByteCount = %d, want 0", r.ByteCount())
+		}
+		if r.RuneCount() != 0 {
+			t.Errorf("Empty region RuneCount = %d, want 0", r.RuneCount())
+		}
+		if r.LineCount() != 0 {
+			t.Errorf("Empty region LineCount = %d, want 0", r.LineCount())
+		}
+
+		// Insert into empty
+		err := r.InsertBytes(0, []byte("test"))
+		if err != nil {
+			t.Fatalf("InsertBytes failed: %v", err)
+		}
+		if string(r.Content()) != "test" {
+			t.Errorf("Content = %q, want %q", r.Content(), "test")
+		}
+	})
+
+	t.Run("insert at start", func(t *testing.T) {
+		r := NewByteBufferRegion([]byte("world"))
+		err := r.InsertBytes(0, []byte("hello "))
+		if err != nil {
+			t.Fatalf("InsertBytes failed: %v", err)
+		}
+		if string(r.Content()) != "hello world" {
+			t.Errorf("Content = %q, want %q", r.Content(), "hello world")
+		}
+	})
+
+	t.Run("insert at end", func(t *testing.T) {
+		r := NewByteBufferRegion([]byte("hello"))
+		err := r.InsertBytes(5, []byte(" world"))
+		if err != nil {
+			t.Fatalf("InsertBytes failed: %v", err)
+		}
+		if string(r.Content()) != "hello world" {
+			t.Errorf("Content = %q, want %q", r.Content(), "hello world")
+		}
+	})
+
+	t.Run("delete all", func(t *testing.T) {
+		r := NewByteBufferRegion([]byte("hello"))
+		err := r.DeleteBytes(0, 5)
+		if err != nil {
+			t.Fatalf("DeleteBytes failed: %v", err)
+		}
+		if r.ByteCount() != 0 {
+			t.Errorf("ByteCount = %d, want 0", r.ByteCount())
+		}
+	})
+
+	t.Run("invalid positions", func(t *testing.T) {
+		r := NewByteBufferRegion([]byte("hello"))
+
+		// Insert at negative position
+		err := r.InsertBytes(-1, []byte("x"))
+		if err != ErrInvalidPosition {
+			t.Errorf("InsertBytes(-1) error = %v, want ErrInvalidPosition", err)
+		}
+
+		// Insert past end
+		err = r.InsertBytes(100, []byte("x"))
+		if err != ErrInvalidPosition {
+			t.Errorf("InsertBytes(100) error = %v, want ErrInvalidPosition", err)
+		}
+
+		// Delete at negative position
+		err = r.DeleteBytes(-1, 1)
+		if err != ErrInvalidPosition {
+			t.Errorf("DeleteBytes(-1) error = %v, want ErrInvalidPosition", err)
+		}
+
+		// Delete past end
+		err = r.DeleteBytes(0, 100)
+		if err != ErrInvalidPosition {
+			t.Errorf("DeleteBytes(0, 100) error = %v, want ErrInvalidPosition", err)
+		}
+
+		// Read at invalid position
+		_, err = r.ReadBytes(-1, 1)
+		if err != ErrInvalidPosition {
+			t.Errorf("ReadBytes(-1) error = %v, want ErrInvalidPosition", err)
+		}
+
+		_, err = r.ReadBytes(0, 100)
+		if err != ErrInvalidPosition {
+			t.Errorf("ReadBytes(0, 100) error = %v, want ErrInvalidPosition", err)
+		}
+	})
+}
