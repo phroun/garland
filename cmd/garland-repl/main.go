@@ -182,17 +182,11 @@ func (r *REPL) handleCommand(input string) bool {
 	case "revisions":
 		r.cmdRevisions()
 
-	case "forks":
-		r.cmdForks()
-
-	case "forkswitch":
-		r.cmdForkSwitch(args)
+	case "fork":
+		r.cmdFork(args)
 
 	case "prune":
 		r.cmdPrune(args)
-
-	case "deletefork":
-		r.cmdDeleteFork(args)
 
 	case "version":
 		r.cmdVersion()
@@ -372,16 +366,17 @@ VERSION CONTROL:
   tx rollback               Rollback the current transaction
   undoseek <revision>       Seek to a specific revision in current fork
   revisions                 List revisions in current fork
-  forks                     List all forks
-  forkswitch <fork>         Switch to a different fork
+  fork                      Show current fork info
+  fork list                 List all forks
+  fork <id>                 Switch to a different fork
+  fork delete <id>          Delete a fork (soft-delete, keeps data for child forks)
   prune <revision>          Prune history before revision (current fork)
-  deletefork <id>           Delete a fork (soft-delete, keeps data for child forks)
   divergences               List fork divergence points for entire history
   divergences <from> <to>   List fork divergences in revision range
   version                   Show current fork and revision
 
 NOTE: Forks are created automatically when you edit from a non-HEAD revision.
-      Use 'forkswitch' to navigate between existing forks.
+      Use 'fork <id>' to navigate between existing forks.
 
 DECORATIONS:
   decorate <key>            Add decoration at cursor position
@@ -1579,76 +1574,118 @@ func (r *REPL) cmdRevisions() {
 	}
 }
 
-func (r *REPL) cmdForks() {
+func (r *REPL) cmdFork(args []string) {
 	if !r.ensureGarland() {
 		return
 	}
 
 	g := r.garland
-	forks := g.ListForks()
+
+	// Handle subcommands: fork, fork list, fork <id>, fork delete <id>
+	if len(args) >= 1 {
+		subcmd := strings.ToLower(args[0])
+
+		if subcmd == "list" {
+			// List all forks
+			forks := g.ListForks()
+			currentFork := g.CurrentFork()
+
+			fmt.Printf("Forks (%d total):\n", len(forks))
+			for _, info := range forks {
+				marker := "  "
+				if info.ID == currentFork {
+					marker = "> "
+				}
+				parentInfo := ""
+				if info.ParentFork != info.ID {
+					parentInfo = fmt.Sprintf(" (parent: fork=%d@rev=%d)", info.ParentFork, info.ParentRevision)
+				}
+				prunedInfo := ""
+				if info.PrunedUpTo > 0 {
+					prunedInfo = fmt.Sprintf(" [pruned<%d]", info.PrunedUpTo)
+				}
+				deletedInfo := ""
+				if info.Deleted {
+					deletedInfo = " [DELETED]"
+				}
+				fmt.Printf("%s%d: highest revision %d%s%s%s\n", marker, info.ID, info.HighestRevision, parentInfo, prunedInfo, deletedInfo)
+			}
+			return
+		}
+
+		if subcmd == "delete" {
+			if len(args) < 2 {
+				fmt.Println("Usage: fork delete <fork_id>")
+				fmt.Println("  Soft-deletes a fork (cannot switch to it anymore)")
+				fmt.Println("  Cannot delete current fork")
+				fmt.Printf("Current fork: %d\n", g.CurrentFork())
+				return
+			}
+
+			forkID, err := strconv.ParseUint(args[1], 10, 64)
+			if err != nil {
+				fmt.Printf("Invalid fork ID: %v\n", err)
+				return
+			}
+
+			err = g.DeleteFork(garland.ForkID(forkID))
+			if err != nil {
+				fmt.Printf("Fork delete error: %v\n", err)
+				return
+			}
+
+			fmt.Printf("Fork %d deleted\n", forkID)
+			return
+		}
+
+		// Switch to fork by ID
+		forkID, err := strconv.ParseUint(args[0], 10, 64)
+		if err != nil {
+			fmt.Printf("Invalid fork ID or subcommand: %s\n", args[0])
+			fmt.Println("Usage: fork [list | <id> | delete <id>]")
+			return
+		}
+
+		prevFork := g.CurrentFork()
+		prevRev := g.CurrentRevision()
+
+		err = g.ForkSeek(garland.ForkID(forkID))
+		if err != nil {
+			fmt.Printf("Fork switch error: %v\n", err)
+			return
+		}
+
+		fmt.Printf("Switched from fork=%d/rev=%d to fork=%d/rev=%d\n",
+			prevFork, prevRev, g.CurrentFork(), g.CurrentRevision())
+		fmt.Printf("Content is now %d bytes\n", g.ByteCount().Value)
+
+		// Show cursor position update
+		if cursor := r.cursor(); cursor != nil {
+			line, lineRune := cursor.LinePos()
+			fmt.Printf("Cursor '%s' now at: byte=%d, line=%d:%d\n",
+				r.currentCursor, cursor.BytePos(), line, lineRune)
+		}
+		return
+	}
+
+	// No args - show current fork info
 	currentFork := g.CurrentFork()
-
-	fmt.Printf("Forks (%d total):\n", len(forks))
-	for _, info := range forks {
-		marker := "  "
-		if info.ID == currentFork {
-			marker = "> "
-		}
-		parentInfo := ""
-		if info.ParentFork != info.ID {
-			parentInfo = fmt.Sprintf(" (parent: fork=%d@rev=%d)", info.ParentFork, info.ParentRevision)
-		}
-		prunedInfo := ""
-		if info.PrunedUpTo > 0 {
-			prunedInfo = fmt.Sprintf(" [pruned<%d]", info.PrunedUpTo)
-		}
-		deletedInfo := ""
-		if info.Deleted {
-			deletedInfo = " [DELETED]"
-		}
-		fmt.Printf("%s%d: highest revision %d%s%s%s\n", marker, info.ID, info.HighestRevision, parentInfo, prunedInfo, deletedInfo)
-	}
-}
-
-func (r *REPL) cmdForkSwitch(args []string) {
-	if !r.ensureGarland() {
-		return
-	}
-
-	g := r.garland
-
-	if len(args) < 1 {
-		fmt.Println("Usage: forkswitch <fork_id>")
-		fmt.Printf("Current fork: %d\n", g.CurrentFork())
-		fmt.Println("Use 'forks' to see available forks.")
-		return
-	}
-
-	forkID, err := strconv.ParseUint(args[0], 10, 64)
+	info, err := g.GetForkInfo(currentFork)
 	if err != nil {
-		fmt.Printf("Invalid fork ID: %v\n", err)
+		fmt.Printf("Error getting fork info: %v\n", err)
 		return
 	}
 
-	prevFork := g.CurrentFork()
-	prevRev := g.CurrentRevision()
-
-	err = g.ForkSeek(garland.ForkID(forkID))
-	if err != nil {
-		fmt.Printf("ForkSwitch error: %v\n", err)
-		return
+	fmt.Printf("Current Fork: %d\n", info.ID)
+	fmt.Printf("  Highest Revision: %d\n", info.HighestRevision)
+	fmt.Printf("  Current Revision: %d\n", g.CurrentRevision())
+	if info.ParentFork != info.ID {
+		fmt.Printf("  Parent: fork=%d@rev=%d\n", info.ParentFork, info.ParentRevision)
 	}
-
-	fmt.Printf("Switched from fork=%d/rev=%d to fork=%d/rev=%d\n",
-		prevFork, prevRev, g.CurrentFork(), g.CurrentRevision())
-	fmt.Printf("Content is now %d bytes\n", g.ByteCount().Value)
-
-	// Show cursor position update
-	if cursor := r.cursor(); cursor != nil {
-		line, lineRune := cursor.LinePos()
-		fmt.Printf("Cursor '%s' now at: byte=%d, line=%d:%d\n",
-			r.currentCursor, cursor.BytePos(), line, lineRune)
+	if info.PrunedUpTo > 0 {
+		fmt.Printf("  Pruned up to: %d\n", info.PrunedUpTo)
 	}
+	fmt.Println("\nUse 'fork list' to see all forks.")
 }
 
 func (r *REPL) cmdPrune(args []string) {
@@ -1684,36 +1721,6 @@ func (r *REPL) cmdPrune(args []string) {
 
 	forkInfo, _ := g.GetForkInfo(g.CurrentFork())
 	fmt.Printf("Fork %d pruned: revisions before %d removed\n", g.CurrentFork(), forkInfo.PrunedUpTo)
-}
-
-func (r *REPL) cmdDeleteFork(args []string) {
-	if !r.ensureGarland() {
-		return
-	}
-
-	g := r.garland
-
-	if len(args) < 1 {
-		fmt.Println("Usage: deletefork <fork_id>")
-		fmt.Println("  Soft-deletes a fork (cannot switch to it anymore)")
-		fmt.Println("  Cannot delete fork 0 or current fork")
-		fmt.Printf("Current fork: %d\n", g.CurrentFork())
-		return
-	}
-
-	forkID, err := strconv.ParseUint(args[0], 10, 64)
-	if err != nil {
-		fmt.Printf("Invalid fork ID: %v\n", err)
-		return
-	}
-
-	err = g.DeleteFork(garland.ForkID(forkID))
-	if err != nil {
-		fmt.Printf("DeleteFork error: %v\n", err)
-		return
-	}
-
-	fmt.Printf("Fork %d deleted\n", forkID)
 }
 
 func (r *REPL) cmdVersion() {
