@@ -288,6 +288,9 @@ func (r *REPL) handleCommand(input string) bool {
 	case "rebalance":
 		r.cmdRebalance()
 
+	case "snapshots":
+		r.cmdSnapshots()
+
 	default:
 		fmt.Printf("Unknown command: %s. Type 'help' for available commands.\n", cmd)
 	}
@@ -301,7 +304,8 @@ Available Commands:
 -------------------
 
 FILE OPERATIONS:
-  new <text>                Create a new garland with the given text content
+  new                       Create a new empty garland
+  new "text"                Create a new garland with the given text content
   open <filepath>           Open a file from disk
   save                      Save to original file path
   saveas <filepath>         Save to a new file path
@@ -318,6 +322,9 @@ CURSOR OPERATIONS:
   seek line <line> <rune>   Move cursor to line:rune position
   relseek bytes <delta>     Move cursor relative (+ forward, - backward)
   relseek runes <delta>     Move cursor relative by runes
+  word <n>                  Move by n words (negative = backward)
+  linestart                 Move to start of current line
+  lineend                   Move to end of current line
 
 READ OPERATIONS:
   read bytes <length>       Read bytes from cursor position (advances cursor)
@@ -357,6 +364,8 @@ VERSION CONTROL:
   revisions                 List revisions in current fork
   forks                     List all forks
   forkswitch <fork>         Switch to a different fork
+  prune <revision>          Prune history before revision (current fork)
+  deletefork <id>           Delete a fork (soft-delete, keeps data for child forks)
   divergences               List fork divergence points for entire history
   divergences <from> <to>   List fork divergences in revision range
   version                   Show current fork and revision
@@ -376,6 +385,7 @@ DECORATIONS:
   decorations <line>        List decorations on a specific line
   decoration <key>          Get the position of a specific decoration
   dumpdecorations <path>    Export all decorations to INI file
+  loaddecorations <path>    Load decorations from INI file
 
 STORAGE TIERS:
   chill inactive            Chill data from inactive forks
@@ -426,6 +436,7 @@ MEMORY MANAGEMENT:
   memory                    Show current memory usage statistics
   memchill [count]          Incrementally chill LRU nodes (default: 5 nodes)
   rebalance                 Force tree rebalancing (use sparingly)
+  snapshots                 Show snapshot statistics by fork/revision
 
 Note: Memory management is automatic when soft/hard limits are configured in
 LibraryOptions. These commands allow manual intervention for debugging.
@@ -442,20 +453,23 @@ func (r *REPL) cmdNew(args []string) {
 		r.garland.Close()
 	}
 
-	content := strings.Join(args, " ")
-	g, err := r.lib.Open(garland.FileOptions{DataString: content})
-	if err != nil {
-		// Handle empty string case
-		if content == "" {
-			g, err = r.lib.Open(garland.FileOptions{DataBytes: []byte{}})
-			if err != nil {
-				fmt.Printf("Error creating garland: %v\n", err)
-				return
-			}
-		} else {
-			fmt.Printf("Error creating garland: %v\n", err)
+	// Parse content - either quoted string or empty for new empty garland
+	var content string
+	if len(args) > 0 {
+		input := strings.Join(args, " ")
+		parsed, _, err := r.parseQuotedString(input)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			fmt.Println("Usage: new \"text content\" or new (for empty)")
 			return
 		}
+		content = parsed
+	}
+
+	g, err := r.lib.Open(garland.FileOptions{DataString: content})
+	if err != nil {
+		fmt.Printf("Error creating garland: %v\n", err)
+		return
 	}
 
 	r.garland = g
@@ -3112,6 +3126,34 @@ func (r *REPL) cmdRebalance() {
 		fmt.Printf("Performed %d rotations\n", stats.RotationsPerformed)
 	} else {
 		fmt.Println("Rebalancing complete")
+	}
+}
+
+func (r *REPL) cmdSnapshots() {
+	if !r.ensureGarland() {
+		return
+	}
+
+	stats := r.garland.GetSnapshotStats()
+
+	fmt.Printf("Snapshot Statistics:\n")
+	fmt.Printf("  Total snapshots: %d\n", stats.TotalSnapshots)
+
+	if len(stats.ByFork) > 0 {
+		fmt.Printf("\nBy Fork:\n")
+		for forkID, count := range stats.ByFork {
+			forkInfo, _ := r.garland.GetForkInfo(forkID)
+			status := ""
+			if forkInfo != nil {
+				if forkInfo.Deleted {
+					status = " [DELETED]"
+				}
+				if forkInfo.PrunedUpTo > 0 {
+					status += fmt.Sprintf(" [pruned<%d]", forkInfo.PrunedUpTo)
+				}
+			}
+			fmt.Printf("  Fork %d: %d snapshots%s\n", forkID, count, status)
+		}
 	}
 }
 
