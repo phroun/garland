@@ -1303,9 +1303,9 @@ func (r *REPL) cmdDump() {
 			output.WriteString(")\x1b[0m")
 		}
 
-		// Output decoration marker(s) - dark red foreground with asterisks
+		// Output decoration marker(s) - red foreground with asterisks
 		if len(decorationsHere) > 0 {
-			output.WriteString("\x1b[2;31m*")
+			output.WriteString("\x1b[0;31m*")
 			output.WriteString(strings.Join(decorationsHere, ","))
 			output.WriteString("*\x1b[0m")
 		}
