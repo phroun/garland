@@ -356,11 +356,14 @@ type Garland struct {
 	// Cursors
 	cursors []*Cursor
 
-	// Decoration cache (hints only)
+	// Decoration cache (hints only).
+	// IMPORTANT: Never delete entries from this map! Deletions break undo/history.
+	// To mark a decoration as "not present", set LastKnownNode to 0 instead.
 	decorationCache map[string]*DecorationCacheEntry
 
 	// Pending decoration cache updates (applied when recordMutation is called)
 	pendingDecorationUpdates []pendingDecorationUpdate
+	pendingDecorationDeletes []string
 
 	// Loading state
 	loader         *Loader
@@ -4764,14 +4767,33 @@ func (g *Garland) Decorate(entries []DecorationEntry) (ChangeResult, error) {
 	// Track whether any changes were made
 	changed := false
 
-	// Process deletions first: find and remove decorations by key
-	if len(deletions) > 0 {
+	// Process deletions: use cache for single deletions, tree walk for batch
+	if len(deletions) == 1 {
+		// Single deletion: try cache-based direct removal first
+		removed, err := g.removeDecorationViaCache(deletions[0])
+		if err != nil {
+			return ChangeResult{}, err
+		}
+		if removed {
+			changed = true
+		} else {
+			// Cache miss - fall back to tree walk
+			keySet := map[string]bool{deletions[0]: true}
+			newRootID, didChange, err := g.removeDecorationsInternal(g.root, g.root.snapshotAt(g.currentFork, g.currentRevision), 0, keySet)
+			if err != nil {
+				return ChangeResult{}, err
+			}
+			if didChange {
+				g.root = g.nodeRegistry[newRootID]
+				changed = true
+			}
+		}
+	} else if len(deletions) > 1 {
+		// Batch deletions: use tree walk (single pass for all keys)
 		keySet := make(map[string]bool)
 		for _, key := range deletions {
 			keySet[key] = true
 		}
-
-		// Walk all leaves and remove matching decorations
 		newRootID, didChange, err := g.removeDecorationsInternal(g.root, g.root.snapshotAt(g.currentFork, g.currentRevision), 0, keySet)
 		if err != nil {
 			return ChangeResult{}, err
@@ -4824,22 +4846,26 @@ func (g *Garland) GetDecorationPosition(key string) (AbsoluteAddress, error) {
 	// as a side effect of inserts/deletes (cache doesn't track these movements)
 	inTransaction := g.transaction != nil && g.transaction.hasMutations
 
-	// Check if cached location is current (same fork/revision) and not in transaction
-	if !inTransaction && cacheEntry.LastKnownFork == g.currentFork && cacheEntry.LastKnownRev == g.currentRevision {
+	// Check if cached location is valid (same fork, not in transaction)
+	if !inTransaction && cacheEntry.LastKnownFork == g.currentFork {
 		// NodeID == 0 means "confirmed not present at this fork/revision"
-		if cacheEntry.LastKnownNode == 0 {
+		if cacheEntry.LastKnownNode == 0 && cacheEntry.LastKnownRev == g.currentRevision {
 			return AbsoluteAddress{}, ErrDecorationNotFound
 		}
 
-		// Try cached location directly - O(1) if still valid
-		if node, ok := g.nodeRegistry[cacheEntry.LastKnownNode]; ok {
-			if snap := node.snapshotAt(g.currentFork, g.currentRevision); snap != nil && snap.isLeaf {
-				for _, d := range snap.decorations {
-					if d.Key == key {
-						// Cache hit! Update access time
-						cacheEntry.LastAccess = time.Now()
-						cacheEntry.Tier = CacheTierHot
-						return ByteAddress(cacheEntry.LastKnownOffset + d.Position), nil
+		// Try cached location directly using O(1) history lookup
+		// Avoid snapshotAt which is O(revisions) in worst case
+		if cacheEntry.LastKnownNode != 0 {
+			if node, ok := g.nodeRegistry[cacheEntry.LastKnownNode]; ok {
+				cachedKey := ForkRevision{cacheEntry.LastKnownFork, cacheEntry.LastKnownRev}
+				if snap, ok := node.history[cachedKey]; ok && snap != nil && snap.isLeaf {
+					for _, d := range snap.decorations {
+						if d.Key == key {
+							// Cache hit! Update access time
+							cacheEntry.LastAccess = time.Now()
+							cacheEntry.Tier = CacheTierHot
+							return ByteAddress(cacheEntry.LastKnownOffset + d.Position), nil
+						}
 					}
 				}
 			}
@@ -4953,6 +4979,17 @@ func (g *Garland) applyPendingDecorationUpdates(fork ForkID, rev RevisionID) {
 		}
 	}
 	g.pendingDecorationUpdates = g.pendingDecorationUpdates[:0] // Clear slice, keep capacity
+
+	// Process pending deletions - mark as "confirmed not present" at this revision
+	for _, key := range g.pendingDecorationDeletes {
+		if entry, exists := g.decorationCache[key]; exists {
+			entry.LastKnownFork = fork
+			entry.LastKnownRev = rev
+			entry.LastKnownNode = 0 // 0 = confirmed not present
+			entry.LastAccess = now
+		}
+	}
+	g.pendingDecorationDeletes = g.pendingDecorationDeletes[:0] // Clear slice, keep capacity
 }
 
 // findLeafAtOffset finds the leaf node containing the given byte offset.
@@ -5266,8 +5303,138 @@ func (g *Garland) lineRuneToByteUnlocked(line, runeInLine int64) (int64, error) 
 	return result.LeafResult.LeafByteStart + result.LeafResult.ByteOffset, nil
 }
 
+// removeDecorationViaCache removes a decoration using only the cache hint.
+// Returns true if the decoration was found and removed, false if cache miss (caller should use fallback).
+// This is O(log n) when cache hits, and returns false when cache misses (no tree walk).
+func (g *Garland) removeDecorationViaCache(key string) (bool, error) {
+	// Check cache for hint
+	cacheEntry, exists := g.decorationCache[key]
+	if !exists || cacheEntry.LastKnownNode == 0 {
+		return false, nil // No cache entry or marked as not present
+	}
+
+	// Check if cache is for current fork (different fork = definitely stale)
+	if cacheEntry.LastKnownFork != g.currentFork {
+		return false, nil // Wrong fork, need fallback
+	}
+
+	// Try to access the cached node directly
+	node, ok := g.nodeRegistry[cacheEntry.LastKnownNode]
+	if !ok {
+		return false, nil // Node doesn't exist, need fallback
+	}
+
+	// Fast path: Check if node has a snapshot at the cached revision (O(1) lookup)
+	// Avoid calling snapshotAt which is O(revisions) in worst case
+	cachedKey := ForkRevision{cacheEntry.LastKnownFork, cacheEntry.LastKnownRev}
+	snap, ok := node.history[cachedKey]
+	if !ok || snap == nil || !snap.isLeaf {
+		return false, nil // Node wasn't valid at cached revision, need fallback
+	}
+
+	// Look for the decoration in this leaf
+	var newDecs []Decoration
+	removed := false
+	for _, d := range snap.decorations {
+		if d.Key == key {
+			removed = true
+		} else {
+			newDecs = append(newDecs, d)
+		}
+	}
+
+	if !removed {
+		return false, nil // Decoration not in this leaf, need fallback
+	}
+
+	// Create new leaf with filtered decorations
+	g.nextNodeID++
+	newLeaf := newNode(g.nextNodeID, g)
+	g.nodeRegistry[newLeaf.id] = newLeaf
+	newSnap := createLeafSnapshot(snap.data, newDecs, snap.originalFileOffset)
+	newLeaf.setSnapshot(g.currentFork, g.currentRevision, newSnap)
+
+	// Queue cache update to mark as deleted
+	g.pendingDecorationDeletes = append(g.pendingDecorationDeletes, key)
+
+	// Rebuild the path from this leaf to root
+	leafResult := &LeafSearchResult{
+		LeafByteStart: cacheEntry.LastKnownOffset,
+	}
+	newRootID, err := g.rebuildFromLeaf(leafResult, newLeaf.id)
+	if err != nil {
+		return false, err
+	}
+
+	g.root = g.nodeRegistry[newRootID]
+	return true, nil
+}
+
+// removeDecorationDirect removes a single decoration by key using targeted lookup.
+// Returns new root ID and whether the decoration was found and removed.
+func (g *Garland) removeDecorationDirect(key string) (NodeID, bool, error) {
+	// Use cache hint if available
+	var hintOffset int64
+	if cacheEntry, exists := g.decorationCache[key]; exists {
+		hintOffset = cacheEntry.LastKnownOffset
+	}
+
+	// Find the decoration's location
+	_, nodeID, nodeOffset, found := g.findDecorationWithHint(key, hintOffset)
+	if !found {
+		return g.root.id, false, nil
+	}
+
+	// Get the leaf node and its snapshot
+	node, ok := g.nodeRegistry[nodeID]
+	if !ok {
+		return g.root.id, false, nil
+	}
+	snap := node.snapshotAt(g.currentFork, g.currentRevision)
+	if snap == nil || !snap.isLeaf {
+		return g.root.id, false, nil
+	}
+
+	// Create new decorations list without the deleted key
+	var newDecs []Decoration
+	removed := false
+	for _, d := range snap.decorations {
+		if d.Key == key {
+			removed = true
+		} else {
+			newDecs = append(newDecs, d)
+		}
+	}
+
+	if !removed {
+		return g.root.id, false, nil
+	}
+
+	// Create new leaf with filtered decorations
+	g.nextNodeID++
+	newLeaf := newNode(g.nextNodeID, g)
+	g.nodeRegistry[newLeaf.id] = newLeaf
+	newSnap := createLeafSnapshot(snap.data, newDecs, snap.originalFileOffset)
+	newLeaf.setSnapshot(g.currentFork, g.currentRevision, newSnap)
+
+	// Queue cache removal
+	g.pendingDecorationDeletes = append(g.pendingDecorationDeletes, key)
+
+	// Rebuild the path from this leaf to root
+	leafResult := &LeafSearchResult{
+		LeafByteStart: nodeOffset,
+	}
+	newRootID, err := g.rebuildFromLeaf(leafResult, newLeaf.id)
+	if err != nil {
+		return 0, false, err
+	}
+
+	return newRootID, true, nil
+}
+
 // removeDecorationsInternal recursively walks the tree and removes decorations matching the given keys.
 // Returns the new node ID and whether any changes were made.
+// DEPRECATED: This is slow O(n) - use removeDecorationDirect for targeted removal.
 func (g *Garland) removeDecorationsInternal(node *Node, snap *NodeSnapshot, offset int64, keys map[string]bool) (NodeID, bool, error) {
 	if snap == nil {
 		return node.id, false, nil
