@@ -462,7 +462,7 @@ func (g *Garland) insertInternal(
 	if snap.isLeaf {
 		// We've found the leaf to insert into
 		localPos := insertPos - offset
-		return g.insertIntoLeaf(snap, localPos, data, decorations, insertBefore)
+		return g.insertIntoLeaf(snap, localPos, offset, data, decorations, insertBefore)
 	}
 
 	// Internal node: determine which child contains the insertion point
@@ -514,9 +514,11 @@ func (g *Garland) insertInternal(
 
 // insertIntoLeaf handles insertion within a leaf node.
 // Returns the ID of the new subtree (which may be a single leaf or internal nodes).
+// absoluteOffset is the byte offset where this leaf starts in the document.
 func (g *Garland) insertIntoLeaf(
 	snap *NodeSnapshot,
 	localPos int64,
+	absoluteOffset int64,
 	data []byte,
 	decorations []RelativeDecoration,
 	insertBefore bool,
@@ -551,6 +553,7 @@ func (g *Garland) insertIntoLeaf(
 
 	// Create new left leaf (original content before insertion point)
 	var leftID NodeID
+	leftOffset := absoluteOffset
 	if len(leftData) > 0 || len(leftDecs) > 0 {
 		g.nextNodeID++
 		leftNode := newNode(g.nextNodeID, g)
@@ -558,9 +561,13 @@ func (g *Garland) insertIntoLeaf(
 		leftSnap := createLeafSnapshot(leftData, leftDecs, -1)
 		leftNode.setSnapshot(g.currentFork, g.currentRevision, leftSnap)
 		leftID = leftNode.id
+
+		// Update cache for decorations in left node
+		g.updateDecorationCacheForNode(leftID, leftOffset, leftDecs)
 	}
 
 	// Create new middle leaf (inserted content)
+	middleOffset := absoluteOffset + int64(len(leftData))
 	g.nextNodeID++
 	middleNode := newNode(g.nextNodeID, g)
 	g.nodeRegistry[middleNode.id] = middleNode
@@ -568,8 +575,12 @@ func (g *Garland) insertIntoLeaf(
 	middleNode.setSnapshot(g.currentFork, g.currentRevision, middleSnap)
 	middleID := middleNode.id
 
+	// Update cache for newly inserted decorations
+	g.updateDecorationCacheForNode(middleID, middleOffset, absoluteDecs)
+
 	// Create new right leaf (original content after insertion point)
 	var rightID NodeID
+	rightOffset := middleOffset + int64(len(data))
 	if len(rightData) > 0 || len(rightDecs) > 0 {
 		g.nextNodeID++
 		rightNode := newNode(g.nextNodeID, g)
@@ -577,6 +588,9 @@ func (g *Garland) insertIntoLeaf(
 		rightSnap := createLeafSnapshot(rightData, rightDecs, -1)
 		rightNode.setSnapshot(g.currentFork, g.currentRevision, rightSnap)
 		rightID = rightNode.id
+
+		// Update cache for decorations in right node
+		g.updateDecorationCacheForNode(rightID, rightOffset, rightDecs)
 	}
 
 	// Build the result subtree
