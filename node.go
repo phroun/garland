@@ -112,8 +112,8 @@ func (n *Node) snapshotAt(fork ForkID, rev RevisionID) *NodeSnapshot {
 }
 
 // snapshotAtWithKey returns the node's snapshot and its actual ForkRevision key.
-// It searches backwards through revisions if an exact match isn't found,
-// and follows parent forks as needed.
+// It finds the highest revision ≤ target for the given fork, and follows parent forks as needed.
+// Optimized to be O(len(history)) instead of O(revisions).
 func (n *Node) snapshotAtWithKey(fork ForkID, rev RevisionID) (*NodeSnapshot, ForkRevision) {
 	// Try exact match first
 	key := ForkRevision{fork, rev}
@@ -121,18 +121,26 @@ func (n *Node) snapshotAtWithKey(fork ForkID, rev RevisionID) (*NodeSnapshot, Fo
 		return snap, key
 	}
 
-	// Walk back through revisions in this fork
-	for r := rev; r > 0; r-- {
-		key = ForkRevision{fork, r - 1}
-		if snap, ok := n.history[key]; ok {
-			return snap, key
+	// Find the highest revision ≤ rev for this fork by iterating through actual history entries
+	// This is O(len(history)) which is typically very small (1-2 entries per node)
+	var bestSnap *NodeSnapshot
+	var bestKey ForkRevision
+	bestRev := RevisionID(0)
+	found := false
+
+	for k, snap := range n.history {
+		if k.Fork == fork && k.Revision <= rev {
+			if !found || k.Revision > bestRev {
+				bestSnap = snap
+				bestKey = k
+				bestRev = k.Revision
+				found = true
+			}
 		}
 	}
 
-	// Check revision 0
-	key = ForkRevision{fork, 0}
-	if snap, ok := n.history[key]; ok {
-		return snap, key
+	if found {
+		return bestSnap, bestKey
 	}
 
 	// If fork has a parent, try parent fork
