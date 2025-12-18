@@ -286,7 +286,7 @@ type DecorationCacheEntry struct {
 	// Last known location (hint for search)
 	LastKnownFork   ForkID
 	LastKnownRev    RevisionID
-	LastKnownNode   NodeID     // 0 means "confirmed not present at this fork/revision"
+	LastKnownNode   NodeID // 0 means "confirmed not present at this fork/revision"
 	LastKnownOffset int64
 
 	// Cache management
