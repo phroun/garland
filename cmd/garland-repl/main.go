@@ -1228,38 +1228,54 @@ func (r *REPL) cmdDump() {
 	savedPos := cursor.BytePos()
 
 	// Collect cursor positions BEFORE reading (reading advances cursors)
-	type cursorPos struct {
-		name string
-		pos  int64
+	type markerInfo struct {
+		pos        int64
+		name       string
+		isCursor   bool // true = cursor, false = decoration
 	}
-	var cursorPositions []cursorPos
+	var markers []markerInfo
+
 	for name, c := range r.cursors {
-		cursorPositions = append(cursorPositions, cursorPos{name: name, pos: c.BytePos()})
+		markers = append(markers, markerInfo{pos: c.BytePos(), name: name, isCursor: true})
 	}
-	sort.Slice(cursorPositions, func(i, j int) bool {
-		return cursorPositions[i].pos < cursorPositions[j].pos
+
+	// Collect decoration positions
+	byteCount := r.garland.ByteCount().Value
+	decorations, _ := r.garland.GetDecorationsInByteRange(0, byteCount)
+	for _, dec := range decorations {
+		if dec.Address != nil {
+			markers = append(markers, markerInfo{pos: dec.Address.Byte, name: dec.Key, isCursor: false})
+		}
+	}
+
+	// Sort all markers by position
+	sort.Slice(markers, func(i, j int) bool {
+		if markers[i].pos != markers[j].pos {
+			return markers[i].pos < markers[j].pos
+		}
+		// Cursors before decorations at same position
+		return markers[i].isCursor && !markers[j].isCursor
 	})
 
 	// Read all content
 	cursor.SeekByte(0)
-	byteCount := r.garland.ByteCount().Value
 	data, err := cursor.ReadBytes(byteCount)
 	if err != nil {
 		fmt.Printf("Read error: %v\n", err)
 		return
 	}
 
-	// Build output with cursor markers inserted at their positions
-	// ANSI: \x1b[1;32m = bold green, \x1b[0m = reset
+	// Build output with markers inserted at their positions
+	// ANSI: \x1b[1;32m = bold green (cursors), \x1b[41m = red background (decorations), \x1b[0m = reset
 	var output strings.Builder
 	dataStr := string(data)
 	lastPos := int64(0)
 
-	// Group cursors at the same position
-	for i := 0; i < len(cursorPositions); {
-		pos := cursorPositions[i].pos
+	// Group markers at the same position
+	for i := 0; i < len(markers); {
+		pos := markers[i].pos
 
-		// Output text from last position to this cursor position
+		// Output text from last position to this marker position
 		if pos > lastPos && lastPos < int64(len(dataStr)) {
 			endPos := pos
 			if endPos > int64(len(dataStr)) {
@@ -1268,22 +1284,36 @@ func (r *REPL) cmdDump() {
 			output.WriteString(dataStr[lastPos:endPos])
 		}
 
-		// Collect all cursors at this position
+		// Collect all cursors and decorations at this position
 		var cursorsHere []string
-		for i < len(cursorPositions) && cursorPositions[i].pos == pos {
-			cursorsHere = append(cursorsHere, cursorPositions[i].name)
+		var decorationsHere []string
+		for i < len(markers) && markers[i].pos == pos {
+			if markers[i].isCursor {
+				cursorsHere = append(cursorsHere, markers[i].name)
+			} else {
+				decorationsHere = append(decorationsHere, markers[i].name)
+			}
 			i++
 		}
 
-		// Output cursor marker(s)
-		output.WriteString("\x1b[1;32m(")
-		output.WriteString(strings.Join(cursorsHere, ","))
-		output.WriteString(")\x1b[0m")
+		// Output cursor marker(s) - bold green with parentheses
+		if len(cursorsHere) > 0 {
+			output.WriteString("\x1b[1;32m(")
+			output.WriteString(strings.Join(cursorsHere, ","))
+			output.WriteString(")\x1b[0m")
+		}
+
+		// Output decoration marker(s) - red background with asterisks
+		if len(decorationsHere) > 0 {
+			output.WriteString("\x1b[41m*")
+			output.WriteString(strings.Join(decorationsHere, ","))
+			output.WriteString("*\x1b[0m")
+		}
 
 		lastPos = pos
 	}
 
-	// Output remaining text after last cursor
+	// Output remaining text after last marker
 	if lastPos < int64(len(dataStr)) {
 		output.WriteString(dataStr[lastPos:])
 	}
