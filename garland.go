@@ -1707,9 +1707,20 @@ func (g *Garland) DeleteFork(fork ForkID) error {
 		}
 	}
 
-	// Clean up revisionInfo for this fork
+	// Clean up revisionInfo for this fork's unique revisions only.
+	// Find the highest revision that any child fork needs from this fork.
+	maxNeededRevision := RevisionID(0)
+	for _, otherFork := range g.forks {
+		if !otherFork.Deleted && otherFork.ParentFork == fork {
+			if otherFork.ParentRevision > maxNeededRevision {
+				maxNeededRevision = otherFork.ParentRevision
+			}
+		}
+	}
+
+	// Only delete revisionInfo for revisions beyond what child forks need
 	for forkRev := range g.revisionInfo {
-		if forkRev.Fork == fork {
+		if forkRev.Fork == fork && forkRev.Revision > maxNeededRevision {
 			delete(g.revisionInfo, forkRev)
 		}
 	}

@@ -194,17 +194,23 @@ func TestDeleteForkCannotDeleteLastFork(t *testing.T) {
 		t.Error("Should not be able to switch to deleted fork 0")
 	}
 
-	// Fork 1 can still access its own revisions and render content
-	// (the underlying data snapshots from fork 0 are preserved)
+	// Fork 1 can still access its own revision
 	err = g.UndoSeek(1) // Fork 1's revision 1
 	if err != nil {
 		t.Errorf("Fork 1 should still access its own revision 1: %v", err)
 	}
 
-	// Verify content is intact (data inherited from fork 0)
+	// Fork 1 can still access shared history (revision 0) via UndoSeek
+	err = g.UndoSeek(0)
+	if err != nil {
+		t.Errorf("Fork 1 should still access shared revision 0 after fork 0 deleted: %v", err)
+	}
+
+	// Verify content at revision 0 is correct (original "BASE")
+	cursor.SeekByte(0)
 	data, _ := cursor.ReadBytes(100)
-	if len(data) == 0 {
-		t.Error("Fork 1 should still have content (inherited data preserved)")
+	if string(data) != "BASE" {
+		t.Errorf("Content at revision 0 should be 'BASE', got '%s'", string(data))
 	}
 }
 
@@ -572,12 +578,21 @@ func TestDeleteOriginalForkWithChildForksNeeding(t *testing.T) {
 	fork0SnapshotsAfterDelete := countSnapshotsInFork(g, 0)
 	t.Logf("Fork 0 has %d snapshots after deletion (shared history preserved)", fork0SnapshotsAfterDelete)
 
-	// Fork 1 should still have access to its data
-	// (forks 1 and 2 branched at rev 2, inheriting content from fork 0's revisions 0-2)
+	// Fork 1 should still have access to shared history via UndoSeek
+	// (forks 1 and 2 branched at rev 2, inheriting revisions 0-2 from fork 0)
 	g.ForkSeek(1)
 
-	// Fork 1 can access its own revisions (not fork 0's revisions)
-	// Fork 1 has revisions 3, 4 (its own edits after branching)
+	// Fork 1 can access the shared revisions (0, 1, 2) even though fork 0 is deleted
+	err = g.UndoSeek(0)
+	if err != nil {
+		t.Errorf("Fork 1 should access shared revision 0: %v", err)
+	}
+	err = g.UndoSeek(2)
+	if err != nil {
+		t.Errorf("Fork 1 should access shared revision 2 (branch point): %v", err)
+	}
+
+	// Fork 1 can also access its own revisions (3, 4)
 	err = g.UndoSeek(3)
 	if err != nil {
 		t.Errorf("Fork 1 should access its own revision 3: %v", err)
