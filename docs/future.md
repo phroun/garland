@@ -2,25 +2,6 @@
 
 This document outlines incomplete features and potential enhancements for the Garland text editor library.
 
-## Incomplete Features
-
-These features have partial implementations that should be completed:
-
-### 1. File Change Detection
-
-**Location:** `storage.go` line ~127
-
-The `HasChanged()` method on `localFileSystem` returns `ErrNotSupported`.
-
-**Current behavior:** Cannot detect if the source file was modified externally.
-
-**Desired behavior:** Compare file mtime and size against cached values to detect external modifications.
-
-**Implementation notes:**
-- Store mtime and size when file is opened
-- Compare against current values in `HasChanged()`
-- Consider inode checking on Unix systems
-
 ## Missing Features
 
 These are features that don't exist yet but would enhance the library:
@@ -99,6 +80,7 @@ Minor improvements for the REPL demo application:
 
 The following features have been implemented:
 
+- **File Change Detection** - Detects external file modifications (append, modify, truncate, replace, delete); warm storage trust levels with lazy verification; append policies for log tailing; source file watching with configurable intervals
 - **Lazy loading blocking** - `waitFor*` functions now block with timeout support; `Is*Ready` check methods for non-blocking guards
 - **Find/Search** - String and regex search with case sensitivity, whole word matching, forward/backward
 - **Find and Replace** - Single, all, and count-limited replacement with regex capture group expansion
@@ -128,7 +110,7 @@ These are application-layer concerns, not appropriate for a backend text buffer 
 ## Priority Recommendations
 
 ### High Priority (Core Functionality)
-1. File change detection - safety feature
+1. Diff between revisions - debugging/comparison feature
 
 ### Medium Priority (Quality of Life)
-2. Diff between revisions - debugging/comparison feature
+2. Word selection and deletion - editing convenience
