@@ -336,32 +336,11 @@ func (g *Garland) touchSnapshot(snap *NodeSnapshot) {
 }
 
 // updateMemoryTracking adjusts the memory tracking when data is loaded or chilled.
-// When memory increases and exceeds hard limit with no cold storage, sets pressure flag.
+// Note: This is called while holding g.mu, so it must not acquire any other locks
+// that could cause deadlock. Memory pressure checks are done separately via
+// CheckMemoryPressure which is called after mutations complete.
 func (g *Garland) updateMemoryTracking(delta int64) {
 	g.memoryBytes += delta
-
-	// Check for memory pressure when memory increases
-	if delta > 0 && g.lib != nil && g.lib.memoryHardLimit > 0 {
-		totalUsage := g.lib.TotalMemoryUsage()
-		if totalUsage > g.lib.memoryHardLimit {
-			// Try to chill some data
-			if g.lib.coldStorageBackend != nil && g.loadingStyle != MemoryOnly {
-				// We have cold storage - try to reduce
-				s := g.lib.IncrementalChill(g.lib.chillBudgetPerTick)
-				if s.NodesChilled == 0 {
-					// Couldn't chill anything - set pressure
-					g.lib.mu.Lock()
-					g.lib.memoryPressure = true
-					g.lib.mu.Unlock()
-				}
-			} else {
-				// No cold storage available - definitely under pressure
-				g.lib.mu.Lock()
-				g.lib.memoryPressure = true
-				g.lib.mu.Unlock()
-			}
-		}
-	}
 }
 
 // recalculateMemoryUsage recalculates the total memory usage from scratch.
