@@ -624,4 +624,3 @@ func TestDecorationEncodeDecode(t *testing.T) {
 		}
 	}
 }
-

@@ -7,67 +7,67 @@ import (
 
 func TestCreateLeafSnapshot(t *testing.T) {
 	tests := []struct {
-		name          string
-		data          []byte
-		wantBytes     int64
-		wantRunes     int64
-		wantLines     int64
+		name           string
+		data           []byte
+		wantBytes      int64
+		wantRunes      int64
+		wantLines      int64
 		wantLineStarts int
 	}{
 		{
-			name:          "empty",
-			data:          []byte{},
-			wantBytes:     0,
-			wantRunes:     0,
-			wantLines:     0,
+			name:           "empty",
+			data:           []byte{},
+			wantBytes:      0,
+			wantRunes:      0,
+			wantLines:      0,
 			wantLineStarts: 1, // always has at least line 0
 		},
 		{
-			name:          "simple ascii",
-			data:          []byte("Hello"),
-			wantBytes:     5,
-			wantRunes:     5,
-			wantLines:     0,
+			name:           "simple ascii",
+			data:           []byte("Hello"),
+			wantBytes:      5,
+			wantRunes:      5,
+			wantLines:      0,
 			wantLineStarts: 1,
 		},
 		{
-			name:          "with newline",
-			data:          []byte("Hello\nWorld"),
-			wantBytes:     11,
-			wantRunes:     11,
-			wantLines:     1,
+			name:           "with newline",
+			data:           []byte("Hello\nWorld"),
+			wantBytes:      11,
+			wantRunes:      11,
+			wantLines:      1,
 			wantLineStarts: 2,
 		},
 		{
-			name:          "multiple newlines",
-			data:          []byte("a\nb\nc\n"),
-			wantBytes:     6,
-			wantRunes:     6,
-			wantLines:     3,
+			name:           "multiple newlines",
+			data:           []byte("a\nb\nc\n"),
+			wantBytes:      6,
+			wantRunes:      6,
+			wantLines:      3,
 			wantLineStarts: 3, // lines start at 0, 2, 4; no line start after final \n since it's at EOF
 		},
 		{
-			name:          "unicode",
-			data:          []byte("Hello, 世界!"),
-			wantBytes:     14, // 7 ASCII + 6 bytes for 2 CJK chars + 1 for !
-			wantRunes:     10,
-			wantLines:     0,
+			name:           "unicode",
+			data:           []byte("Hello, 世界!"),
+			wantBytes:      14, // 7 ASCII + 6 bytes for 2 CJK chars + 1 for !
+			wantRunes:      10,
+			wantLines:      0,
 			wantLineStarts: 1,
 		},
 		{
-			name:          "unicode with newlines",
-			data:          []byte("你好\n世界"),
-			wantBytes:     13, // 6 + 1 + 6
-			wantRunes:     5,  // 2 + 1 + 2
-			wantLines:     1,
+			name:           "unicode with newlines",
+			data:           []byte("你好\n世界"),
+			wantBytes:      13, // 6 + 1 + 6
+			wantRunes:      5,  // 2 + 1 + 2
+			wantLines:      1,
 			wantLineStarts: 2,
 		},
 		{
-			name:          "emoji",
-			data:          []byte("Hello 👋"),
-			wantBytes:     10, // 6 ASCII ("Hello ") + 4 bytes for emoji
-			wantRunes:     7,  // 6 ASCII runes + 1 emoji rune
-			wantLines:     0,
+			name:           "emoji",
+			data:           []byte("Hello 👋"),
+			wantBytes:      10, // 6 ASCII ("Hello ") + 4 bytes for emoji
+			wantRunes:      7,  // 6 ASCII runes + 1 emoji rune
+			wantLines:      0,
 			wantLineStarts: 1,
 		},
 	}

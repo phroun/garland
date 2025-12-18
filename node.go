@@ -59,11 +59,11 @@ type NodeSnapshot struct {
 	rightID NodeID
 
 	// For leaf nodes: data and decorations
-	data            []byte
-	decorations     []Decoration
-	storageState    StorageState
-	dataHash        []byte // SHA-256 hash for verification
-	decorationHash  []byte // SHA-256 hash for decoration verification
+	data           []byte
+	decorations    []Decoration
+	storageState   StorageState
+	dataHash       []byte // SHA-256 hash for verification
+	decorationHash []byte // SHA-256 hash for decoration verification
 
 	// originalFileOffset is the byte offset in the original file where this
 	// content came from. -1 if not from the original file (not eligible for warm storage).

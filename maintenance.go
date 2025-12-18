@@ -7,19 +7,19 @@ import (
 
 // MemoryStats contains current memory usage statistics.
 type MemoryStats struct {
-	MemoryBytes     int64 // bytes of in-memory leaf data
-	SoftLimit       int64 // configured soft limit (0 = disabled)
-	HardLimit       int64 // configured hard limit (0 = disabled)
-	InMemoryLeaves  int   // count of leaves with data in memory
-	ColdStoredLeaves int  // count of leaves with data in cold storage
-	WarmStoredLeaves int  // count of leaves with data in warm storage
+	MemoryBytes      int64 // bytes of in-memory leaf data
+	SoftLimit        int64 // configured soft limit (0 = disabled)
+	HardLimit        int64 // configured hard limit (0 = disabled)
+	InMemoryLeaves   int   // count of leaves with data in memory
+	ColdStoredLeaves int   // count of leaves with data in cold storage
+	WarmStoredLeaves int   // count of leaves with data in warm storage
 }
 
 // MaintenanceStats contains statistics from a maintenance run.
 type MaintenanceStats struct {
-	NodesChilled    int   // number of nodes moved to cold storage
-	BytesChilled    int64 // bytes moved to cold storage
-	RotationsPerformed int // number of tree rotations performed
+	NodesChilled       int   // number of nodes moved to cold storage
+	BytesChilled       int64 // bytes moved to cold storage
+	RotationsPerformed int   // number of tree rotations performed
 }
 
 // MemoryUsage returns current memory statistics for this Garland.

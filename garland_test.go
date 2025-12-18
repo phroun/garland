@@ -495,7 +495,7 @@ func TestForkSeek(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ForkSeek to 0 failed: %v", err)
 	}
-	
+
 	// Need to seek to revision 1 in fork 0 to see "ABase"
 	err = g.UndoSeek(1)
 	if err != nil {

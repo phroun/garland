@@ -1234,9 +1234,9 @@ func (r *REPL) cmdDump() {
 
 	// Collect cursor positions BEFORE reading (reading advances cursors)
 	type markerInfo struct {
-		pos        int64
-		name       string
-		isCursor   bool // true = cursor, false = decoration
+		pos      int64
+		name     string
+		isCursor bool // true = cursor, false = decoration
 	}
 	var markers []markerInfo
 

@@ -32,7 +32,7 @@ func TestDecorationSlidingOnInsert(t *testing.T) {
 	// First, let's insert with decorations at different positions
 	cursor.SeekByte(0)
 	_, err = cursor.InsertString("", []RelativeDecoration{
-		{Key: "mark_0", Position: 0},  // At "H"
+		{Key: "mark_0", Position: 0}, // At "H"
 	}, false)
 	if err != nil {
 		t.Fatalf("Insert decoration at 0 failed: %v", err)
@@ -40,7 +40,7 @@ func TestDecorationSlidingOnInsert(t *testing.T) {
 
 	cursor.SeekByte(5)
 	_, err = cursor.InsertString("", []RelativeDecoration{
-		{Key: "mark_5", Position: 0},  // At " " (space)
+		{Key: "mark_5", Position: 0}, // At " " (space)
 	}, false)
 	if err != nil {
 		t.Fatalf("Insert decoration at 5 failed: %v", err)
@@ -48,7 +48,7 @@ func TestDecorationSlidingOnInsert(t *testing.T) {
 
 	cursor.SeekByte(6)
 	_, err = cursor.InsertString("", []RelativeDecoration{
-		{Key: "mark_6", Position: 0},  // At "W"
+		{Key: "mark_6", Position: 0}, // At "W"
 	}, false)
 	if err != nil {
 		t.Fatalf("Insert decoration at 6 failed: %v", err)
@@ -721,9 +721,12 @@ func TestDecorationNearCursorBoundaries(t *testing.T) {
 // based on the insertBefore flag when a decoration is exactly at the insert point.
 //
 // insertBefore=false: Insert AFTER cursor position. Decorations at insert point should STAY
-//                     (the new text goes after the decoration's logical position).
+//
+//	(the new text goes after the decoration's logical position).
+//
 // insertBefore=true:  Insert BEFORE cursor position. Decorations at insert point should SLIDE
-//                     (the new text goes before the decoration's logical position).
+//
+//	(the new text goes before the decoration's logical position).
 func TestDecorationInsertBeforeFlag(t *testing.T) {
 	lib, err := Init(LibraryOptions{})
 	if err != nil {
@@ -1241,9 +1244,9 @@ func TestDecorateFunction(t *testing.T) {
 		addr1 := ByteAddress(3)
 		addr2 := ByteAddress(7)
 		result, err := g.Decorate([]DecorationEntry{
-			{Key: "to_delete", Address: nil},  // delete
-			{Key: "new_D", Address: &addr1},   // add at position 3
-			{Key: "new_H", Address: &addr2},   // add at position 7
+			{Key: "to_delete", Address: nil}, // delete
+			{Key: "new_D", Address: &addr1},  // add at position 3
+			{Key: "new_H", Address: &addr2},  // add at position 7
 		})
 		if err != nil {
 			t.Fatalf("Mixed operations failed: %v", err)

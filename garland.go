@@ -309,8 +309,8 @@ type Garland struct {
 
 	// Tree structure
 	root         *Node
-	eofNode      *Node              // special node for EOF decorations
-	nodeRegistry map[NodeID]*Node   // all nodes
+	eofNode      *Node            // special node for EOF decorations
+	nodeRegistry map[NodeID]*Node // all nodes
 	nextNodeID   NodeID
 	// Structure lookup: maps (leftID, rightID) to the internal node with those children
 	// This allows us to reuse internal nodes instead of creating new ones
@@ -5064,9 +5064,9 @@ func escapeForPreview(s string) string {
 
 // SnapshotStats contains statistics about node snapshots.
 type SnapshotStats struct {
-	TotalSnapshots   int                    // Total snapshots across all nodes
-	ByFork           map[ForkID]int         // Snapshots per fork
-	ByForkRevision   map[ForkRevision]int   // Snapshots per fork/revision
+	TotalSnapshots int                  // Total snapshots across all nodes
+	ByFork         map[ForkID]int       // Snapshots per fork
+	ByForkRevision map[ForkRevision]int // Snapshots per fork/revision
 }
 
 // GetSnapshotStats returns statistics about node snapshots.

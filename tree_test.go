@@ -560,7 +560,7 @@ func TestByteToRuneOffset(t *testing.T) {
 	data := []byte("Hello, 世界!")
 
 	tests := []struct {
-		byteOff int64
+		byteOff  int64
 		wantRune int64
 	}{
 		{0, 0},
