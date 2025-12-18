@@ -301,10 +301,9 @@ func (g *Garland) findLeafByLineInternal(
 	// The target line relative to start
 	relTargetLine := targetLine - lineStart
 
-	// Use <= because if left has N newlines, line N starts in the left subtree
-	// (after the Nth newline) even though the line might extend into the right subtree
-	if relTargetLine <= leftLines {
-		// Target line starts within left subtree
+	// Determine which subtree to descend into
+	if relTargetLine < leftLines {
+		// Line is entirely in left subtree
 		return g.findLeafByLineInternal(
 			leftNode,
 			leftSnap,
@@ -316,7 +315,26 @@ func (g *Garland) findLeafByLineInternal(
 		)
 	}
 
-	// Target line is in right subtree (or spans the boundary, but we go right)
+	if relTargetLine == leftLines {
+		// Line starts in left subtree (or at boundary) and may extend into right.
+		// Check if the requested rune position is within the left subtree's portion.
+		if runeInLine < leftSnap.runesAfterLastNewline {
+			// Rune is in left subtree
+			return g.findLeafByLineInternal(
+				leftNode,
+				leftSnap,
+				targetLine,
+				runeInLine,
+				byteStart,
+				runeStart,
+				lineStart,
+			)
+		}
+		// Rune is in right subtree - adjust runeInLine by subtracting what's in left
+		runeInLine -= leftSnap.runesAfterLastNewline
+	}
+
+	// Target line (or remaining runes) is in right subtree
 	rightNode := g.nodeRegistry[snap.rightID]
 	if rightNode == nil {
 		return nil, ErrInvalidPosition

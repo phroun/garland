@@ -74,6 +74,12 @@ type NodeSnapshot struct {
 	runeCount int64
 	lineCount int64 // number of newlines
 
+	// runesAfterLastNewline is the number of runes after the last newline in this subtree.
+	// For a leaf with no newlines, this equals runeCount.
+	// For a leaf ending with a newline, this is 0.
+	// For internal nodes, this is derived from children.
+	runesAfterLastNewline int64
+
 	// lineStarts contains the starting positions of each line within this leaf.
 	// Only populated for leaf nodes.
 	lineStarts []LineStart
@@ -180,6 +186,18 @@ func createLeafSnapshot(data []byte, decorations []Decoration, originalOffset in
 		runeOffset++
 	}
 
+	// Calculate runes after last newline from lineStarts
+	if snap.lineCount == 0 {
+		// No newlines - all runes are on line 0
+		snap.runesAfterLastNewline = snap.runeCount
+	} else if int(snap.lineCount) < len(snap.lineStarts) {
+		// There's content after the last newline
+		snap.runesAfterLastNewline = snap.runeCount - snap.lineStarts[snap.lineCount].RuneOffset
+	} else {
+		// Leaf ends with newline
+		snap.runesAfterLastNewline = 0
+	}
+
 	// Compute hash
 	snap.dataHash = computeHash(data)
 	if len(decorations) > 0 {
@@ -191,13 +209,24 @@ func createLeafSnapshot(data []byte, decorations []Decoration, originalOffset in
 
 // createInternalSnapshot creates a new internal (non-leaf) snapshot.
 func createInternalSnapshot(leftID, rightID NodeID, leftSnap, rightSnap *NodeSnapshot) *NodeSnapshot {
+	// Calculate runesAfterLastNewline:
+	// - If right has newlines, the last line is entirely in right
+	// - If right has no newlines, the last line spans from left into right
+	var runesAfterLastNewline int64
+	if rightSnap.lineCount > 0 {
+		runesAfterLastNewline = rightSnap.runesAfterLastNewline
+	} else {
+		runesAfterLastNewline = leftSnap.runesAfterLastNewline + rightSnap.runeCount
+	}
+
 	return &NodeSnapshot{
-		isLeaf:    false,
-		leftID:    leftID,
-		rightID:   rightID,
-		byteCount: leftSnap.byteCount + rightSnap.byteCount,
-		runeCount: leftSnap.runeCount + rightSnap.runeCount,
-		lineCount: leftSnap.lineCount + rightSnap.lineCount,
+		isLeaf:                false,
+		leftID:                leftID,
+		rightID:               rightID,
+		byteCount:             leftSnap.byteCount + rightSnap.byteCount,
+		runeCount:             leftSnap.runeCount + rightSnap.runeCount,
+		lineCount:             leftSnap.lineCount + rightSnap.lineCount,
+		runesAfterLastNewline: runesAfterLastNewline,
 	}
 }
 
