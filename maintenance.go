@@ -476,6 +476,7 @@ func (g *Garland) ForceRebalance() MaintenanceStats {
 	if newRootID != 0 && newRootID != g.root.id {
 		g.root = g.nodeRegistry[newRootID]
 		stats.RotationsPerformed = -1 // indicates full rebuild
+		g.nodeManipulations = 0       // reset counter after rebalance
 	}
 
 	return stats
