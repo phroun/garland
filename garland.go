@@ -1506,6 +1506,14 @@ func (g *Garland) CurrentRevision() RevisionID {
 	return g.currentRevision
 }
 
+// NodeManipulations returns the count of node operations since the last rebalance.
+// This is a cheap counter incremented during tree mutations.
+func (g *Garland) NodeManipulations() int64 {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.nodeManipulations
+}
+
 // ByteCount returns total bytes (or known bytes if still loading).
 // For revisions created during streaming, includes the streaming remainder.
 func (g *Garland) ByteCount() CountResult {
