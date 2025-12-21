@@ -346,6 +346,9 @@ type Garland struct {
 	// This allows us to reuse internal nodes instead of creating new ones
 	internalNodesByChildren map[[2]NodeID]NodeID
 
+	// Tree balance tracking
+	nodeManipulations int64 // count of node operations since last rebalance
+
 	// Versioning
 	currentFork     ForkID
 	currentRevision RevisionID
