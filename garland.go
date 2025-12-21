@@ -346,6 +346,9 @@ type Garland struct {
 	// This allows us to reuse internal nodes instead of creating new ones
 	internalNodesByChildren map[[2]NodeID]NodeID
 
+	// Tree balance tracking
+	nodeManipulations int64 // count of node operations since last rebalance
+
 	// Versioning
 	currentFork     ForkID
 	currentRevision RevisionID
@@ -1501,6 +1504,14 @@ func (g *Garland) CurrentFork() ForkID {
 // CurrentRevision returns the current revision number within the current fork.
 func (g *Garland) CurrentRevision() RevisionID {
 	return g.currentRevision
+}
+
+// NodeManipulations returns the count of node operations since the last rebalance.
+// This is a cheap counter incremented during tree mutations.
+func (g *Garland) NodeManipulations() int64 {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.nodeManipulations
 }
 
 // ByteCount returns total bytes (or known bytes if still loading).

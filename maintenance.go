@@ -389,6 +389,11 @@ func (g *Garland) IncrementalRebalance(affectedPath []NodeID) MaintenanceStats {
 		}
 	}
 
+	// Reset manipulation counter when rebalancing occurs
+	if stats.RotationsPerformed > 0 {
+		g.nodeManipulations = 0
+	}
+
 	return stats
 }
 

@@ -380,6 +380,7 @@ func (g *Garland) splitLeaf(node *Node, snap *NodeSnapshot, bytePos int64) (Node
 
 	// Create left leaf
 	g.nextNodeID++
+	g.nodeManipulations++
 	leftNode := newNode(g.nextNodeID, g)
 	g.nodeRegistry[leftNode.id] = leftNode
 
@@ -390,6 +391,7 @@ func (g *Garland) splitLeaf(node *Node, snap *NodeSnapshot, bytePos int64) (Node
 
 	// Create right leaf
 	g.nextNodeID++
+	g.nodeManipulations++
 	rightNode := newNode(g.nextNodeID, g)
 	g.nodeRegistry[rightNode.id] = rightNode
 
@@ -439,6 +441,7 @@ func (g *Garland) concatenate(leftID, rightID NodeID) (NodeID, error) {
 
 	// Create new internal node
 	g.nextNodeID++
+	g.nodeManipulations++
 	internalNode := newNode(g.nextNodeID, g)
 	g.nodeRegistry[internalNode.id] = internalNode
 	g.internalNodesByChildren[key] = internalNode.id
@@ -556,6 +559,7 @@ func (g *Garland) insertIntoLeaf(
 	leftOffset := absoluteOffset
 	if len(leftData) > 0 || len(leftDecs) > 0 {
 		g.nextNodeID++
+		g.nodeManipulations++
 		leftNode := newNode(g.nextNodeID, g)
 		g.nodeRegistry[leftNode.id] = leftNode
 		leftSnap := createLeafSnapshot(leftData, leftDecs, -1)
@@ -569,6 +573,7 @@ func (g *Garland) insertIntoLeaf(
 	// Create new middle leaf (inserted content)
 	middleOffset := absoluteOffset + int64(len(leftData))
 	g.nextNodeID++
+	g.nodeManipulations++
 	middleNode := newNode(g.nextNodeID, g)
 	g.nodeRegistry[middleNode.id] = middleNode
 	middleSnap := createLeafSnapshot(data, absoluteDecs, -1)
@@ -583,6 +588,7 @@ func (g *Garland) insertIntoLeaf(
 	rightOffset := middleOffset + int64(len(data))
 	if len(rightData) > 0 || len(rightDecs) > 0 {
 		g.nextNodeID++
+		g.nodeManipulations++
 		rightNode := newNode(g.nextNodeID, g)
 		g.nodeRegistry[rightNode.id] = rightNode
 		rightSnap := createLeafSnapshot(rightData, rightDecs, -1)
@@ -705,6 +711,7 @@ func (g *Garland) deleteRangeInternal(
 
 		// Create new leaf
 		g.nextNodeID++
+		g.nodeManipulations++
 		newNode := newNode(g.nextNodeID, g)
 		g.nodeRegistry[newNode.id] = newNode
 		newSnap := createLeafSnapshot(newData, newDecs, -1)
