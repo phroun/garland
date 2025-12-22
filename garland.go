@@ -3146,6 +3146,13 @@ func (g *Garland) byteToLineRuneInternal(bytePos int64) (int64, int64, error) {
 	// Calculate rune position within the line
 	runeInLine := result.RuneOffset - lineRuneStart
 
+	// If we're on line 0 of this leaf (which might be a continuation from a previous leaf),
+	// we need to add the runes that came before this leaf on the same line.
+	if line == 0 && result.LeafByteStart > 0 {
+		runesBefore := g.countRunesOnLineBeforeLeaf(result.LeafByteStart)
+		runeInLine += runesBefore
+	}
+
 	return absoluteLine, runeInLine, nil
 }
 
@@ -3219,6 +3226,13 @@ func (g *Garland) byteToLineRuneInternalUnlocked(bytePos int64) (int64, int64, e
 
 	// Calculate rune position within the line
 	runeInLine := result.RuneOffset - lineRuneStart
+
+	// If we're on line 0 of this leaf (which might be a continuation from a previous leaf),
+	// we need to add the runes that came before this leaf on the same line.
+	if line == 0 && result.LeafByteStart > 0 {
+		runesBefore := g.countRunesOnLineBeforeLeaf(result.LeafByteStart)
+		runeInLine += runesBefore
+	}
 
 	return absoluteLine, runeInLine, nil
 }
@@ -3545,6 +3559,71 @@ func (g *Garland) countLinesBeforeByteInternal(node *Node, snap *NodeSnapshot, t
 	rightSnap := rightNode.snapshotAt(g.currentFork, g.currentRevision)
 
 	return leftSnap.lineCount + g.countLinesBeforeByteInternal(rightNode, rightSnap, targetByte, leftEnd)
+}
+
+// countRunesOnLineBeforeLeaf counts the runes on the current line that come before the leaf at byteStart.
+// This is used when a leaf continues a line from a previous leaf.
+func (g *Garland) countRunesOnLineBeforeLeaf(byteStart int64) int64 {
+	if byteStart == 0 {
+		return 0
+	}
+
+	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
+	if rootSnap == nil {
+		return 0
+	}
+
+	return g.countRunesOnLineBeforeByteInternal(g.root, rootSnap, byteStart, 0)
+}
+
+func (g *Garland) countRunesOnLineBeforeByteInternal(node *Node, snap *NodeSnapshot, targetByte int64, currentByte int64) int64 {
+	if snap.isLeaf {
+		// We've reached a leaf that's entirely before the target position.
+		// Return its runesAfterLastNewline contribution.
+		return snap.runesAfterLastNewline
+	}
+
+	leftNode := g.nodeRegistry[snap.leftID]
+	leftSnap := leftNode.snapshotAt(g.currentFork, g.currentRevision)
+
+	leftEnd := currentByte + leftSnap.byteCount
+
+	if targetByte < leftEnd {
+		// Target is within left subtree
+		return g.countRunesOnLineBeforeByteInternal(leftNode, leftSnap, targetByte, currentByte)
+	}
+
+	if targetByte == leftEnd {
+		// Target is exactly at the start of right subtree.
+		// Count only from left subtree's last line.
+		return leftSnap.runesAfterLastNewline
+	}
+
+	// Target is within right subtree (targetByte > leftEnd)
+	rightNode := g.nodeRegistry[snap.rightID]
+	rightSnap := rightNode.snapshotAt(g.currentFork, g.currentRevision)
+
+	rightResult := g.countRunesOnLineBeforeByteInternal(rightNode, rightSnap, targetByte, leftEnd)
+
+	// If the right portion before targetByte has no newlines,
+	// we need to add the runesAfterLastNewline from the left subtree
+	if g.countLinesInRange(leftEnd, targetByte) == 0 {
+		return leftSnap.runesAfterLastNewline + rightResult
+	}
+
+	return rightResult
+}
+
+// countLinesInRange counts the number of newlines in the byte range [start, end).
+func (g *Garland) countLinesInRange(start, end int64) int64 {
+	if start >= end {
+		return 0
+	}
+
+	// Find lines at end, subtract lines at start
+	linesAtEnd := g.countLinesBeforeLeaf(end)
+	linesAtStart := g.countLinesBeforeLeaf(start)
+	return linesAtEnd - linesAtStart
 }
 
 // Mutation operations
