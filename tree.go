@@ -751,15 +751,27 @@ func (g *Garland) deleteRangeInternal(
 			newData = append(newData, snap.data[localEnd:]...)
 		}
 
-		// Build new decorations (adjust positions)
+		// Build new decorations:
+		// - Decorations before deletion: keep as-is
+		// - Decorations in deleted range: consolidate to deletion point (localStart)
+		// - Decorations after deletion: shift left by deleted amount
 		var newDecs []Decoration
+		deleteLen := localEnd - localStart
 		for _, d := range snap.decorations {
 			if d.Position < localStart {
+				// Before deletion - keep as-is
 				newDecs = append(newDecs, d)
-			} else if d.Position >= localEnd {
+			} else if d.Position < localEnd {
+				// In deleted range - consolidate to deletion point
 				newDecs = append(newDecs, Decoration{
 					Key:      d.Key,
-					Position: d.Position - (localEnd - localStart),
+					Position: localStart,
+				})
+			} else {
+				// After deletion - shift left
+				newDecs = append(newDecs, Decoration{
+					Key:      d.Key,
+					Position: d.Position - deleteLen,
 				})
 			}
 		}
@@ -771,6 +783,9 @@ func (g *Garland) deleteRangeInternal(
 		g.nodeRegistry[newNode.id] = newNode
 		newSnap := createLeafSnapshot(newData, newDecs, -1)
 		newNode.setSnapshot(g.currentFork, g.currentRevision, newSnap)
+
+		// Queue decoration cache updates for the new leaf
+		g.updateDecorationCacheForNode(newNode.id, nodeStart, newDecs)
 
 		return newNode.id, nil
 	}

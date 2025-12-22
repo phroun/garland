@@ -88,7 +88,8 @@ func TestDecorationPositionAfterInsert(t *testing.T) {
 	}
 }
 
-// TestDecorationPositionAfterDelete verifies decorations are handled correctly after deletions.
+// TestDecorationPositionAfterDelete verifies decorations are consolidated after deletions.
+// Decorations within a deleted range are NOT removed - they are consolidated to the deletion point.
 func TestDecorationPositionAfterDelete(t *testing.T) {
 	lib, err := Init(LibraryOptions{})
 	if err != nil {
@@ -104,8 +105,9 @@ func TestDecorationPositionAfterDelete(t *testing.T) {
 	// Set decorations
 	decorations := map[string]int64{
 		"before_delete": 2,  // 'l' - before deleted range
-		"in_delete":     4,  // 'o' - inside deleted range (should be removed)
-		"at_end":        7,  // 'o' in World - at end of delete range
+		"in_delete":     4,  // 'o' - inside deleted range (consolidated to deletion point)
+		"in_delete2":    5,  // ' ' - inside deleted range (consolidated to deletion point)
+		"at_end":        7,  // 'o' in World - at boundary of delete range
 		"after_delete":  9,  // 'l' in World - after deleted range
 	}
 
@@ -131,17 +133,19 @@ func TestDecorationPositionAfterDelete(t *testing.T) {
 	content, _ := cursor.ReadString(100)
 	t.Logf("After delete: %q", content)
 
-	// Expected:
+	// Expected - decorations in deleted range are CONSOLIDATED to deletion point:
 	// "before_delete" at 2 -> stays at 2
-	// "in_delete" at 4 -> DELETED (in deleted range)
-	// "at_end" at 7 -> moves to 4 (end of deleted range becomes start)
+	// "in_delete" at 4 -> consolidated to 4 (deletion point)
+	// "in_delete2" at 5 -> consolidated to 4 (deletion point)
+	// "at_end" at 7 -> moves to 4 (shifted left by 3)
 	// "after_delete" at 9 -> moves to 6 (shifted left by 3)
 	expected := map[string]int64{
 		"before_delete": 2,
-		"at_end":        4,
-		"after_delete":  6,
+		"in_delete":     4, // consolidated to deletion point
+		"in_delete2":    4, // consolidated to deletion point
+		"at_end":        4, // was at 7, shifted left by 3
+		"after_delete":  6, // was at 9, shifted left by 3
 	}
-	deleted := []string{"in_delete"}
 
 	for key, expectedPos := range expected {
 		pos, err := g.GetDecorationPosition(key)
@@ -152,15 +156,6 @@ func TestDecorationPositionAfterDelete(t *testing.T) {
 		t.Logf("Decoration %s: position %d (expected %d)", key, pos.Byte, expectedPos)
 		if pos.Byte != expectedPos {
 			t.Errorf("Decoration %s: expected position %d, got %d", key, expectedPos, pos.Byte)
-		}
-	}
-
-	for _, key := range deleted {
-		_, err := g.GetDecorationPosition(key)
-		if err == nil {
-			t.Errorf("Decoration %s should have been deleted", key)
-		} else {
-			t.Logf("Decoration %s correctly deleted", key)
 		}
 	}
 }
