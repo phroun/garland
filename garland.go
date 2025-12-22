@@ -3146,6 +3146,12 @@ func (g *Garland) byteToLineRuneInternal(bytePos int64) (int64, int64, error) {
 	// Calculate rune position within the line
 	runeInLine := result.RuneOffset - lineRuneStart
 
+	// If we're on line 0 of this leaf (which might be a continuation from a previous leaf),
+	// add the runes that came before this leaf on the same line.
+	if line == 0 {
+		runeInLine += result.RunesOnLineBeforeLeaf
+	}
+
 	return absoluteLine, runeInLine, nil
 }
 
@@ -3219,6 +3225,12 @@ func (g *Garland) byteToLineRuneInternalUnlocked(bytePos int64) (int64, int64, e
 
 	// Calculate rune position within the line
 	runeInLine := result.RuneOffset - lineRuneStart
+
+	// If we're on line 0 of this leaf (which might be a continuation from a previous leaf),
+	// add the runes that came before this leaf on the same line.
+	if line == 0 {
+		runeInLine += result.RunesOnLineBeforeLeaf
+	}
 
 	return absoluteLine, runeInLine, nil
 }
