@@ -252,20 +252,24 @@ func (g *Garland) findLeafByLineInternal(
 			// Line starts at beginning of this leaf's contribution
 			byteOffset = 0
 			runeOffset = 0
-		} else {
-			// Find the line start from lineStarts
-			if int(relLine) >= len(snap.lineStarts) {
-				return nil, ErrInvalidPosition
-			}
+		} else if int(relLine) < len(snap.lineStarts) {
+			// Line starts within this leaf (after a newline)
 			byteOffset = snap.lineStarts[relLine].ByteOffset
 			runeOffset = snap.lineStarts[relLine].RuneOffset
+		} else if int(relLine) == len(snap.lineStarts) && runeInLine == 0 {
+			// Seeking to the line that starts at the END of this leaf
+			// This is valid when the leaf ends with a newline and we want position 0 of next line
+			byteOffset = int64(len(snap.data))
+			runeOffset = snap.runeCount
+		} else {
+			return nil, ErrInvalidPosition
 		}
 
 		// Add runeInLine offset (need to convert to bytes)
 		finalRuneOffset := runeOffset + runeInLine
 		finalByteOffset := runeToByteOffset(snap.data, finalRuneOffset)
 
-		// Validate the position is within this leaf
+		// Validate the position is within this leaf (allow equal for EOF position)
 		if finalByteOffset > int64(len(snap.data)) {
 			return nil, ErrInvalidPosition
 		}

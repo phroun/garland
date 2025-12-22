@@ -3172,6 +3172,9 @@ func (r *REPL) cmdMemory() {
 	} else {
 		fmt.Println("  Tree status:        Balanced")
 	}
+
+	// Show node manipulation count (useful for determining when to rebalance)
+	fmt.Printf("  Node manipulations: %d (since last rebalance)\n", r.garland.NodeManipulations())
 }
 
 func (r *REPL) cmdMemChill(args []string) {

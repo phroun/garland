@@ -3086,8 +3086,48 @@ func (g *Garland) byteToLineRuneInternal(bytePos int64) (int64, int64, error) {
 		return 0, 0, err
 	}
 
-	// Find which line within the leaf
 	snap := result.Snapshot
+
+	// Handle position at the end of a leaf (ByteOffset == len(data)) or in empty leaf
+	// We need to look at the previous byte to determine line position
+	if (result.ByteOffset == int64(len(snap.data)) || len(snap.data) == 0) && bytePos > 0 {
+		// Find the leaf containing the last byte of actual content
+		prevResult, err := g.findLeafByByte(bytePos - 1)
+		if err != nil {
+			return 0, 0, err
+		}
+		prevSnap := prevResult.Snapshot
+
+		// Check if the last character is a newline
+		lastByte := prevSnap.data[len(prevSnap.data)-1]
+		if lastByte == '\n' {
+			// We're on a new line after the newline
+			// Count all lines up to and including this leaf
+			absoluteLine := g.countLinesBeforeLeaf(result.LeafByteStart) + snap.lineCount
+			return absoluteLine, 0, nil
+		}
+
+		// We're at the end of the last line (after last non-newline char)
+		// Find line info from the previous leaf
+		line := int64(0)
+		lineRuneStart := int64(0)
+		prevOffset := int64(len(prevSnap.data)) // We're at the end of this leaf
+
+		for i := len(prevSnap.lineStarts) - 1; i >= 0; i-- {
+			if prevSnap.lineStarts[i].ByteOffset <= prevOffset {
+				line = int64(i)
+				lineRuneStart = prevSnap.lineStarts[i].RuneOffset
+				break
+			}
+		}
+
+		absoluteLine := g.countLinesBeforeLeaf(prevResult.LeafByteStart) + line
+		runeInLine := prevSnap.runeCount - lineRuneStart
+
+		return absoluteLine, runeInLine, nil
+	}
+
+	// Normal case: find which line within the leaf
 	line := int64(0)
 	lineRuneStart := int64(0)
 
@@ -3120,8 +3160,48 @@ func (g *Garland) byteToLineRuneInternalUnlocked(bytePos int64) (int64, int64, e
 		return 0, 0, err
 	}
 
-	// Find which line within the leaf
 	snap := result.Snapshot
+
+	// Handle position at the end of a leaf (ByteOffset == len(data)) or in empty leaf
+	// We need to look at the previous byte to determine line position
+	if (result.ByteOffset == int64(len(snap.data)) || len(snap.data) == 0) && bytePos > 0 {
+		// Find the leaf containing the last byte of actual content
+		prevResult, err := g.findLeafByByteUnlocked(bytePos - 1)
+		if err != nil {
+			return 0, 0, err
+		}
+		prevSnap := prevResult.Snapshot
+
+		// Check if the last character is a newline
+		lastByte := prevSnap.data[len(prevSnap.data)-1]
+		if lastByte == '\n' {
+			// We're on a new line after the newline
+			// Count all lines up to and including this leaf
+			absoluteLine := g.countLinesBeforeLeaf(result.LeafByteStart) + snap.lineCount
+			return absoluteLine, 0, nil
+		}
+
+		// We're at the end of the last line (after last non-newline char)
+		// Find line info from the previous leaf
+		line := int64(0)
+		lineRuneStart := int64(0)
+		prevOffset := int64(len(prevSnap.data)) // We're at the end of this leaf
+
+		for i := len(prevSnap.lineStarts) - 1; i >= 0; i-- {
+			if prevSnap.lineStarts[i].ByteOffset <= prevOffset {
+				line = int64(i)
+				lineRuneStart = prevSnap.lineStarts[i].RuneOffset
+				break
+			}
+		}
+
+		absoluteLine := g.countLinesBeforeLeaf(prevResult.LeafByteStart) + line
+		runeInLine := prevSnap.runeCount - lineRuneStart
+
+		return absoluteLine, runeInLine, nil
+	}
+
+	// Normal case: find which line within the leaf
 	line := int64(0)
 	lineRuneStart := int64(0)
 
@@ -3455,7 +3535,7 @@ func (g *Garland) countLinesBeforeByteInternal(node *Node, snap *NodeSnapshot, t
 
 	leftEnd := currentByte + leftSnap.byteCount
 
-	if targetByte <= leftEnd {
+	if targetByte < leftEnd {
 		// Target is in left subtree
 		return g.countLinesBeforeByteInternal(leftNode, leftSnap, targetByte, currentByte)
 	}
