@@ -4,12 +4,13 @@ import "unicode/utf8"
 
 // LeafSearchResult contains information about a leaf node found during tree traversal.
 type LeafSearchResult struct {
-	Node          *Node         // the leaf node
-	Snapshot      *NodeSnapshot // the node's snapshot at current version
-	ByteOffset    int64         // byte offset from start of this leaf to target
-	RuneOffset    int64         // rune offset from start of this leaf to target
-	LeafByteStart int64         // absolute byte position where this leaf starts
-	LeafRuneStart int64         // absolute rune position where this leaf starts
+	Node                  *Node         // the leaf node
+	Snapshot              *NodeSnapshot // the node's snapshot at current version
+	ByteOffset            int64         // byte offset from start of this leaf to target
+	RuneOffset            int64         // rune offset from start of this leaf to target
+	LeafByteStart         int64         // absolute byte position where this leaf starts
+	LeafRuneStart         int64         // absolute rune position where this leaf starts
+	RunesOnLineBeforeLeaf int64         // runes on current line before this leaf starts
 }
 
 // findLeafByByte navigates the tree to find the leaf containing the given byte position.
@@ -46,19 +47,21 @@ func (g *Garland) findLeafByByteUnlocked(pos int64) (*LeafSearchResult, error) {
 		return nil, ErrInvalidPosition
 	}
 
-	return g.findLeafByByteInternal(g.root, rootSnap, pos, 0, 0)
+	return g.findLeafByByteInternal(g.root, rootSnap, pos, 0, 0, 0)
 }
 
 // findLeafByByteInternal is the recursive implementation of findLeafByByte.
-func (g *Garland) findLeafByByteInternal(node *Node, snap *NodeSnapshot, pos int64, byteStart int64, runeStart int64) (*LeafSearchResult, error) {
+// runesOnLine tracks runes on the current line before the start of the subtree we're descending into.
+func (g *Garland) findLeafByByteInternal(node *Node, snap *NodeSnapshot, pos int64, byteStart int64, runeStart int64, runesOnLine int64) (*LeafSearchResult, error) {
 	if snap.isLeaf {
 		return &LeafSearchResult{
-			Node:          node,
-			Snapshot:      snap,
-			ByteOffset:    pos,
-			RuneOffset:    byteToRuneOffset(snap.data, pos),
-			LeafByteStart: byteStart,
-			LeafRuneStart: runeStart,
+			Node:                  node,
+			Snapshot:              snap,
+			ByteOffset:            pos,
+			RuneOffset:            byteToRuneOffset(snap.data, pos),
+			LeafByteStart:         byteStart,
+			LeafRuneStart:         runeStart,
+			RunesOnLineBeforeLeaf: runesOnLine,
 		}, nil
 	}
 
@@ -76,8 +79,8 @@ func (g *Garland) findLeafByByteInternal(node *Node, snap *NodeSnapshot, pos int
 	// Use < so that when pos equals left's byte count, we go to right subtree
 	// This ensures proper leaf boundary handling when reading across leaves
 	if pos < leftSnap.byteCount {
-		// Target is in left subtree
-		return g.findLeafByByteInternal(leftNode, leftSnap, pos, byteStart, runeStart)
+		// Target is in left subtree - runesOnLine stays the same
+		return g.findLeafByByteInternal(leftNode, leftSnap, pos, byteStart, runeStart, runesOnLine)
 	}
 
 	// Target is in right subtree
@@ -91,12 +94,23 @@ func (g *Garland) findLeafByByteInternal(node *Node, snap *NodeSnapshot, pos int
 		return nil, ErrInvalidPosition
 	}
 
+	// Calculate runes on current line after passing the left subtree
+	var newRunesOnLine int64
+	if leftSnap.lineCount > 0 {
+		// Left subtree has newlines, so line resets to left's trailing partial line
+		newRunesOnLine = leftSnap.runesAfterLastNewline
+	} else {
+		// Left subtree has no newlines, add all its runes to the running total
+		newRunesOnLine = runesOnLine + leftSnap.runeCount
+	}
+
 	return g.findLeafByByteInternal(
 		rightNode,
 		rightSnap,
 		pos-leftSnap.byteCount,
 		byteStart+leftSnap.byteCount,
 		runeStart+leftSnap.runeCount,
+		newRunesOnLine,
 	)
 }
 
@@ -132,20 +146,22 @@ func (g *Garland) findLeafByRuneUnlocked(pos int64) (*LeafSearchResult, error) {
 		return nil, ErrInvalidPosition
 	}
 
-	return g.findLeafByRuneInternal(g.root, rootSnap, pos, 0, 0)
+	return g.findLeafByRuneInternal(g.root, rootSnap, pos, 0, 0, 0)
 }
 
 // findLeafByRuneInternal is the recursive implementation of findLeafByRune.
-func (g *Garland) findLeafByRuneInternal(node *Node, snap *NodeSnapshot, pos int64, byteStart int64, runeStart int64) (*LeafSearchResult, error) {
+// runesOnLine tracks runes on the current line before the start of the subtree we're descending into.
+func (g *Garland) findLeafByRuneInternal(node *Node, snap *NodeSnapshot, pos int64, byteStart int64, runeStart int64, runesOnLine int64) (*LeafSearchResult, error) {
 	if snap.isLeaf {
 		byteOffset := runeToByteOffset(snap.data, pos)
 		return &LeafSearchResult{
-			Node:          node,
-			Snapshot:      snap,
-			ByteOffset:    byteOffset,
-			RuneOffset:    pos,
-			LeafByteStart: byteStart,
-			LeafRuneStart: runeStart,
+			Node:                  node,
+			Snapshot:              snap,
+			ByteOffset:            byteOffset,
+			RuneOffset:            pos,
+			LeafByteStart:         byteStart,
+			LeafRuneStart:         runeStart,
+			RunesOnLineBeforeLeaf: runesOnLine,
 		}, nil
 	}
 
@@ -162,8 +178,8 @@ func (g *Garland) findLeafByRuneInternal(node *Node, snap *NodeSnapshot, pos int
 
 	// Use < so that when pos equals left's rune count, we go to right subtree
 	if pos < leftSnap.runeCount {
-		// Target is in left subtree
-		return g.findLeafByRuneInternal(leftNode, leftSnap, pos, byteStart, runeStart)
+		// Target is in left subtree - runesOnLine stays the same
+		return g.findLeafByRuneInternal(leftNode, leftSnap, pos, byteStart, runeStart, runesOnLine)
 	}
 
 	// Target is in right subtree
@@ -177,12 +193,23 @@ func (g *Garland) findLeafByRuneInternal(node *Node, snap *NodeSnapshot, pos int
 		return nil, ErrInvalidPosition
 	}
 
+	// Calculate runes on current line after passing the left subtree
+	var newRunesOnLine int64
+	if leftSnap.lineCount > 0 {
+		// Left subtree has newlines, so line resets to left's trailing partial line
+		newRunesOnLine = leftSnap.runesAfterLastNewline
+	} else {
+		// Left subtree has no newlines, add all its runes to the running total
+		newRunesOnLine = runesOnLine + leftSnap.runeCount
+	}
+
 	return g.findLeafByRuneInternal(
 		rightNode,
 		rightSnap,
 		pos-leftSnap.runeCount,
 		byteStart+leftSnap.byteCount,
 		runeStart+leftSnap.runeCount,
+		newRunesOnLine,
 	)
 }
 
@@ -226,10 +253,11 @@ func (g *Garland) findLeafByLineUnlocked(line, runeInLine int64) (*LineSearchRes
 		return nil, ErrInvalidPosition
 	}
 
-	return g.findLeafByLineInternal(g.root, rootSnap, line, runeInLine, 0, 0, 0)
+	return g.findLeafByLineInternal(g.root, rootSnap, line, runeInLine, 0, 0, 0, 0)
 }
 
 // findLeafByLineInternal is the recursive implementation of findLeafByLine.
+// runesOnLine tracks runes on the current line before the start of the subtree we're descending into.
 func (g *Garland) findLeafByLineInternal(
 	node *Node,
 	snap *NodeSnapshot,
@@ -238,6 +266,7 @@ func (g *Garland) findLeafByLineInternal(
 	byteStart int64,
 	runeStart int64,
 	lineStart int64,
+	runesOnLine int64,
 ) (*LineSearchResult, error) {
 	if snap.isLeaf {
 		// Find the line within this leaf
@@ -274,14 +303,23 @@ func (g *Garland) findLeafByLineInternal(
 			return nil, ErrInvalidPosition
 		}
 
+		// If relLine > 0, the line starts within this leaf (after a newline),
+		// so runesOnLineBeforeLeaf is 0 for that line.
+		// Only use runesOnLine when relLine == 0 (continuation line).
+		var runesOnLineBeforeLeaf int64
+		if relLine == 0 {
+			runesOnLineBeforeLeaf = runesOnLine
+		}
+
 		return &LineSearchResult{
 			LeafResult: &LeafSearchResult{
-				Node:          node,
-				Snapshot:      snap,
-				ByteOffset:    finalByteOffset,
-				RuneOffset:    finalRuneOffset,
-				LeafByteStart: byteStart,
-				LeafRuneStart: runeStart,
+				Node:                  node,
+				Snapshot:              snap,
+				ByteOffset:            finalByteOffset,
+				RuneOffset:            finalRuneOffset,
+				LeafByteStart:         byteStart,
+				LeafRuneStart:         runeStart,
+				RunesOnLineBeforeLeaf: runesOnLineBeforeLeaf,
 			},
 			LineByteStart: byteStart + byteOffset,
 			LineRuneStart: runeStart + runeOffset,
@@ -307,7 +345,7 @@ func (g *Garland) findLeafByLineInternal(
 
 	// Determine which subtree to descend into
 	if relTargetLine < leftLines {
-		// Line is entirely in left subtree
+		// Line is entirely in left subtree - runesOnLine stays the same
 		return g.findLeafByLineInternal(
 			leftNode,
 			leftSnap,
@@ -316,6 +354,7 @@ func (g *Garland) findLeafByLineInternal(
 			byteStart,
 			runeStart,
 			lineStart,
+			runesOnLine,
 		)
 	}
 
@@ -323,7 +362,7 @@ func (g *Garland) findLeafByLineInternal(
 		// Line starts in left subtree (or at boundary) and may extend into right.
 		// Check if the requested rune position is within the left subtree's portion.
 		if runeInLine < leftSnap.runesAfterLastNewline {
-			// Rune is in left subtree
+			// Rune is in left subtree - runesOnLine stays the same
 			return g.findLeafByLineInternal(
 				leftNode,
 				leftSnap,
@@ -332,6 +371,7 @@ func (g *Garland) findLeafByLineInternal(
 				byteStart,
 				runeStart,
 				lineStart,
+				runesOnLine,
 			)
 		}
 		// Rune is in right subtree - adjust runeInLine by subtracting what's in left
@@ -349,6 +389,16 @@ func (g *Garland) findLeafByLineInternal(
 		return nil, ErrInvalidPosition
 	}
 
+	// Calculate runes on current line after passing the left subtree
+	var newRunesOnLine int64
+	if leftSnap.lineCount > 0 {
+		// Left subtree has newlines, so line resets to left's trailing partial line
+		newRunesOnLine = leftSnap.runesAfterLastNewline
+	} else {
+		// Left subtree has no newlines, add all its runes to the running total
+		newRunesOnLine = runesOnLine + leftSnap.runeCount
+	}
+
 	return g.findLeafByLineInternal(
 		rightNode,
 		rightSnap,
@@ -357,6 +407,7 @@ func (g *Garland) findLeafByLineInternal(
 		byteStart+leftSnap.byteCount,
 		runeStart+leftSnap.runeCount,
 		lineStart+leftSnap.lineCount,
+		newRunesOnLine,
 	)
 }
 
