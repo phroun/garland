@@ -21,8 +21,8 @@ func (g *Garland) findLeafByByte(pos int64) (*LeafSearchResult, error) {
 		return nil, ErrInvalidPosition
 	}
 
-	g.mu.RLock()
-	defer g.mu.RUnlock()
+	g.mu.Lock()
+	defer g.mu.Unlock()
 
 	return g.findLeafByByteUnlocked(pos)
 }
@@ -54,6 +54,12 @@ func (g *Garland) findLeafByByteUnlocked(pos int64) (*LeafSearchResult, error) {
 // runesOnLine tracks runes on the current line before the start of the subtree we're descending into.
 func (g *Garland) findLeafByByteInternal(node *Node, snap *NodeSnapshot, pos int64, byteStart int64, runeStart int64, runesOnLine int64) (*LeafSearchResult, error) {
 	if snap.isLeaf {
+		// Consumers of a leaf search read snap.data (starting with the
+		// rune-offset conversion right below); a chilled leaf must be
+		// resident first or they operate on nil bytes.
+		if err := g.ensureLeafDataResident(node, snap); err != nil {
+			return nil, err
+		}
 		return &LeafSearchResult{
 			Node:                  node,
 			Snapshot:              snap,
@@ -120,8 +126,8 @@ func (g *Garland) findLeafByRune(pos int64) (*LeafSearchResult, error) {
 		return nil, ErrInvalidPosition
 	}
 
-	g.mu.RLock()
-	defer g.mu.RUnlock()
+	g.mu.Lock()
+	defer g.mu.Unlock()
 
 	return g.findLeafByRuneUnlocked(pos)
 }
@@ -153,6 +159,9 @@ func (g *Garland) findLeafByRuneUnlocked(pos int64) (*LeafSearchResult, error) {
 // runesOnLine tracks runes on the current line before the start of the subtree we're descending into.
 func (g *Garland) findLeafByRuneInternal(node *Node, snap *NodeSnapshot, pos int64, byteStart int64, runeStart int64, runesOnLine int64) (*LeafSearchResult, error) {
 	if snap.isLeaf {
+		if err := g.ensureLeafDataResident(node, snap); err != nil {
+			return nil, err
+		}
 		byteOffset := runeToByteOffset(snap.data, pos)
 		return &LeafSearchResult{
 			Node:                  node,
@@ -226,8 +235,8 @@ func (g *Garland) findLeafByLine(line, runeInLine int64) (*LineSearchResult, err
 		return nil, ErrInvalidPosition
 	}
 
-	g.mu.RLock()
-	defer g.mu.RUnlock()
+	g.mu.Lock()
+	defer g.mu.Unlock()
 
 	return g.findLeafByLineUnlocked(line, runeInLine)
 }
@@ -269,6 +278,9 @@ func (g *Garland) findLeafByLineInternal(
 	runesOnLine int64,
 ) (*LineSearchResult, error) {
 	if snap.isLeaf {
+		if err := g.ensureLeafDataResident(node, snap); err != nil {
+			return nil, err
+		}
 		// Find the line within this leaf
 		relLine := targetLine - lineStart
 		if relLine < 0 {
@@ -430,8 +442,10 @@ func (g *Garland) splitLeaf(node *Node, snap *NodeSnapshot, bytePos int64) (Node
 	leftData := snap.data[:splitPos]
 	rightData := snap.data[splitPos:]
 
-	// Partition decorations (decorations at exact split point go to right)
-	leftDecs, rightDecs := partitionDecorations(snap.decorations, splitPos, true)
+	// Partition decorations (decorations at exact split point go to the
+	// right leaf - a pure split keeps every mark in the leaf that
+	// contains its byte; insertBefore=true yields no boundary marks)
+	leftDecs, _, rightDecs := partitionDecorations(snap.decorations, splitPos, true)
 
 	// Create left leaf
 	g.nextNodeID++
@@ -518,7 +532,13 @@ func (g *Garland) insertInternal(
 	insertBefore bool,
 ) (NodeID, error) {
 	if snap.isLeaf {
-		// We've found the leaf to insert into
+		// We've found the leaf to insert into. Its bytes must be
+		// resident: the split/coalesce below slices snap.data, and on
+		// a chilled leaf that would silently build the new tree from
+		// nil - data loss, not an error.
+		if err := g.ensureLeafDataResident(node, snap); err != nil {
+			return 0, err
+		}
 		localPos := insertPos - offset
 		return g.insertIntoLeaf(snap, localPos, offset, data, decorations, insertBefore)
 	}
@@ -602,12 +622,80 @@ func (g *Garland) insertIntoLeaf(
 	leftData := snap.data[:splitPos]
 	rightData := snap.data[splitPos:]
 
-	// Partition existing decorations based on insertBefore flag
-	leftDecs, rightDecs := partitionDecorations(snap.decorations, splitPos, insertBefore)
+	// Partition existing decorations based on insertBefore flag.
+	// Boundary marks (exactly at the insert point, not sliding) home
+	// into the middle leaf at offset 0: same absolute address, and the
+	// no-mark-at-leaf-end storage invariant holds.
+	leftDecs, boundaryDecs, rightDecs := partitionDecorations(snap.decorations, splitPos, insertBefore)
+	absoluteDecs = append(absoluteDecs, boundaryDecs...)
 
 	// Note: rightDecs positions are already adjusted to be relative to rightData
 	// by partitionDecorations (subtracted splitPos). No further adjustment needed
 	// because the inserted content goes into its own leaf node.
+
+	// COALESCE: when the pieces fit in one or two leaves, build those
+	// instead of a left/middle/right triple. Without this, every
+	// keystroke mints a tiny middle leaf plus a deeper spine of
+	// internal nodes - typing at one spot degrades to O(edits) work
+	// per edit and O(edits^2) node accumulation. With it, a keystroke
+	// rebuilds one bounded leaf and the tree's shape is stable.
+	combinedLen := int64(len(leftData)) + int64(len(data)) + int64(len(rightData))
+	if combinedLen <= 2*g.maxLeafSize {
+		combined := make([]byte, 0, combinedLen)
+		combined = append(combined, leftData...)
+		combined = append(combined, data...)
+		combined = append(combined, rightData...)
+
+		mid := int64(len(leftData))
+		combDecs := make([]Decoration, 0, len(leftDecs)+len(absoluteDecs)+len(rightDecs))
+		combDecs = append(combDecs, leftDecs...)
+		for _, d := range absoluteDecs {
+			combDecs = append(combDecs, Decoration{Key: d.Key, Position: d.Position + mid})
+		}
+		for _, d := range rightDecs {
+			combDecs = append(combDecs, Decoration{Key: d.Key, Position: d.Position + mid + int64(len(data))})
+		}
+
+		if combinedLen <= g.maxLeafSize {
+			g.nextNodeID++
+			g.nodeManipulations++
+			leaf := newNode(g.nextNodeID, g)
+			g.nodeRegistry[leaf.id] = leaf
+			leaf.setSnapshot(g.currentFork, g.currentRevision, createLeafSnapshot(combined, combDecs, -1))
+			g.updateDecorationCacheForNode(leaf.id, absoluteOffset, combDecs)
+			return leaf.id, nil
+		}
+
+		// Two balanced leaves, split on a rune boundary so per-leaf
+		// rune/line indexes stay meaningful.
+		sp := combinedLen / 2
+		for sp > 0 && (combined[sp]&0xC0) == 0x80 {
+			sp--
+		}
+		var firstDecs, secondDecs []Decoration
+		for _, d := range combDecs {
+			if d.Position < sp {
+				firstDecs = append(firstDecs, d)
+			} else {
+				secondDecs = append(secondDecs, Decoration{Key: d.Key, Position: d.Position - sp})
+			}
+		}
+		g.nextNodeID++
+		g.nodeManipulations++
+		first := newNode(g.nextNodeID, g)
+		g.nodeRegistry[first.id] = first
+		first.setSnapshot(g.currentFork, g.currentRevision, createLeafSnapshot(combined[:sp:sp], firstDecs, -1))
+		g.updateDecorationCacheForNode(first.id, absoluteOffset, firstDecs)
+
+		g.nextNodeID++
+		g.nodeManipulations++
+		second := newNode(g.nextNodeID, g)
+		g.nodeRegistry[second.id] = second
+		second.setSnapshot(g.currentFork, g.currentRevision, createLeafSnapshot(combined[sp:], secondDecs, -1))
+		g.updateDecorationCacheForNode(second.id, absoluteOffset+sp, secondDecs)
+
+		return g.concatenate(first.id, second.id)
+	}
 
 	// Create new left leaf (original content before insertion point)
 	var leftID NodeID
@@ -722,6 +810,11 @@ func (g *Garland) deleteRangeInternal(
 	}
 
 	if snap.isLeaf {
+		// The rebuild below slices snap.data; a chilled leaf must be
+		// resident or the surviving content is silently lost.
+		if err := g.ensureLeafDataResident(node, snap); err != nil {
+			return 0, err
+		}
 		// Calculate local delete range
 		localStart := deleteStart - nodeStart
 		if localStart < 0 {

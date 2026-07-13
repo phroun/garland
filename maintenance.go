@@ -417,6 +417,11 @@ func (g *Garland) updateChildReference(parentID, oldChildID, newChildID NodeID) 
 		byteCount: snap.byteCount,
 		runeCount: snap.runeCount,
 		lineCount: snap.lineCount,
+		// A reference swap keeps the subtree's content identical, so
+		// the trailing-partial-line rune count carries over; dropping
+		// it (zero) poisons every cross-leaf column conversion that
+		// passes through this node.
+		runesAfterLastNewline: snap.runesAfterLastNewline,
 	}
 
 	if snap.leftID == oldChildID {
@@ -514,9 +519,12 @@ func (g *Garland) rebuildBalanced(leaves []*NodeSnapshot, start, end int) NodeID
 	}
 
 	if end-start == 1 {
-		// Single leaf - create a node for it
-		nodeID := g.nextNodeID
+		// Single leaf - create a node for it.
+		// NOTE: pre-increment like every other allocation site -
+		// nextNodeID holds the LAST-USED id, so reading it before
+		// incrementing would reuse (and overwrite) an existing node.
 		g.nextNodeID++
+		nodeID := g.nextNodeID
 		node := newNode(nodeID, g)
 		node.setSnapshot(g.currentFork, g.currentRevision, leaves[start])
 		g.nodeRegistry[nodeID] = node
@@ -535,12 +543,12 @@ func (g *Garland) rebuildBalanced(leaves []*NodeSnapshot, start, end int) NodeID
 		return rightID
 	}
 
-	// Create internal node
+	// Create internal node (pre-increment: see leaf case above)
 	leftSnap := g.nodeRegistry[leftID].snapshotAt(g.currentFork, g.currentRevision)
 	rightSnap := g.nodeRegistry[rightID].snapshotAt(g.currentFork, g.currentRevision)
 
-	nodeID := g.nextNodeID
 	g.nextNodeID++
+	nodeID := g.nextNodeID
 	node := newNode(nodeID, g)
 	node.setSnapshot(g.currentFork, g.currentRevision, createInternalSnapshot(leftID, rightID, leftSnap, rightSnap))
 	g.nodeRegistry[nodeID] = node

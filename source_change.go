@@ -372,7 +372,7 @@ func (g *Garland) verifyBoundaryForAppendUnlocked() error {
 	}
 
 	// Find the leaf at the boundary position
-	leaf, err := g.findLeafByByte(boundaryPos)
+	leaf, err := g.findLeafByByteUnlocked(boundaryPos)
 	if err != nil {
 		return err
 	}

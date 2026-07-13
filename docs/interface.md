@@ -2,6 +2,23 @@
 
 This document defines the complete user-facing API for the Garland library.
 
+## Concurrency Contract
+
+Any goroutine may call any public API concurrently. All operations are
+linearized through the buffer's internal lock: pure metadata getters
+(counts, positions, fork/revision, status, IntegrityEvents,
+MemoryPressure) run in parallel under a read lock; everything that can
+load storage tiers or mutate (edits, seeks, reads that may thaw,
+searches, decorations) serializes under the write lock - at sub-
+millisecond per operation this costs nothing measurable. Each Cursor
+may be used by ONE goroutine at a time (edits from other goroutines
+still adjust it safely). The long operation - save - runs without the
+lock via SaveOptions.Concurrent. Position errors (ErrInvalidPosition
+etc.) are normal when the buffer shrinks under a racing reader; the
+caller coordinates its own read-modify-write sequences. Cold-storage
+block writes are atomic (write + rename), so concurrent block reads
+never tear.
+
 ## Overview
 
 Garland is a rope-based data structure for efficient text/binary editing with:
@@ -137,12 +154,138 @@ const (
 // Close releases resources associated with the Garland.
 func (g *Garland) Close() error
 
-// Save overwrites the original file.
-// Caller asserts that this replaces any warm storage source.
-func (g *Garland) Save() error
+// Save overwrites the original file IN PLACE (no temp copy; the file
+// shrinks only as the final step) and preserves undo history. Warm
+// storage survives, re-homed to the new layout.
+func (g *Garland) Save() (SaveReport, error)
+
+// SaveWith is Save with explicit options (e.g. PreserveHistory=false).
+func (g *Garland) SaveWith(opts SaveOptions) (SaveReport, error)
 
 // SaveAs writes to a new location. Warm storage remains untouched.
-func (g *Garland) SaveAs(fs FileSystemInterface, name string) error
+// (Saving onto the original path routes through the in-place engine.)
+func (g *Garland) SaveAs(fs FileSystemInterface, name string) (SaveReport, error)
+
+// SaveOptions configures Save behavior.
+type SaveOptions struct {
+    // PreserveHistory migrates warm-backed undo history that the
+    // rewrite would overwrite into cold storage first. When false,
+    // overwritten history becomes placeholders on access (amputated,
+    // never silently corrupted).
+    PreserveHistory bool
+
+    // Concurrent (opt-in) runs the rewrite WITHOUT holding the buffer
+    // lock: the app may keep reading/editing on its op goroutine while
+    // the save writes (only Prune, DeleteFork, Rebase, Close, and
+    // other saves wait). Cost: displaced warm spans are EVACUATED
+    // first (cold storage if available, else memory); with no cold
+    // backend and a hard memory limit the save transparently falls
+    // back to the locked zero-copy path.
+    Concurrent bool
+}
+
+// MemoryPressure reports the buffer's memory standing - the signal
+// for an app-side "hot-write mode": when SaveableBytes dominates and
+// ResidentBytes approaches the hard limit, saving is the only relief
+// ("to keep editing, I need to save before I run out of RAM").
+func (g *Garland) MemoryPressure() MemoryPressureInfo
+
+type MemoryPressureInfo struct {
+    ResidentBytes  int64 // leaf bytes currently in memory
+    EvictableBytes int64 // chillable to warm/cold right now
+    SaveableBytes  int64 // only a Save can make these evictable
+    SoftLimitBytes int64 // configured limits (0 = none)
+    HardLimitBytes int64
+}
+
+// A save NEVER refuses because data was lost to a storage failure:
+// lost blocks are written as visible, exact-size scars and reported
+// back so the app decides how to deal with them.
+type SaveReport struct {
+    Scars      []ScarWarning    // empty on a clean save
+    Integrity  []IntegrityEvent // block-level events since the last save
+    Concurrent bool             // whether the save actually ran lock-free
+}
+
+type ScarWarning struct {
+    Offset   int64  // byte offset of the scarred block in the saved content
+    Length   int64  // byte count of the lost block
+    Marker   string // human-readable marker text written into the file
+    Appended bool   // marker did not fit in the block; appended at EOF
+    Reason   string // why the data was lost, captured at discovery time
+}
+
+// Block-level integrity forensics: when a warm block's bytes on disk
+// stop matching expectations, the mismatch is triaged before being
+// declared a loss - slide (external insert/delete shifted the block;
+// re-homed), swap (external move; backing offsets exchanged), soft
+// adopt (surrounding blocks verify, so the file's bytes are adopted as
+// a deliberate external edit - a future save preserves them), or hard
+// loss (placeholder, scarred on save). Every outcome is recorded at
+// the moment of discovery.
+type IntegrityKind int
+
+const (
+    IntegrityBlockSlid             IntegrityKind = iota // recovered: re-homed
+    IntegrityBlockSwapped                               // recovered: external move
+    IntegrityBlockAdopted                               // soft: external edit adopted
+    IntegrityBlockAdoptedDuplicate                      // soft: adopted; duplicates another block (move/copy suspected)
+    IntegrityBlockLost                                  // hard: placeholder, will scar
+    IntegrityDecorationsLost                            // marks lost on thaw; content intact
+)
+
+// Decoration keys are IDENTIFIERS (RULING): non-empty ASCII letters,
+// digits, '_', '.', '#', '-' only. Every write-side API rejects other
+// characters with ErrInvalidDecorationKey, which keeps the cold-storage
+// .dec encoding framing-safe by construction. Failure to restore a
+// block's decorations on thaw (side block missing / hash mismatch /
+// corrupt encoding) is reported as an IntegrityDecorationsLost event -
+// content thaws fine, marks never vanish silently.
+func ValidDecorationKey(key string) bool
+
+type IntegrityEvent struct {
+    Kind         IntegrityKind
+    BufferOffset int64  // block's buffer offset at discovery (-1 unknown)
+    FileOffset   int64  // backing position in the source file
+    Length       int64
+    Detail       string // specifics: shift distance, duplicate location, cause
+}
+
+// IntegrityEvents peeks at events accumulated since the last
+// successful save; the save itself drains them into SaveReport.Integrity.
+func (g *Garland) IntegrityEvents() []IntegrityEvent
+
+// Rebase: deliberate reconciliation against a file ("file changed on
+// disk - reload or keep your version?" -> rebase takes the FILE as
+// the new base). Blocks are anchor-matched by hash (piecewise shifts
+// followed), keeping identity/decorations/warm backing for matched
+// content; placeholders whose bytes still exist in the file heal;
+// everything else (external edits, resized blocks - kind
+// IntegrityBlockResized points here - and unsaved local edits: the
+// disk wins) is adopted and reported. One recorded mutation:
+// UndoSeek(report.PreviousRevision) is "keep your version" after the
+// fact. Source tracking is re-baselined - a fresh starting point.
+func (g *Garland) RebaseOnSource() (RebaseReport, error)
+
+// RebaseOn does the same against a DIFFERENT file, which becomes the
+// buffer's source (path, handle, warm backing all switch).
+func (g *Garland) RebaseOnFile(fs FileSystemInterface, name string) (RebaseReport, error)
+
+type RebaseReport struct {
+    Adopted          []RebaseRegion // regions taken from the file
+    BytesKept        int64
+    BytesAdopted     int64
+    BlocksKept       int
+    BlocksHealed     int   // lost placeholders recovered from the file
+    OldSize, NewSize int64
+    NoChange         bool  // already identical; nothing recorded
+    PreviousRevision RevisionID // undo target for "keep your version"
+}
+
+type RebaseRegion struct {
+    Offset int64 // in the new buffer (== file offset)
+    Length int64
+}
 ```
 
 ---
@@ -172,6 +315,24 @@ func (c *Cursor) SeekRune(pos int64) error
 // SeekLine moves cursor to a line and rune-within-line position.
 // Line and rune are both 0-indexed. Newline is the last character of its line.
 func (c *Cursor) SeekLine(line, runeInLine int64) error
+
+// SeekByWord moves by n words (negative = backward) using
+// WordStyleSimple; returns how many words were actually moved.
+func (c *Cursor) SeekByWord(n int) (int, error)
+
+// SeekByWordStyle selects the word semantics per call.
+func (c *Cursor) SeekByWordStyle(n int, style WordStyle) (int, error)
+
+type WordStyle int
+
+const (
+    // WordStyleSimple: words are runs of letters/digits/underscore;
+    // punctuation and whitespace are separators.
+    WordStyleSimple WordStyle = iota
+    // WordStyleVi: like vi's w/b - punctuation runs are words of
+    // their own; only whitespace separates.
+    WordStyleVi
+)
 
 // Position queries
 
@@ -238,7 +399,10 @@ func (c *Cursor) InsertString(data string, decorations []RelativeDecoration,
 
 ```go
 // DeleteBytes deletes `length` bytes starting at cursor position.
-// Returns decorations from the deleted range.
+// Returns decorations from the deleted range AS A REPORT: marks are
+// never deleted with a range - they collapse to the deletion point
+// and survive. The caller decides which reported marks to remove
+// explicitly (Decorate with a nil Address).
 // If includeLineDecorations is true, also returns (but does not move)
 // decorations from partially affected lines.
 func (c *Cursor) DeleteBytes(length int64, includeLineDecorations bool) (

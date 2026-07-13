@@ -181,3 +181,48 @@ func TestChillLevelConstants(t *testing.T) {
 		t.Error("ChillUnusedData should be less than ChillEverything")
 	}
 }
+
+// TestDecorationsSurviveChillThaw: marks on a chilled leaf must come
+// back intact when the leaf is thawed from cold storage. Regression
+// test: an eagerly computed decorationHash used a different encoding
+// than the one cold storage writes and thaw verifies, so verification
+// always failed and the marks were silently dropped.
+func TestDecorationsSurviveChillThaw(t *testing.T) {
+	tmpDir := t.TempDir()
+	lib, _ := Init(LibraryOptions{ColdStoragePath: tmpDir})
+
+	g, err := lib.Open(FileOptions{DataString: "Hello Beautiful World"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Close()
+
+	addr := ByteAddress(6)
+	if _, err := g.Decorate([]DecorationEntry{{Key: "mark", Address: &addr}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Push everything to cold storage, then force a thaw by reading.
+	if err := g.Chill(ChillEverything); err != nil {
+		t.Fatalf("Chill: %v", err)
+	}
+	c := g.NewCursor()
+	if err := c.SeekByte(0); err != nil {
+		t.Fatal(err)
+	}
+	data, err := c.ReadBytes(g.ByteCount().Value)
+	if err != nil {
+		t.Fatalf("ReadBytes after chill: %v", err)
+	}
+	if string(data) != "Hello Beautiful World" {
+		t.Fatalf("content after thaw = %q", data)
+	}
+
+	pos, err := g.GetDecorationPosition("mark")
+	if err != nil {
+		t.Fatalf("mark lost across chill/thaw: %v", err)
+	}
+	if pos.Byte != 6 {
+		t.Errorf("mark at %d after thaw, want 6", pos.Byte)
+	}
+}

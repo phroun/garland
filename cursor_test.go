@@ -279,7 +279,7 @@ func TestCursorAdjustForMutation(t *testing.T) {
 	c.runePos = 10
 
 	// Insert at position 5 (before cursor) - 3 bytes, 3 runes, 0 lines
-	c.adjustForMutation(5, 3, 3, 0)
+	c.adjustForMutation(5, 3, 3, 0, true)
 	if c.bytePos != 13 {
 		t.Errorf("After insert before cursor: bytePos = %d, want 13", c.bytePos)
 	}
@@ -288,7 +288,7 @@ func TestCursorAdjustForMutation(t *testing.T) {
 	}
 
 	// Delete at position 5 (before cursor) - 2 bytes, 2 runes, 0 lines
-	c.adjustForMutation(5, -2, -2, 0)
+	c.adjustForMutation(5, -2, -2, 0, false)
 	if c.bytePos != 11 {
 		t.Errorf("After delete before cursor: bytePos = %d, want 11", c.bytePos)
 	}
@@ -299,15 +299,16 @@ func TestCursorAdjustForMutation(t *testing.T) {
 	// Mutation after cursor should not affect position
 	c.bytePos = 10
 	c.runePos = 10
-	c.adjustForMutation(15, 5, 5, 0)
+	c.adjustForMutation(15, 5, 5, 0, true)
 	if c.bytePos != 10 {
 		t.Errorf("Mutation after cursor should not change position: got %d, want 10", c.bytePos)
 	}
 
-	// Insert at cursor position DOES move cursor (new behavior)
+	// Insert at cursor position moves the cursor when insertBefore
+	// (RULING: the flag governs cursors at the point, like decorations)
 	c.bytePos = 10
 	c.runePos = 10
-	c.adjustForMutation(10, 5, 5, 0)
+	c.adjustForMutation(10, 5, 5, 0, true)
 	if c.bytePos != 15 {
 		t.Errorf("Insert at cursor position should move cursor: got %d, want 15", c.bytePos)
 	}

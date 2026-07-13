@@ -88,3 +88,36 @@ type Decoration struct {
 	Key      string
 	Position int64 // relative byte offset within the node
 }
+
+// ValidDecorationKey reports whether key is a legal decoration
+// identifier: non-empty, ASCII letters and digits plus '_', '.', '#'
+// (hashtag-style marks), and '-'. RULING: keys are identifiers, not
+// storage in their own right - restricting them keeps every
+// serialization of keys (e.g. cold-storage .dec blocks) framing-safe
+// by construction, with no escaping anywhere.
+func ValidDecorationKey(key string) bool {
+	if len(key) == 0 {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
+			c == '_', c == '.', c == '#', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// validateRelativeDecorations rejects any illegal key up front, before
+// an edit begins - never mid-mutation.
+func validateRelativeDecorations(decs []RelativeDecoration) error {
+	for _, d := range decs {
+		if !ValidDecorationKey(d.Key) {
+			return ErrInvalidDecorationKey
+		}
+	}
+	return nil
+}

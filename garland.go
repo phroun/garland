@@ -2,7 +2,9 @@ package garland
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode"
 )
 
 // LoadingStyle determines which storage tiers are available.
@@ -402,6 +404,39 @@ type Garland struct {
 	// Source file change detection
 	sourceState      *sourceState
 	warmVerification map[NodeID]*warmVerificationState
+
+	// integrityLog accumulates block-level integrity events (slides,
+	// swaps, adoptions, losses) from the moment each is discovered
+	// until they are reported: peeked via IntegrityEvents, drained
+	// into the next successful save's SaveReport.
+	integrityLog []IntegrityEvent
+
+	// maintenanceInFlight guards against stacking CheckMemoryPressure
+	// goroutines (one per mutation would each scan the node registry).
+	maintenanceInFlight int32
+
+	// Concurrent-save coordination. saveMu serializes saves (Save,
+	// SaveWith, SaveAs) against each other. saveInFlight is true while
+	// a Concurrent save's unlocked rewrite phase runs; operations that
+	// would invalidate its pinned plan (Prune, DeleteFork, Rebase,
+	// Close - the ones that destroy cold blocks or rewrite the file)
+	// wait on saveCond until it clears. All three are guarded by mu
+	// except saveMu, which is independent.
+	saveMu       sync.Mutex
+	saveInFlight bool
+	saveCond     *sync.Cond
+}
+
+// awaitNoSaveLocked blocks until no Concurrent save rewrite is in
+// flight. Caller must hold the write lock (which Wait releases while
+// blocked, letting the save finish).
+func (g *Garland) awaitNoSaveLocked() {
+	for g.saveInFlight {
+		if g.saveCond == nil {
+			return
+		}
+		g.saveCond.Wait()
+	}
 }
 
 // Open creates or loads a Garland from various sources.
@@ -553,6 +588,11 @@ func (lib *Library) Open(options FileOptions) (*Garland, error) {
 
 // Close releases resources associated with the Garland.
 func (g *Garland) Close() error {
+	// Let any in-flight concurrent save finish before tearing down.
+	g.mu.Lock()
+	g.awaitNoSaveLocked()
+	g.mu.Unlock()
+
 	// Stop source file watching
 	g.DisableSourceWatch()
 
@@ -570,56 +610,53 @@ func (g *Garland) Close() error {
 	return nil
 }
 
-// Save overwrites the original file with the current content.
-// Caller asserts that this replaces any warm storage source.
+// Save overwrites the original file IN PLACE with the current content.
+// The file is rewritten without a temporary copy (peak disk usage never
+// exceeds max(old, new) size) and shrinks only as the final step; warm
+// storage survives the save, re-homed to the new layout. Undo history
+// that depends on overwritten warm bytes is migrated to cold storage
+// first. See save.go for the full design.
+// The returned SaveReport lists any blocks whose data was lost and had
+// to be written as visible scars; the app decides how to surface them.
 // Returns ErrNoDataSource if there is no original file path.
-func (g *Garland) Save() error {
-	if g.sourcePath == "" {
-		return ErrNoDataSource
-	}
-
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	// Determine which filesystem to use
-	fs := g.sourceFS
-	if fs == nil {
-		fs = g.lib.defaultFS
-	}
-
-	// Close warm storage handle if open
-	if g.sourceHandle != nil {
-		fs.Close(g.sourceHandle)
-		g.sourceHandle = nil
-	}
-
-	// Stream write to file
-	if err := g.streamWriteToFile(fs, g.sourcePath); err != nil {
-		return err
-	}
-
-	// Reopen for warm storage if needed
-	if g.loadingStyle == AllStorage {
-		handle, err := fs.Open(g.sourcePath, OpenModeRead)
-		if err == nil {
-			g.sourceHandle = handle
-		}
-	}
-
-	return nil
+func (g *Garland) Save() (SaveReport, error) {
+	return g.SaveWith(SaveOptions{PreserveHistory: true})
 }
 
 // SaveAs writes the current content to a new location.
-// Warm storage remains pointing to the original file (if any).
-func (g *Garland) SaveAs(fs FileSystemInterface, name string) error {
+// Warm storage remains pointing to the original file (if any). Saving
+// onto the original file itself routes through the in-place engine so
+// the warm backing store is never destroyed. The returned SaveReport
+// lists any lost blocks written as scars.
+func (g *Garland) SaveAs(fs FileSystemInterface, name string) (SaveReport, error) {
 	if fs == nil {
-		return ErrNotSupported
+		return SaveReport{}, ErrNotSupported
 	}
 
-	g.mu.RLock()
-	defer g.mu.RUnlock()
+	// Serialize against other saves (including an in-flight
+	// concurrent save's unlocked rewrite phase).
+	g.saveMu.Lock()
+	defer g.saveMu.Unlock()
 
-	return g.streamWriteToFile(fs, name)
+	// Full lock: streaming may thaw chilled snapshots, which mutates them.
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.sourcePath != "" && name == g.sourcePath &&
+		(fs == g.sourceFS || (g.sourceFS == nil && fs == g.lib.defaultFS)) {
+		return g.saveInPlace(fs, SaveOptions{PreserveHistory: true})
+	}
+
+	// RULING: saving never refuses because data was lost - scar
+	// placeholders first, then stream.
+	scars, err := g.scarifyPlaceholders()
+	if err != nil {
+		return SaveReport{}, err
+	}
+	if err := g.streamWriteToFile(fs, name); err != nil {
+		return SaveReport{Scars: scars}, err
+	}
+	return SaveReport{Scars: scars, Integrity: g.drainIntegrityEvents()}, nil
 }
 
 // streamWriteToFile writes the document to a file using streaming (no full materialization).
@@ -656,12 +693,9 @@ func (g *Garland) streamWriteNode(fs FileSystemInterface, handle FileHandle, nod
 	}
 
 	if snap.isLeaf {
-		// Thaw if needed
-		if snap.storageState != StorageMemory {
-			forkRev := ForkRevision{g.currentFork, g.currentRevision}
-			if err := g.thawSnapshot(nodeID, forkRev, snap); err != nil {
-				return err
-			}
+		// Thaw if needed, using the snapshot's own history key
+		if err := g.ensureLeafDataResident(node, snap); err != nil {
+			return err
 		}
 		// Write leaf data directly to file
 		if len(snap.data) > 0 {
@@ -1168,9 +1202,12 @@ func encodeDecorations(decs []Decoration) []byte {
 }
 
 // decodeDecorations parses decorations from the cold storage format.
-func decodeDecorations(data []byte) []Decoration {
+// STRICT: keys are validated identifiers and positions are pure
+// digits, so any deviation is corruption and is reported as an error
+// rather than silently "recovered" into wrong decorations.
+func decodeDecorations(data []byte) ([]Decoration, error) {
 	if len(data) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	var decs []Decoration
@@ -1182,9 +1219,12 @@ func decodeDecorations(data []byte) []Decoration {
 			keyEnd++
 		}
 		if keyEnd >= len(data) {
-			break // Malformed data
+			return nil, ErrColdStorageFailure // truncated record
 		}
 		key := string(data[i:keyEnd])
+		if !ValidDecorationKey(key) {
+			return nil, ErrColdStorageFailure
+		}
 
 		// Find newline (end of position)
 		posStart := keyEnd + 1
@@ -1192,15 +1232,22 @@ func decodeDecorations(data []byte) []Decoration {
 		for posEnd < len(data) && data[posEnd] != '\n' {
 			posEnd++
 		}
-		if posEnd > posStart {
-			posStr := string(data[posStart:posEnd])
-			pos := parseUint64(posStr)
-			decs = append(decs, Decoration{Key: key, Position: int64(pos)})
+		if posEnd == posStart || posEnd >= len(data) {
+			return nil, ErrColdStorageFailure // empty or unterminated position
 		}
+		var pos uint64
+		for j := posStart; j < posEnd; j++ {
+			c := data[j]
+			if c < '0' || c > '9' {
+				return nil, ErrColdStorageFailure
+			}
+			pos = pos*10 + uint64(c-'0')
+		}
+		decs = append(decs, Decoration{Key: key, Position: int64(pos)})
 
 		i = posEnd + 1
 	}
-	return decs
+	return decs, nil
 }
 
 // parseUint64 parses a uint64 from a base-10 encoded string.
@@ -1224,7 +1271,7 @@ func (g *Garland) thawSnapshot(nodeID NodeID, forkRev ForkRevision, snap *NodeSn
 	blockName := formatBlockName(nodeID, forkRev)
 	data, err := g.lib.coldStorageBackend.Get(g.id, blockName)
 	if err != nil {
-		snap.storageState = StoragePlaceholder
+		g.markSnapshotLost(snap, "cold storage read failed: "+err.Error())
 		return err
 	}
 
@@ -1232,7 +1279,7 @@ func (g *Garland) thawSnapshot(nodeID NodeID, forkRev ForkRevision, snap *NodeSn
 	if len(snap.dataHash) > 0 {
 		actualHash := computeHash(data)
 		if !hashesEqual(snap.dataHash, actualHash) {
-			snap.storageState = StoragePlaceholder
+			g.markSnapshotLost(snap, "cold storage block corrupted (hash mismatch)")
 			return ErrColdStorageFailure
 		}
 	}
@@ -1247,19 +1294,36 @@ func (g *Garland) thawSnapshot(nodeID NodeID, forkRev ForkRevision, snap *NodeSn
 	// Mark as recently accessed
 	g.touchSnapshot(snap)
 
-	// Try to restore decorations if they were stored
+	// Try to restore decorations if they were stored. Any failure -
+	// block missing while a hash says it existed, hash mismatch, or a
+	// corrupt encoding - is reported as an integrity event: the CONTENT
+	// thawed fine, but its marks are gone, and the app deserves to know
+	// rather than have them vanish silently.
 	decBlockName := blockName + ".dec"
 	decData, err := g.lib.coldStorageBackend.Get(g.id, decBlockName)
-	if err == nil && len(decData) > 0 {
-		// Verify decoration hash if present
+	decsLost := ""
+	if err != nil || len(decData) == 0 {
 		if len(snap.decorationHash) > 0 {
-			actualHash := computeHash(decData)
-			if hashesEqual(snap.decorationHash, actualHash) {
-				snap.decorations = decodeDecorations(decData)
-			}
-		} else {
-			snap.decorations = decodeDecorations(decData)
+			decsLost = "decoration block missing from cold storage"
 		}
+	} else if len(snap.decorationHash) > 0 &&
+		!hashesEqual(snap.decorationHash, computeHash(decData)) {
+		decsLost = "decoration block corrupted (hash mismatch)"
+	} else if decs, derr := decodeDecorations(decData); derr != nil {
+		decsLost = "decoration block corrupted (malformed encoding)"
+	} else {
+		snap.decorations = decs
+	}
+	if decsLost != "" {
+		g.logIntegrityEvent(IntegrityEvent{
+			Kind:         IntegrityDecorationsLost,
+			BufferOffset: -1,
+			FileOffset:   snap.originalFileOffset,
+			Length:       snap.byteCount,
+			Detail:       decsLost,
+		})
+	}
+	if len(decData) > 0 && decsLost == "" {
 
 		// Add restored decorations to cache for existence checking
 		// Note: The offset is unknown, so we set it to 0 as a hint
@@ -1325,6 +1389,24 @@ func (g *Garland) ensureSnapshotData(node *Node, forkRev ForkRevision, snap *Nod
 	return nil
 }
 
+// ensureLeafDataResident thaws a leaf snapshot using the snapshot's OWN
+// history key: cold-storage blocks are named by the (fork, revision)
+// key the snapshot was chilled under, which is not necessarily the
+// current coordinates - thawing with the wrong key misses the block
+// and falsely placeholders the leaf. This is the entry point every
+// reader of snap.data must pass through when the leaf may be chilled.
+func (g *Garland) ensureLeafDataResident(node *Node, snap *NodeSnapshot) error {
+	if snap == nil || !snap.isLeaf || snap.storageState == StorageMemory {
+		return nil
+	}
+	for k, s := range node.history {
+		if s == snap {
+			return g.ensureSnapshotData(node, k, snap)
+		}
+	}
+	return g.ensureSnapshotData(node, ForkRevision{g.currentFork, g.currentRevision}, snap)
+}
+
 // readFromWarmStorageWithTrust reads data from warm storage using trust-aware verification.
 func (g *Garland) readFromWarmStorageWithTrust(nodeID NodeID, snap *NodeSnapshot) error {
 	if g.sourceHandle == nil || g.sourceFS == nil {
@@ -1360,14 +1442,14 @@ func (g *Garland) readFromWarmStorageWithTrust(nodeID NodeID, snap *NodeSnapshot
 	// Seek to the original position
 	err := g.sourceFS.SeekByte(g.sourceHandle, snap.originalFileOffset)
 	if err != nil {
-		snap.storageState = StoragePlaceholder
+		g.markSnapshotLost(snap, "source file seek failed: "+err.Error())
 		return err
 	}
 
 	// Read the data
 	data, err := g.sourceFS.ReadBytes(g.sourceHandle, int(snap.byteCount))
 	if err != nil {
-		snap.storageState = StoragePlaceholder
+		g.markSnapshotLost(snap, "source file read failed: "+err.Error())
 		return err
 	}
 
@@ -1375,10 +1457,12 @@ func (g *Garland) readFromWarmStorageWithTrust(nodeID NodeID, snap *NodeSnapshot
 	if shouldVerify && len(snap.dataHash) > 0 {
 		actualHash := computeHash(data)
 		if !hashesEqual(snap.dataHash, actualHash) {
-			// Warm storage mismatch - file was modified
+			// The file changed under this block. Notify the app, then
+			// investigate before declaring the data lost: an external
+			// edit may have slid, moved, or locally modified it - all
+			// of which triage can resolve without a loss.
 			g.handleWarmStorageMismatch(nodeID)
-			snap.storageState = StoragePlaceholder
-			return ErrWarmStorageMismatch
+			return g.triageWarmMismatch(nodeID, snap, data, actualHash)
 		}
 		// Verification passed - update tracking
 		g.updateWarmVerification(nodeID)
@@ -1419,59 +1503,12 @@ func (g *Garland) handleWarmStorageMismatch(nodeID NodeID) {
 	}
 }
 
-// readFromWarmStorage reads data from the original file for warm storage (legacy, always verifies).
-func (g *Garland) readFromWarmStorage(snap *NodeSnapshot) error {
-	if g.sourceHandle == nil || g.sourceFS == nil {
-		return ErrWarmStorageMismatch
-	}
-
-	// Seek to the original position
-	err := g.sourceFS.SeekByte(g.sourceHandle, snap.originalFileOffset)
-	if err != nil {
-		snap.storageState = StoragePlaceholder
-		return err
-	}
-
-	// Read the data
-	data, err := g.sourceFS.ReadBytes(g.sourceHandle, int(snap.byteCount))
-	if err != nil {
-		snap.storageState = StoragePlaceholder
-		return err
-	}
-
-	// Verify hash if present
-	if len(snap.dataHash) > 0 {
-		actualHash := computeHash(data)
-		if !hashesEqual(snap.dataHash, actualHash) {
-			// Warm storage mismatch - file was modified
-			// Try cold storage as fallback if available
-			if g.lib.coldStorageBackend != nil && snap.storageState == StorageWarm {
-				// Can't thaw without nodeID and forkRev - mark as placeholder
-				snap.storageState = StoragePlaceholder
-				return ErrWarmStorageMismatch
-			}
-			snap.storageState = StoragePlaceholder
-			return ErrWarmStorageMismatch
-		}
-	}
-
-	snap.data = data
-	snap.storageState = StorageMemory
-
-	// Update memory tracking
-	g.updateMemoryTracking(int64(len(data)))
-
-	// Mark as recently accessed
-	g.touchSnapshot(snap)
-
-	return nil
-}
-
 // NewCursor creates a new cursor at position 0.
 func (g *Garland) NewCursor() *Cursor {
-	c := newCursor(g)
-
+	// newCursor reads currentFork/currentRevision - inside the lock,
+	// or a concurrent mutation's recordMutation races the read.
 	g.mu.Lock()
+	c := newCursor(g)
 	g.cursors = append(g.cursors, c)
 	g.mu.Unlock()
 
@@ -1498,11 +1535,15 @@ func (g *Garland) RemoveCursor(c *Cursor) error {
 
 // CurrentFork returns the current fork ID.
 func (g *Garland) CurrentFork() ForkID {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	return g.currentFork
 }
 
 // CurrentRevision returns the current revision number within the current fork.
 func (g *Garland) CurrentRevision() RevisionID {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	return g.currentRevision
 }
 
@@ -1585,6 +1626,8 @@ func (g *Garland) IsReady() bool {
 
 // InTransaction returns true if any transaction is active.
 func (g *Garland) InTransaction() bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	return g.transaction != nil
 }
 
@@ -1657,6 +1700,15 @@ func (g *Garland) TransactionCommit() (ChangeResult, error) {
 
 	// ALWAYS create a new revision, even if no mutations
 	g.currentRevision = g.transaction.pendingRevision
+
+	// Flush decoration cache updates queued by mutations inside the
+	// transaction (recordMutation defers to commit while a transaction
+	// is open); without this, a mark set inside the transaction stays
+	// invisible to the O(1) existence check after commit. The verified
+	// variant re-resolves each key against the committed tree: queued
+	// offsets were captured mid-transaction and later mutations in the
+	// same transaction may have shifted them.
+	g.flushPendingDecorationUpdatesVerified(g.currentFork, g.currentRevision)
 
 	// Update fork's highest revision
 	if forkInfo, ok := g.forks[g.currentFork]; ok {
@@ -1764,6 +1816,15 @@ func (g *Garland) UndoSeek(revision RevisionID) error {
 	if revInfo == nil {
 		return ErrRevisionNotFound
 	}
+	// findRevisionInfo walks BACK through revisions when the exact one
+	// is missing (e.g. pruned away on an ancestor before this fork
+	// branched). Installing a lower revision's tree while stamping the
+	// requested revision number would bind (fork, revision) to the
+	// wrong content - refuse instead: the requested revision no longer
+	// exists.
+	if revInfo.Revision != revision {
+		return ErrRevisionNotFound
+	}
 
 	// Restore the root to what it was at this revision
 	if revInfo.RootID != 0 {
@@ -1778,19 +1839,23 @@ func (g *Garland) UndoSeek(revision RevisionID) error {
 	// Update counts from the root snapshot at this revision
 	g.updateCountsFromRoot()
 
-	// Restore cursor positions if they have recorded positions for this version
+	// Restore cursor positions if they have recorded positions for this
+	// version (following fork lineage - positions recorded before a
+	// branch live under the parent fork's key).
 	for _, cursor := range g.cursors {
-		if pos, ok := cursor.positionHistory[ForkRevision{g.currentFork, revision}]; ok {
+		if pos := g.cursorHistoryAt(cursor, g.currentFork, revision); pos != nil {
 			cursor.restorePosition(pos)
 		} else {
-			// Cursor didn't exist at this revision or hasn't moved since - clamp to valid range
+			// No record along the lineage: keep the byte position
+			// (clamped), but the OTHER coordinates were computed
+			// against the pre-seek content and must be reconciled
+			// against what is here now.
 			if cursor.bytePos > g.totalBytes {
 				cursor.bytePos = g.totalBytes
-				// Recalculate other coordinates
-				cursor.runePos = g.totalRunes
-				cursor.line = g.totalLines
-				cursor.lineRune = 0
 			}
+			cursor.runePos, _ = g.byteToRuneInternalUnlocked(cursor.bytePos)
+			cursor.line, cursor.lineRune, _ = g.byteToLineRuneInternalUnlocked(cursor.bytePos)
+			cursor.lineRuneDirty = false
 		}
 		// Update cursor's last known fork/revision
 		cursor.lastFork = g.currentFork
@@ -1840,9 +1905,19 @@ func (g *Garland) ForkSeek(fork ForkID) error {
 
 	// Get revision info to restore the correct root
 	revInfo := g.findRevisionInfo(fork, targetRevision)
+	if revInfo == nil {
+		// Nothing reachable on the target lineage at or below the
+		// common revision. Proceeding would keep the CURRENT fork's
+		// root while stamping the target fork's coordinates - refuse.
+		return ErrRevisionNotFound
+	}
+	// The computed common revision may have been pruned away; land on
+	// the nearest surviving ancestor revision instead, and make the
+	// stamped revision match the tree actually installed.
+	targetRevision = revInfo.Revision
 
-	// Restore the root if we found revision info
-	if revInfo != nil && revInfo.RootID != 0 {
+	// Restore the root
+	if revInfo.RootID != 0 {
 		if rootNode, ok := g.nodeRegistry[revInfo.RootID]; ok {
 			g.root = rootNode
 		}
@@ -1855,24 +1930,41 @@ func (g *Garland) ForkSeek(fork ForkID) error {
 	// Update counts from the root snapshot at this version
 	g.updateCountsFromRoot()
 
-	// Update cursor positions
+	// Update cursor positions (lineage-aware, same as UndoSeek).
 	for _, cursor := range g.cursors {
-		if pos, ok := cursor.positionHistory[ForkRevision{fork, targetRevision}]; ok {
+		if pos := g.cursorHistoryAt(cursor, fork, targetRevision); pos != nil {
 			cursor.restorePosition(pos)
 		} else {
-			// Clamp cursor to valid range
 			if cursor.bytePos > g.totalBytes {
 				cursor.bytePos = g.totalBytes
-				cursor.runePos = g.totalRunes
-				cursor.line = g.totalLines
-				cursor.lineRune = 0
 			}
+			cursor.runePos, _ = g.byteToRuneInternalUnlocked(cursor.bytePos)
+			cursor.line, cursor.lineRune, _ = g.byteToLineRuneInternalUnlocked(cursor.bytePos)
+			cursor.lineRuneDirty = false
 		}
 		cursor.lastFork = fork
 		cursor.lastRevision = targetRevision
 	}
 
 	return nil
+}
+
+// cursorHistoryAt finds a cursor's recorded position at (fork, rev),
+// following fork ancestry the way node snapshots resolve: a revision
+// at or below a fork's branch point is shared with the parent lineage
+// (positions recorded before the branch were keyed under the parent
+// fork). Returns nil when the cursor has no record along the lineage.
+func (g *Garland) cursorHistoryAt(c *Cursor, fork ForkID, rev RevisionID) *CursorPosition {
+	for {
+		if pos, ok := c.positionHistory[ForkRevision{fork, rev}]; ok {
+			return pos
+		}
+		fi, ok := g.forks[fork]
+		if !ok || fi.ParentFork == fork || rev > fi.ParentRevision {
+			return nil
+		}
+		fork = fi.ParentFork
+	}
 }
 
 // GetForkInfo returns information about a specific fork.
@@ -1905,6 +1997,7 @@ func (g *Garland) ListForks() []ForkInfo {
 func (g *Garland) Prune(keepFromRevision RevisionID) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.awaitNoSaveLocked() // pruning destroys cold blocks a save may be reading
 
 	forkInfo := g.forks[g.currentFork]
 	if forkInfo == nil {
@@ -1929,9 +2022,16 @@ func (g *Garland) Prune(keepFromRevision RevisionID) error {
 	// Set the watermark
 	forkInfo.PrunedUpTo = keepFromRevision
 
-	// Clean up revisionInfo for this fork
+	// Other live forks that branched from this one still resolve their
+	// inherited revisions through THIS fork's revisionInfo and cursor
+	// records. Pruning is this fork's own view only - shared history
+	// survives while anything depends on it (same contract as
+	// DeleteFork).
 	for forkRev := range g.revisionInfo {
 		if forkRev.Fork == g.currentFork && forkRev.Revision < keepFromRevision {
+			if g.revisionNeededByOthers(g.currentFork, forkRev.Revision) {
+				continue
+			}
 			delete(g.revisionInfo, forkRev)
 		}
 	}
@@ -1949,13 +2049,55 @@ func (g *Garland) Prune(keepFromRevision RevisionID) error {
 	return nil
 }
 
-// pruneCursorHistory removes position history entries for pruned revisions.
+// pruneCursorHistory removes position history entries for pruned
+// revisions, sparing those still reachable by other live forks.
 func (g *Garland) pruneCursorHistory(cursor *Cursor, fork ForkID, prunedUpTo RevisionID) {
 	for forkRev := range cursor.positionHistory {
 		if forkRev.Fork == fork && forkRev.Revision < prunedUpTo {
+			if g.revisionNeededByOthers(fork, forkRev.Revision) {
+				continue
+			}
 			delete(cursor.positionHistory, forkRev)
 		}
 	}
+}
+
+// revisionNeededByOthers reports whether revision rev of fork f is
+// still reachable by some OTHER live (non-deleted) fork. A fork D
+// reaches (f, rev) when its lineage passes through f at or above rev -
+// the reach into an ancestor is the MINIMUM branch revision along the
+// path, since each hop only inherits up to its own branch point - AND
+// D has not pruned its own view past rev. This is exactly the set of
+// revisions the snapshot GC marks on D's behalf, so revisionInfo and
+// snapshots stay alive or die together. The walk passes straight
+// through soft-deleted intermediate forks: their lineage metadata
+// persists precisely so descendants keep working.
+func (g *Garland) revisionNeededByOthers(f ForkID, rev RevisionID) bool {
+	for _, other := range g.forks {
+		if other == nil || other.Deleted || other.ID == f {
+			continue
+		}
+		if other.PrunedUpTo > rev {
+			continue // pruned its own view past this revision
+		}
+		cur := other
+		reach := RevisionID(0)
+		haveReach := false
+		for cur != nil && cur.ParentFork != cur.ID {
+			if !haveReach || cur.ParentRevision < reach {
+				reach = cur.ParentRevision
+				haveReach = true
+			}
+			if cur.ParentFork == f {
+				if reach >= rev {
+					return true
+				}
+				break
+			}
+			cur = g.forks[cur.ParentFork]
+		}
+	}
+	return false
 }
 
 // DeleteFork soft-deletes a fork, preventing further navigation to it.
@@ -1964,6 +2106,7 @@ func (g *Garland) pruneCursorHistory(cursor *Cursor, fork ForkID, prunedUpTo Rev
 func (g *Garland) DeleteFork(fork ForkID) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.awaitNoSaveLocked() // fork GC destroys cold blocks a save may be reading
 
 	// Can't delete current fork
 	if fork == g.currentFork {
@@ -1994,31 +2137,23 @@ func (g *Garland) DeleteFork(fork ForkID) error {
 	// Mark as deleted
 	forkInfo.Deleted = true
 
-	// Clean up cursor history for this fork
+	// Keep only entries some other live fork still reaches -
+	// TRANSITIVELY: a live grandchild whose parent is itself deleted
+	// still resolves its inherited revisions through this fork's
+	// entries. Descendants restore cursors through ancestor keys the
+	// same way, so cursor history follows the same rule.
 	for _, cursor := range g.cursors {
 		if cursor != nil {
 			for forkRev := range cursor.positionHistory {
-				if forkRev.Fork == fork {
+				if forkRev.Fork == fork && !g.revisionNeededByOthers(fork, forkRev.Revision) {
 					delete(cursor.positionHistory, forkRev)
 				}
 			}
 		}
 	}
 
-	// Clean up revisionInfo for this fork's unique revisions only.
-	// Find the highest revision that any child fork needs from this fork.
-	maxNeededRevision := RevisionID(0)
-	for _, otherFork := range g.forks {
-		if !otherFork.Deleted && otherFork.ParentFork == fork {
-			if otherFork.ParentRevision > maxNeededRevision {
-				maxNeededRevision = otherFork.ParentRevision
-			}
-		}
-	}
-
-	// Only delete revisionInfo for revisions beyond what child forks need
 	for forkRev := range g.revisionInfo {
-		if forkRev.Fork == fork && forkRev.Revision > maxNeededRevision {
+		if forkRev.Fork == fork && !g.revisionNeededByOthers(fork, forkRev.Revision) {
 			delete(g.revisionInfo, forkRev)
 		}
 	}
@@ -2244,55 +2379,46 @@ func (g *Garland) isAtHead() bool {
 // findCommonRevision finds a common revision between two forks.
 // Returns the revision in the target fork that corresponds to the source position.
 func (g *Garland) findCommonRevision(sourceFork ForkID, sourceRev RevisionID, targetFork ForkID) RevisionID {
-	// Walk up the ancestry of both forks to find common ancestor
-	// For now, simple approach: if target fork is descendant of source, use sourceRev
-	// If source fork is descendant of target, find where source forked from target
-
-	targetInfo := g.forks[targetFork]
-
-	// Check if target fork descended from source fork
-	current := targetFork
-	for current != 0 {
-		info := g.forks[current]
-		if info.ParentFork == sourceFork {
-			// Target descended from source at info.ParentRevision
-			if sourceRev <= info.ParentRevision {
-				return sourceRev
+	// reachInto computes, for the starting fork and every ancestor of
+	// it, the highest revision of that fork reachable from the start:
+	// the MINIMUM of the branch revisions along the path (each hop only
+	// inherits its parent's history up to its own branch point), capped
+	// by `limit` for the starting fork itself.
+	reachInto := func(start ForkID, limit RevisionID) map[ForkID]RevisionID {
+		out := map[ForkID]RevisionID{start: limit}
+		reach := limit
+		cur := g.forks[start]
+		for cur != nil && cur.ParentFork != cur.ID {
+			if cur.ParentRevision < reach {
+				reach = cur.ParentRevision
 			}
-			return info.ParentRevision
+			out[cur.ParentFork] = reach
+			cur = g.forks[cur.ParentFork]
 		}
-		if current == info.ParentFork {
-			break // reached root
-		}
-		current = info.ParentFork
+		return out
 	}
+	src := reachInto(sourceFork, sourceRev)
+	tgtInfo := g.forks[targetFork]
+	tgt := reachInto(targetFork, tgtInfo.HighestRevision)
 
-	// Check if source fork descended from target fork
-	sourceInfo := g.forks[sourceFork]
-	current = sourceFork
-	for current != 0 {
-		info := g.forks[current]
-		if info.ParentFork == targetFork {
-			// Source descended from target at info.ParentRevision
-			return info.ParentRevision
+	// Walk up from the target: the first fork on its ancestry chain
+	// that the source also reaches is the junction. The shared revision
+	// visible from both sides is the smaller of the two reaches.
+	cur := targetFork
+	for {
+		if sr, ok := src[cur]; ok {
+			tr := tgt[cur]
+			if sr < tr {
+				return sr
+			}
+			return tr
 		}
-		if current == info.ParentFork {
+		fi := g.forks[cur]
+		if fi == nil || fi.ParentFork == cur {
 			break
 		}
-		current = info.ParentFork
+		cur = fi.ParentFork
 	}
-
-	// Both forks share a common ancestor - find it
-	// Use targetInfo's parent revision as a safe fallback
-	if targetInfo.ParentFork == sourceInfo.ParentFork {
-		// Siblings - use the earlier of the two divergence points
-		if targetInfo.ParentRevision < sourceInfo.ParentRevision {
-			return targetInfo.ParentRevision
-		}
-		return sourceInfo.ParentRevision
-	}
-
-	// Default: start of target fork
 	return 0
 }
 
@@ -2367,6 +2493,11 @@ func (g *Garland) snapshotCursorPositions() map[*Cursor]*CursorPosition {
 
 // rollbackToPreTransaction restores state to before the transaction.
 func (g *Garland) rollbackToPreTransaction() {
+	// Cache updates queued by the discarded mutations must never be
+	// applied - they describe nodes the rollback just orphaned.
+	g.pendingDecorationUpdates = g.pendingDecorationUpdates[:0]
+	g.pendingDecorationDeletes = g.pendingDecorationDeletes[:0]
+
 	if g.transaction == nil {
 		return
 	}
@@ -2431,7 +2562,15 @@ func (g *Garland) channelLoaderRoutine() {
 			return
 		case data, ok := <-g.loader.dataChan:
 			if !ok {
-				// Channel closed - mark as complete and finalize streaming
+				// Channel closed - flush any held-back partial-rune tail
+				// verbatim (a tail that never completed is the stream's
+				// real final bytes - binary or truncated UTF-8 either
+				// way, they belong in the buffer).
+				if len(g.loader.pendingTail) > 0 {
+					g.appendStreamData(g.loader.pendingTail)
+					g.loader.pendingTail = nil
+				}
+				// Mark as complete and finalize streaming
 				g.mu.Lock()
 				g.countComplete = true
 				g.loader.eofReached = true
@@ -2455,7 +2594,21 @@ func (g *Garland) channelLoaderRoutine() {
 				return
 			}
 			if len(data) > 0 {
-				g.appendStreamData(data)
+				// Rejoin any partial rune held back from the previous
+				// chunk, and hold back a new incomplete tail so leaf
+				// boundaries never split a UTF-8 sequence. For non-UTF-8
+				// (binary) tails trimToRuneBoundary keeps everything.
+				if len(g.loader.pendingTail) > 0 {
+					data = append(append([]byte(nil), g.loader.pendingTail...), data...)
+					g.loader.pendingTail = nil
+				}
+				if cut := trimToRuneBoundary(data); cut < len(data) {
+					g.loader.pendingTail = append([]byte(nil), data[cut:]...)
+					data = data[:cut]
+				}
+				if len(data) > 0 {
+					g.appendStreamData(data)
+				}
 			}
 		}
 	}
@@ -3033,18 +3186,13 @@ func (g *Garland) ByteToLineRune(bytePos int64) (line, runeInLine int64, err err
 	return g.byteToLineRuneInternal(bytePos)
 }
 
+// byteToRuneInternal is the locking wrapper over the single
+// implementation in byteToRuneInternalUnlocked (the RWMutex is not
+// reentrant; paths already holding the lock call the Unlocked core).
 func (g *Garland) byteToRuneInternal(bytePos int64) (int64, error) {
-	if bytePos == 0 {
-		return 0, nil
-	}
-
-	result, err := g.findLeafByByte(bytePos)
-	if err != nil {
-		return 0, err
-	}
-
-	// Absolute rune position = leaf's rune start + rune offset within leaf
-	return result.LeafRuneStart + result.RuneOffset, nil
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.byteToRuneInternalUnlocked(bytePos)
 }
 
 // byteToRuneInternalUnlocked is the unlocked version for use when caller already holds the lock.
@@ -3063,11 +3211,18 @@ func (g *Garland) byteToRuneInternalUnlocked(bytePos int64) (int64, error) {
 }
 
 func (g *Garland) runeToByteInternal(runePos int64) (int64, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.runeToByteInternalUnlocked(runePos)
+}
+
+// runeToByteInternalUnlocked converts under a lock the caller holds.
+func (g *Garland) runeToByteInternalUnlocked(runePos int64) (int64, error) {
 	if runePos == 0 {
 		return 0, nil
 	}
 
-	result, err := g.findLeafByRune(runePos)
+	result, err := g.findLeafByRuneUnlocked(runePos)
 	if err != nil {
 		return 0, err
 	}
@@ -3076,83 +3231,16 @@ func (g *Garland) runeToByteInternal(runePos int64) (int64, error) {
 	return result.LeafByteStart + result.ByteOffset, nil
 }
 
+// byteToLineRuneInternal is the locking wrapper over the single
+// implementation in byteToLineRuneInternalUnlocked. It used to carry a
+// full duplicate of the conversion (which is how the cross-leaf
+// final-line bug existed twice); one body, one place for fixes - and
+// the read lock now covers the WHOLE conversion instead of being
+// taken piecemeal by each tree lookup.
 func (g *Garland) byteToLineRuneInternal(bytePos int64) (int64, int64, error) {
-	if bytePos == 0 {
-		return 0, 0, nil
-	}
-
-	result, err := g.findLeafByByte(bytePos)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	snap := result.Snapshot
-
-	// Handle position at the end of a leaf (ByteOffset == len(data)) or in empty leaf
-	// We need to look at the previous byte to determine line position
-	if (result.ByteOffset == int64(len(snap.data)) || len(snap.data) == 0) && bytePos > 0 {
-		// Find the leaf containing the last byte of actual content
-		prevResult, err := g.findLeafByByte(bytePos - 1)
-		if err != nil {
-			return 0, 0, err
-		}
-		prevSnap := prevResult.Snapshot
-
-		// Check if the last character is a newline
-		lastByte := prevSnap.data[len(prevSnap.data)-1]
-		if lastByte == '\n' {
-			// We're on a new line after the newline
-			// Count all lines up to and including this leaf
-			absoluteLine := g.countLinesBeforeLeaf(result.LeafByteStart) + snap.lineCount
-			return absoluteLine, 0, nil
-		}
-
-		// We're at the end of the last line (after last non-newline char)
-		// Find line info from the previous leaf
-		line := int64(0)
-		lineRuneStart := int64(0)
-		prevOffset := int64(len(prevSnap.data)) // We're at the end of this leaf
-
-		for i := len(prevSnap.lineStarts) - 1; i >= 0; i-- {
-			if prevSnap.lineStarts[i].ByteOffset <= prevOffset {
-				line = int64(i)
-				lineRuneStart = prevSnap.lineStarts[i].RuneOffset
-				break
-			}
-		}
-
-		absoluteLine := g.countLinesBeforeLeaf(prevResult.LeafByteStart) + line
-		runeInLine := prevSnap.runeCount - lineRuneStart
-
-		return absoluteLine, runeInLine, nil
-	}
-
-	// Normal case: find which line within the leaf
-	line := int64(0)
-	lineRuneStart := int64(0)
-
-	// Find the line that contains our byte offset
-	for i := len(snap.lineStarts) - 1; i >= 0; i-- {
-		if snap.lineStarts[i].ByteOffset <= result.ByteOffset {
-			line = int64(i)
-			lineRuneStart = snap.lineStarts[i].RuneOffset
-			break
-		}
-	}
-
-	// Calculate absolute line number
-	absoluteLine := g.countLinesBeforeLeaf(result.LeafByteStart) + line
-
-	// Calculate rune position within the line
-	runeInLine := result.RuneOffset - lineRuneStart
-
-	// If we're on line 0 of this leaf (which might be a continuation from a previous leaf),
-	// add the runes that came before this leaf on the same line.
-	if line == 0 {
-		runeInLine += result.RunesOnLineBeforeLeaf
-	}
-
-	return absoluteLine, runeInLine, nil
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.byteToLineRuneInternalUnlocked(bytePos)
 }
 
 // byteToLineRuneInternalUnlocked is the unlocked version for use when caller already holds the lock.
@@ -3203,6 +3291,13 @@ func (g *Garland) byteToLineRuneInternalUnlocked(bytePos int64) (int64, int64, e
 
 		absoluteLine := g.countLinesBeforeLeaf(prevResult.LeafByteStart) + line
 		runeInLine := prevSnap.runeCount - lineRuneStart
+		if line == 0 {
+			// The final line may SPAN leaves: when the previous leaf has
+			// no newline of its own, runes carried on this line from
+			// earlier leaves must be included, exactly as the normal
+			// (mid-leaf) case does below.
+			runeInLine += prevResult.RunesOnLineBeforeLeaf
+		}
 
 		return absoluteLine, runeInLine, nil
 	}
@@ -3236,7 +3331,14 @@ func (g *Garland) byteToLineRuneInternalUnlocked(bytePos int64) (int64, int64, e
 }
 
 func (g *Garland) lineRuneToByteInternal(line, runeInLine int64) (int64, error) {
-	result, err := g.findLeafByLine(line, runeInLine)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.lineRuneToByteInternalUnlocked(line, runeInLine)
+}
+
+// lineRuneToByteInternalUnlocked converts under a lock the caller holds.
+func (g *Garland) lineRuneToByteInternalUnlocked(line, runeInLine int64) (int64, error) {
+	result, err := g.findLeafByLineUnlocked(line, runeInLine)
 	if err != nil {
 		return 0, err
 	}
@@ -3244,12 +3346,12 @@ func (g *Garland) lineRuneToByteInternal(line, runeInLine int64) (int64, error) 
 	return result.LeafResult.LeafByteStart + result.LeafResult.ByteOffset, nil
 }
 
-// seekByWordAt moves the cursor by n words.
+// seekByWordAt moves the cursor by n words under the given style.
 // Positive n moves forward, negative moves backward.
 // Returns the number of words actually moved.
-func (g *Garland) seekByWordAt(c *Cursor, n int) (int, error) {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
+func (g *Garland) seekByWordAt(c *Cursor, n int, style WordStyle) (int, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 
 	if n == 0 {
 		return 0, nil
@@ -3264,7 +3366,7 @@ func (g *Garland) seekByWordAt(c *Cursor, n int) (int, error) {
 		currentBytePos := c.bytePos
 		for moved < n {
 			// Find the next word boundary from currentBytePos
-			nextWordStart, err := g.findNextWordBoundary(currentBytePos, true)
+			nextWordStart, err := g.findNextWordBoundary(currentBytePos, true, style)
 			if err != nil || nextWordStart == currentBytePos {
 				// No more words or at end
 				break
@@ -3273,8 +3375,8 @@ func (g *Garland) seekByWordAt(c *Cursor, n int) (int, error) {
 			moved++
 		}
 		if moved > 0 {
-			runePos, _ := g.byteToRuneInternal(currentBytePos)
-			line, lineRune, _ := g.byteToLineRuneInternal(currentBytePos)
+			runePos, _ := g.byteToRuneInternalUnlocked(currentBytePos)
+			line, lineRune, _ := g.byteToLineRuneInternalUnlocked(currentBytePos)
 			c.updatePosition(currentBytePos, runePos, line, lineRune)
 		}
 	} else {
@@ -3283,7 +3385,7 @@ func (g *Garland) seekByWordAt(c *Cursor, n int) (int, error) {
 		currentBytePos := c.bytePos
 		for moved < wordsToMove {
 			// Find the previous word boundary from currentBytePos
-			prevWordStart, err := g.findNextWordBoundary(currentBytePos, false)
+			prevWordStart, err := g.findNextWordBoundary(currentBytePos, false, style)
 			if err != nil || prevWordStart == currentBytePos {
 				// No more words or at beginning
 				break
@@ -3292,8 +3394,8 @@ func (g *Garland) seekByWordAt(c *Cursor, n int) (int, error) {
 			moved++
 		}
 		if moved > 0 {
-			runePos, _ := g.byteToRuneInternal(currentBytePos)
-			line, lineRune, _ := g.byteToLineRuneInternal(currentBytePos)
+			runePos, _ := g.byteToRuneInternalUnlocked(currentBytePos)
+			line, lineRune, _ := g.byteToLineRuneInternalUnlocked(currentBytePos)
 			c.updatePosition(currentBytePos, runePos, line, lineRune)
 		}
 	}
@@ -3301,9 +3403,29 @@ func (g *Garland) seekByWordAt(c *Cursor, n int) (int, error) {
 	return moved, nil
 }
 
-// findNextWordBoundary finds the byte position of the next/previous word boundary.
-// forward=true finds next word start, forward=false finds previous word start.
-func (g *Garland) findNextWordBoundary(fromByte int64, forward bool) (int64, error) {
+// wordClassOf buckets a rune for word-motion purposes under a style:
+// 0 = separator (never a stop), 1 = word character, 2 = punctuation
+// run (its own kind of word - WordStyleVi only; under WordStyleSimple
+// punctuation is a separator).
+func wordClassOf(r rune, style WordStyle) int {
+	switch {
+	case unicode.IsSpace(r):
+		return 0
+	case isWordChar(r):
+		return 1
+	case style == WordStyleVi:
+		return 2
+	default:
+		return 0
+	}
+}
+
+// findNextWordBoundary finds the byte position of the next/previous word
+// start under the given style. forward=true finds the next word start,
+// forward=false the previous one. A "word" is a maximal run of a single
+// non-separator class: with WordStyleSimple only letters/digits/_ form
+// words; with WordStyleVi punctuation runs are words of their own.
+func (g *Garland) findNextWordBoundary(fromByte int64, forward bool, style WordStyle) (int64, error) {
 	totalBytes := g.totalBytes
 
 	if forward {
@@ -3311,35 +3433,30 @@ func (g *Garland) findNextWordBoundary(fromByte int64, forward bool) (int64, err
 			return fromByte, nil
 		}
 
-		// Skip current word (if in one), then skip whitespace, then find word start
+		// Skip the rest of the current run - only when the cursor is ON
+		// a non-separator. Starting from a separator must land on the
+		// NEXT word start, not consume it and land on the one after.
 		pos := fromByte
-		inWord := false
-
-		// First, determine if we're in a word and skip to its end
-		for pos < totalBytes {
-			r, size, err := g.runeAtByte(pos)
-			if err != nil {
-				break
-			}
-			if isWordChar(r) {
-				inWord = true
+		if r, size, err := g.runeAtByte(pos); err == nil {
+			if cls := wordClassOf(r, style); cls != 0 {
 				pos += int64(size)
-			} else if inWord {
-				// We've reached the end of current word
-				break
-			} else {
-				pos += int64(size)
+				for pos < totalBytes {
+					r, size, err := g.runeAtByte(pos)
+					if err != nil || wordClassOf(r, style) != cls {
+						break
+					}
+					pos += int64(size)
+				}
 			}
 		}
 
-		// Now skip whitespace/non-word to find next word start
+		// Now skip separators to find the next word start.
 		for pos < totalBytes {
 			r, size, err := g.runeAtByte(pos)
 			if err != nil {
 				break
 			}
-			if isWordChar(r) {
-				// Found start of next word
+			if wordClassOf(r, style) != 0 {
 				return pos, nil
 			}
 			pos += int64(size)
@@ -3355,26 +3472,32 @@ func (g *Garland) findNextWordBoundary(fromByte int64, forward bool) (int64, err
 
 	pos := fromByte
 
-	// First, move back to skip any whitespace/non-word chars before cursor
+	// First, move back over any separators before the cursor.
 	for pos > 0 {
 		r, size, err := g.runeBeforeByte(pos)
 		if err != nil {
 			break
 		}
-		if isWordChar(r) {
+		if wordClassOf(r, style) != 0 {
 			break
 		}
 		pos -= int64(size)
 	}
 
-	// Now move back through the word to find its start
+	// Now move back through the run (of whatever non-separator class
+	// precedes the cursor) to find its start.
+	runClass := -1
 	for pos > 0 {
 		r, size, err := g.runeBeforeByte(pos)
 		if err != nil {
 			break
 		}
-		if !isWordChar(r) {
-			// Found start of word
+		cls := wordClassOf(r, style)
+		if runClass == -1 {
+			runClass = cls
+		}
+		if cls == 0 || cls != runClass {
+			// Found start of the run
 			return pos, nil
 		}
 		pos -= int64(size)
@@ -3492,14 +3615,14 @@ func decodeLastRune(data []byte) (rune, int) {
 
 // seekLineEndAt moves the cursor to the end of its current line.
 func (g *Garland) seekLineEndAt(c *Cursor) error {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
+	g.mu.Lock()
+	defer g.mu.Unlock()
 
 	currentLine := c.line
 
 	// Try to find the start of the next line
 	nextLine := currentLine + 1
-	nextLineBytePos, err := g.lineRuneToByteInternal(nextLine, 0)
+	nextLineBytePos, err := g.lineRuneToByteInternalUnlocked(nextLine, 0)
 
 	if err == nil && nextLineBytePos > 0 {
 		// Next line exists - position just before the newline
@@ -3509,16 +3632,16 @@ func (g *Garland) seekLineEndAt(c *Cursor) error {
 			endPos = 0
 		}
 
-		runePos, _ := g.byteToRuneInternal(endPos)
-		_, lineRune, _ := g.byteToLineRuneInternal(endPos)
+		runePos, _ := g.byteToRuneInternalUnlocked(endPos)
+		_, lineRune, _ := g.byteToLineRuneInternalUnlocked(endPos)
 		c.updatePosition(endPos, runePos, currentLine, lineRune)
 		return nil
 	}
 
 	// We're on the last line - go to EOF
 	endPos := g.totalBytes
-	runePos, _ := g.byteToRuneInternal(endPos)
-	_, lineRune, _ := g.byteToLineRuneInternal(endPos)
+	runePos, _ := g.byteToRuneInternalUnlocked(endPos)
+	_, lineRune, _ := g.byteToLineRuneInternalUnlocked(endPos)
 	c.updatePosition(endPos, runePos, currentLine, lineRune)
 	return nil
 }
@@ -3586,13 +3709,15 @@ func (g *Garland) insertBytesAt(c *Cursor, pos int64, data []byte, decorations [
 		return ChangeResult{}, ErrInvalidPosition
 	}
 
-	newRootID, err := g.insertInternal(g.root, rootSnap, pos, 0, data, decorations, insertBefore)
+	interiorDecs, endDecs := splitEndDecorations(decorations, int64(len(data)))
+	newRootID, err := g.insertInternal(g.root, rootSnap, pos, 0, data, interiorDecs, insertBefore)
 	if err != nil {
 		return ChangeResult{}, err
 	}
 
 	// Update tree root
 	g.root = g.nodeRegistry[newRootID]
+	g.addEndDecorations(endDecs, pos)
 
 	// Calculate deltas for counts
 	insertedBytes := int64(len(data))
@@ -3609,10 +3734,11 @@ func (g *Garland) insertBytesAt(c *Cursor, pos int64, data []byte, decorations [
 	g.totalRunes += insertedRunes
 	g.totalLines += insertedLines
 
-	// Adjust cursors after insertion point
+	// Adjust cursors after the insertion point. RULING: insertBefore
+	// governs cursors exactly AT the point, same as decorations.
 	for _, cursor := range g.cursors {
 		if cursor != c && cursor.bytePos >= pos {
-			cursor.adjustForMutation(pos, insertedBytes, insertedRunes, insertedLines)
+			cursor.adjustForMutation(pos, insertedBytes, insertedRunes, insertedLines, insertBefore)
 		}
 	}
 
@@ -3677,12 +3803,23 @@ func (g *Garland) deleteBytesAt(c *Cursor, pos int64, length int64, includeLineD
 	g.totalRunes -= deletedRunes
 	g.totalLines -= deletedLines
 
+	// Marks are NEVER deleted with a range: they collapse to the
+	// deletion point and stay alive; the returned list is a REPORT so
+	// the tool author can decide which ones to remove explicitly.
+	// deleteRange dropped them from their leaves - re-home each at the
+	// deletion point (right-anchored placement).
+	for _, d := range deletedDecs {
+		if newRootID, err := g.addDecorationInternal(d.Key, pos); err == nil {
+			g.root = g.nodeRegistry[newRootID]
+		}
+	}
+
 	// Adjust cursors after deletion point
 	for _, cursor := range g.cursors {
 		if cursor != c {
 			if cursor.bytePos > pos+length {
 				// Cursor is after deleted range - shift back
-				cursor.adjustForMutation(pos+length, -deletedBytes, -deletedRunes, -deletedLines)
+				cursor.adjustForMutation(pos+length, -deletedBytes, -deletedRunes, -deletedLines, false)
 			} else if cursor.bytePos > pos {
 				// Cursor is within deleted range - move to deletion point
 				cursor.bytePos = pos
@@ -3804,15 +3941,36 @@ func (g *Garland) overwriteBytesAtInternal(c *Cursor, pos int64, length int64, n
 		if rootSnap == nil {
 			return nil, ChangeResult{}, ErrInternal
 		}
-		newRootID, err := g.insertInternal(g.root, rootSnap, pos, 0, newData, allDecorations, insertBefore)
+		// Seam flag: when a range was actually deleted, the only marks
+		// still in the tree at pos are ex-range-end boundary marks
+		// (in-range marks were removed and travel via allDecorations).
+		// They were AFTER the replaced range, so they must slide past
+		// the new content - force the seam to insert-before. Only a
+		// pure insert (length == 0) lets the caller's flag govern
+		// marks that were genuinely at pos.
+		seamBefore := insertBefore
+		if length > 0 {
+			seamBefore = true
+		}
+		interiorDecs, endDecs := splitEndDecorations(allDecorations, newDataLen)
+		newRootID, err := g.insertInternal(g.root, rootSnap, pos, 0, newData, interiorDecs, seamBefore)
 		if err != nil {
 			return nil, ChangeResult{}, err
 		}
 		g.root = g.nodeRegistry[newRootID]
+		g.addEndDecorations(endDecs, pos)
 	} else if len(allDecorations) > 0 {
-		// No new data but we have decorations to add - they need to go somewhere
-		// In this case, the decorations are effectively deleted (returned to caller)
-		// since there's no content to attach them to
+		// Empty replacement: the overwrite degenerates to a delete.
+		// The ruling still holds - marks are never deleted with a
+		// range - so re-home the displaced marks at the deletion point.
+		for _, d := range allDecorations {
+			if oldRootID, removed, err := g.removeDecorationDirect(d.Key); err == nil && removed {
+				g.root = g.nodeRegistry[oldRootID]
+			}
+			if newRootID, err := g.addDecorationInternal(d.Key, pos); err == nil {
+				g.root = g.nodeRegistry[newRootID]
+			}
+		}
 	}
 
 	// Calculate inserted counts
@@ -3830,27 +3988,33 @@ func (g *Garland) overwriteBytesAtInternal(c *Cursor, pos int64, length int64, n
 	g.totalRunes += insertedRunes - deletedRunes
 	g.totalLines += insertedLines - deletedLines
 
-	// Adjust cursors
-	// If the overwrite changes the byte length, cursors after the range need to shift
+	// Adjust cursors. A cursor at or after the end of the replaced
+	// range shifts by the net change (including exactly at the end -
+	// it was after the replaced content); a cursor inside the range
+	// collapses to its start. Either way the replacement can change
+	// rune/line structure before the cursor, so recompute coordinates
+	// from the byte position rather than patching deltas.
+	// The acting cursor is NOT exempt: replace operations fire
+	// overwrites at match positions unrelated to the cursor that
+	// initiated them, so its coordinates must track content shifts
+	// like any other cursor's. (For a plain OverwriteBytes the actor
+	// sits at the range start, where the loop is a no-op anyway.)
 	netByteChange := insertedBytes - deletedBytes
-	netRuneChange := insertedRunes - deletedRunes
-	netLineChange := insertedLines - deletedLines
-
 	for _, cursor := range g.cursors {
-		if cursor != c {
-			if cursor.bytePos >= pos+length {
-				// Cursor is after overwritten range - shift by net change
-				if netByteChange != 0 {
-					cursor.adjustForMutation(pos+length, netByteChange, netRuneChange, netLineChange)
-				}
-			} else if cursor.bytePos > pos {
-				// Cursor is within overwritten range - move to start of range
-				cursor.bytePos = pos
-				// Use unlocked versions since we hold the lock
-				cursor.runePos, _ = g.byteToRuneInternalUnlocked(pos)
-				cursor.line, cursor.lineRune, _ = g.byteToLineRuneInternalUnlocked(pos)
-			}
+		if cursor.bytePos > pos+length ||
+			(cursor.bytePos == pos+length && (length > 0 || insertBefore)) {
+			// length > 0: at range end means after the replaced
+			// content - always shifts. length == 0: pure insert,
+			// the insertBefore flag governs a cursor exactly at pos.
+			cursor.bytePos += netByteChange
+		} else if cursor.bytePos > pos {
+			cursor.bytePos = pos
+		} else {
+			continue
 		}
+		cursor.runePos, _ = g.byteToRuneInternalUnlocked(cursor.bytePos)
+		cursor.line, cursor.lineRune, _ = g.byteToLineRuneInternalUnlocked(cursor.bytePos)
+		cursor.lineRuneDirty = false
 	}
 
 	// Convert absolute decorations to relative (original positions before deletion)
@@ -3865,6 +4029,36 @@ func (g *Garland) overwriteBytesAtInternal(c *Cursor, pos int64, length int64, n
 	// Handle versioning
 	result := g.recordMutation()
 	return relDecs, result, nil
+}
+
+// splitEndDecorations separates relative decorations that land exactly
+// at (or past) the end of a block of inserted content of length n.
+// Storing those inside the inserted leaf would put them at a leaf's END
+// offset, violating the right-anchored storage invariant: per-leaf
+// range arithmetic then reads such a mark as both "inside" and "after"
+// a range (duplicating it), and offset-addressed lookups miss it. The
+// caller must insert the interior decorations with the content and add
+// the end decorations afterwards via addDecorationInternal, which homes
+// them at offset 0 of the following leaf (or as a legitimate EOF mark).
+func splitEndDecorations(decs []RelativeDecoration, n int64) (interior, end []RelativeDecoration) {
+	for _, d := range decs {
+		if d.Position >= n {
+			end = append(end, d)
+		} else {
+			interior = append(interior, d)
+		}
+	}
+	return
+}
+
+// addEndDecorations places end-of-block decorations after an insert at
+// landing, updating the root as it goes. See splitEndDecorations.
+func (g *Garland) addEndDecorations(end []RelativeDecoration, landing int64) {
+	for _, d := range end {
+		if newRootID, err := g.addDecorationInternal(d.Key, landing+d.Position); err == nil {
+			g.root = g.nodeRegistry[newRootID]
+		}
+	}
 }
 
 // MoveResult contains the result of a Move operation.
@@ -3994,13 +4188,37 @@ func (g *Garland) moveBytesAt(c *Cursor, srcStart, srcEnd, dstStart, dstEnd int6
 				})
 			}
 
+			// Seam flag: when the destination window was non-empty,
+			// every mark still in the tree at the seam collapsed there
+			// from AFTER a deleted range (dst end, or an adjacent src
+			// end) and must slide past the landing content. Only a
+			// pure insertion point (dstLen == 0) lets the caller's
+			// flag govern marks genuinely at the seam.
+			seamBefore := insertBefore
+			if dstLen > 0 {
+				seamBefore = true
+			}
+			interiorDecs, endDecs := splitEndDecorations(allDecs, int64(len(srcData)))
 			rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
-			newRootID, err := g.insertInternal(g.root, rootSnap, adjustedDst, 0, srcData, allDecs, insertBefore)
+			newRootID, err := g.insertInternal(g.root, rootSnap, adjustedDst, 0, srcData, interiorDecs, seamBefore)
 			if err != nil {
 				return MoveResult{}, err
 			}
 			g.root = g.nodeRegistry[newRootID]
 			g.totalBytes += int64(len(srcData))
+			g.addEndDecorations(endDecs, adjustedDst)
+		} else if len(dstDecs) > 0 {
+			// Nothing lands: the move degenerates to deleting the dst
+			// window. Marks are never deleted with a range - re-home
+			// the displaced marks at the collapsed window position.
+			for _, d := range dstDecs {
+				if oldRootID, removed, err := g.removeDecorationDirect(d.Key); err == nil && removed {
+					g.root = g.nodeRegistry[oldRootID]
+				}
+				if newRootID, err := g.addDecorationInternal(d.Key, adjustedDst); err == nil {
+					g.root = g.nodeRegistry[newRootID]
+				}
+			}
 		}
 	} else {
 		// Source is after destination (or at same position)
@@ -4039,13 +4257,38 @@ func (g *Garland) moveBytesAt(c *Cursor, srcStart, srcEnd, dstStart, dstEnd int6
 				})
 			}
 
+			// Seam flag: same rule as the src-before-dst branch above,
+			// plus one case unique to this branch: when the destination
+			// window ends exactly at srcStart, marks that sat at srcEnd
+			// collapse onto the seam (the source delete rebases them to
+			// srcStart, the dst delete to dstStart). They were AFTER the
+			// moved block originally, so they slide past it - and no
+			// flag-governed mark can coexist at that seam, because a
+			// mark originally at dstStart==srcStart travels with the
+			// source content instead.
+			seamBefore := insertBefore
+			if dstLen > 0 || srcStart == dstEnd {
+				seamBefore = true
+			}
+			interiorDecs, endDecs := splitEndDecorations(allDecs, int64(len(srcData)))
 			rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
-			newRootID, err := g.insertInternal(g.root, rootSnap, dstStart, 0, srcData, allDecs, insertBefore)
+			newRootID, err := g.insertInternal(g.root, rootSnap, dstStart, 0, srcData, interiorDecs, seamBefore)
 			if err != nil {
 				return MoveResult{}, err
 			}
 			g.root = g.nodeRegistry[newRootID]
 			g.totalBytes += int64(len(srcData))
+			g.addEndDecorations(endDecs, dstStart)
+		} else if len(dstDecs) > 0 {
+			// Nothing lands - re-home displaced dst marks (see above).
+			for _, d := range dstDecs {
+				if oldRootID, removed, err := g.removeDecorationDirect(d.Key); err == nil && removed {
+					g.root = g.nodeRegistry[oldRootID]
+				}
+				if newRootID, err := g.addDecorationInternal(d.Key, dstStart); err == nil {
+					g.root = g.nodeRegistry[newRootID]
+				}
+			}
 		}
 	}
 
@@ -4085,6 +4328,20 @@ func (g *Garland) moveBytesAt(c *Cursor, srcStart, srcEnd, dstStart, dstEnd int6
 			Key:      d.Key,
 			Position: d.Position - dstStart,
 		}
+	}
+
+	// Move/Copy rearranges content at TWO sites; per-site delta
+	// arithmetic cannot keep cursor coordinates coherent. Reconcile
+	// every cursor's rune/line coordinates from its (clamped) byte
+	// position against the final content - these ops are rare, so
+	// correctness wins over the extra tree walks.
+	for _, cursor := range g.cursors {
+		if cursor.bytePos > g.totalBytes {
+			cursor.bytePos = g.totalBytes
+		}
+		cursor.runePos, _ = g.byteToRuneInternalUnlocked(cursor.bytePos)
+		cursor.line, cursor.lineRune, _ = g.byteToLineRuneInternalUnlocked(cursor.bytePos)
+		cursor.lineRuneDirty = false
 	}
 
 	result := g.recordMutation()
@@ -4175,21 +4432,48 @@ func (g *Garland) copyBytesAt(c *Cursor, srcStart, srcEnd, dstStart, dstEnd int6
 		if rootSnap == nil {
 			return CopyResult{}, ErrInternal
 		}
-		newRootID, err := g.insertInternal(g.root, rootSnap, dstStart, 0, srcData, allDecs, insertBefore)
+		// Seam flag: when the destination window was non-empty, marks
+		// still in the tree at dstStart collapsed there from the
+		// window's end and must slide past the copied content. Only a
+		// pure insertion point (dstLen == 0) lets the caller's flag
+		// govern marks genuinely at the seam.
+		seamBefore := insertBefore
+		if dstLen > 0 {
+			seamBefore = true
+		}
+		interiorDecs, endDecs := splitEndDecorations(allDecs, int64(len(srcData)))
+		newRootID, err := g.insertInternal(g.root, rootSnap, dstStart, 0, srcData, interiorDecs, seamBefore)
 		if err != nil {
 			return CopyResult{}, err
 		}
 		g.root = g.nodeRegistry[newRootID]
+		g.addEndDecorations(endDecs, dstStart)
+	} else if len(dstDecs) > 0 {
+		// Nothing lands: the copy degenerates to deleting the dst
+		// window. Marks are never deleted with a range - re-home the
+		// displaced marks at the collapsed window position.
+		for _, d := range dstDecs {
+			if oldRootID, removed, err := g.removeDecorationDirect(d.Key); err == nil && removed {
+				g.root = g.nodeRegistry[oldRootID]
+			}
+			if newRootID, err := g.addDecorationInternal(d.Key, dstStart); err == nil {
+				g.root = g.nodeRegistry[newRootID]
+			}
+		}
 	}
 
 	// Update counts
 	g.updateCountsFromRoot()
 
-	// Adjust cursors that were in or after the destination range
+	// Adjust cursors that were in or after the destination range.
+	// At exactly the window end: dstLen > 0 means the cursor was after
+	// the replaced content and always shifts; a pure insertion point
+	// (dstLen == 0) is governed by the insertBefore flag.
 	netChange := int64(len(srcData)) - dstLen
 	for _, cursor := range g.cursors {
 		if cursor != c {
-			if cursor.bytePos >= dstStart+dstLen {
+			if cursor.bytePos > dstStart+dstLen ||
+				(cursor.bytePos == dstStart+dstLen && (dstLen > 0 || insertBefore)) {
 				// After destination - shift by net change
 				cursor.bytePos += netChange
 				if cursor.bytePos < 0 {
@@ -4216,6 +4500,20 @@ func (g *Garland) copyBytesAt(c *Cursor, srcStart, srcEnd, dstStart, dstEnd int6
 			Key:      d.Key,
 			Position: d.Position - dstStart,
 		}
+	}
+
+	// Move/Copy rearranges content at TWO sites; per-site delta
+	// arithmetic cannot keep cursor coordinates coherent. Reconcile
+	// every cursor's rune/line coordinates from its (clamped) byte
+	// position against the final content - these ops are rare, so
+	// correctness wins over the extra tree walks.
+	for _, cursor := range g.cursors {
+		if cursor.bytePos > g.totalBytes {
+			cursor.bytePos = g.totalBytes
+		}
+		cursor.runePos, _ = g.byteToRuneInternalUnlocked(cursor.bytePos)
+		cursor.line, cursor.lineRune, _ = g.byteToLineRuneInternalUnlocked(cursor.bytePos)
+		cursor.lineRuneDirty = false
 	}
 
 	result := g.recordMutation()
@@ -4312,19 +4610,19 @@ func (g *Garland) deleteRunesAt(c *Cursor, runePos int64, length int64, includeL
 	}
 
 	// Convert rune positions to byte positions (need brief lock for this)
-	g.mu.RLock()
-	byteStart, err := g.runeToByteInternal(runePos)
+	g.mu.Lock()
+	byteStart, err := g.runeToByteInternalUnlocked(runePos)
 	if err != nil {
-		g.mu.RUnlock()
+		g.mu.Unlock()
 		return nil, ChangeResult{}, err
 	}
 
-	byteEnd, err := g.runeToByteInternal(runePos + length)
+	byteEnd, err := g.runeToByteInternalUnlocked(runePos + length)
 	if err != nil {
 		// Clamp to EOF
 		byteEnd = g.totalBytes
 	}
-	g.mu.RUnlock()
+	g.mu.Unlock()
 
 	// Now call deleteBytesAt which will handle its own locking
 	return g.deleteBytesAt(c, byteStart, byteEnd-byteStart, includeLineDecorations)
@@ -4350,6 +4648,56 @@ func (g *Garland) truncateAt(c *Cursor, pos int64) (ChangeResult, error) {
 	// Call deleteBytesAt which will handle its own locking
 	_, result, err := g.deleteBytesAt(c, pos, length, false)
 	return result, err
+}
+
+// setCursorFromByte recomputes every coordinate from a byte position
+// and updates the cursor, all under one write lock - cursor fields are
+// only ever written with the lock held.
+func (g *Garland) setCursorFromByte(c *Cursor, pos int64) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	runePos, err := g.byteToRuneInternalUnlocked(pos)
+	if err != nil {
+		return err
+	}
+	line, lineRune, err := g.byteToLineRuneInternalUnlocked(pos)
+	if err != nil {
+		return err
+	}
+	c.updatePosition(pos, runePos, line, lineRune)
+	return nil
+}
+
+// setCursorFromRune is setCursorFromByte for a rune position.
+func (g *Garland) setCursorFromRune(c *Cursor, runePos int64) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	pos, err := g.runeToByteInternalUnlocked(runePos)
+	if err != nil {
+		return err
+	}
+	line, lineRune, err := g.byteToLineRuneInternalUnlocked(pos)
+	if err != nil {
+		return err
+	}
+	c.updatePosition(pos, runePos, line, lineRune)
+	return nil
+}
+
+// setCursorFromLine is setCursorFromByte for a line:rune position.
+func (g *Garland) setCursorFromLine(c *Cursor, line, runeInLine int64) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	pos, err := g.lineRuneToByteInternalUnlocked(line, runeInLine)
+	if err != nil {
+		return err
+	}
+	runePos, err := g.byteToRuneInternalUnlocked(pos)
+	if err != nil {
+		return err
+	}
+	c.updatePosition(pos, runePos, line, runeInLine)
+	return nil
 }
 
 // recordMutation handles versioning after a mutation.
@@ -4406,9 +4754,18 @@ func (g *Garland) recordMutation() ChangeResult {
 		cursor.lastRevision = g.currentRevision
 	}
 
-	// Check memory pressure and perform incremental maintenance if needed
-	// Note: This is done without holding the lock, so we need to be careful
-	go g.CheckMemoryPressure()
+	// Check memory pressure and perform incremental maintenance if
+	// needed. Only when limits are actually configured, and never more
+	// than one checker in flight: an unconditional goroutine per
+	// mutation means one full node-registry scan PER KEYSTROKE, each
+	// scan growing with the registry.
+	if g.lib != nil && (g.lib.memorySoftLimit > 0 || g.lib.memoryHardLimit > 0) &&
+		atomic.CompareAndSwapInt32(&g.maintenanceInFlight, 0, 1) {
+		go func() {
+			defer atomic.StoreInt32(&g.maintenanceInFlight, 0)
+			g.CheckMemoryPressure()
+		}()
+	}
 
 	return ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}
 }
@@ -4420,6 +4777,7 @@ func (g *Garland) recordCursorPositionsInHistory() {
 	for _, cursor := range g.cursors {
 		// Always update position - cursor may have moved since last record
 		// This captures the position just before the mutation occurs
+		cursor.resolveStaleLineRuneLocked() // history must store real columns
 		cursor.positionHistory[key] = &CursorPosition{
 			BytePos:  cursor.bytePos,
 			RunePos:  cursor.runePos,
@@ -4468,11 +4826,11 @@ func (g *Garland) readBytesAt(pos int64, length int64) ([]byte, error) {
 	}
 
 	// Try read with read lock first (fast path)
-	g.mu.RLock()
+	g.mu.Lock()
 	totalBytesForRevision := g.calculateTotalBytesUnlocked()
 
 	if pos > totalBytesForRevision {
-		g.mu.RUnlock()
+		g.mu.Unlock()
 		return nil, ErrInvalidPosition
 	}
 
@@ -4483,7 +4841,7 @@ func (g *Garland) readBytesAt(pos int64, length int64) ([]byte, error) {
 	}
 
 	result, err := g.readBytesRangeInternal(pos, readLength)
-	g.mu.RUnlock()
+	g.mu.Unlock()
 
 	// If data is not loaded (cold storage), try to thaw and retry
 	if err == ErrDataNotLoaded {
@@ -4493,9 +4851,9 @@ func (g *Garland) readBytesAt(pos int64, length int64) ([]byte, error) {
 		}
 
 		// Retry with read lock
-		g.mu.RLock()
+		g.mu.Lock()
 		result, err = g.readBytesRangeInternal(pos, readLength)
-		g.mu.RUnlock()
+		g.mu.Unlock()
 	}
 
 	return result, err
@@ -4532,20 +4890,20 @@ func (g *Garland) readStringAt(pos int64, length int64) (string, error) {
 		return "", nil
 	}
 
-	g.mu.RLock()
-	defer g.mu.RUnlock()
+	g.mu.Lock()
+	defer g.mu.Unlock()
 
 	if pos < 0 || pos > g.totalRunes {
 		return "", ErrInvalidPosition
 	}
 
 	// Convert rune range to byte range
-	byteStart, err := g.runeToByteInternal(pos)
+	byteStart, err := g.runeToByteInternalUnlocked(pos)
 	if err != nil {
 		return "", err
 	}
 
-	byteEnd, err := g.runeToByteInternal(pos + length)
+	byteEnd, err := g.runeToByteInternalUnlocked(pos + length)
 	if err != nil {
 		// If end is past EOF, clamp to EOF
 		byteEnd = g.totalBytes
@@ -4564,8 +4922,8 @@ func (g *Garland) readLineAt(line int64) (string, error) {
 		return "", ErrInvalidPosition
 	}
 
-	g.mu.RLock()
-	defer g.mu.RUnlock()
+	g.mu.Lock()
+	defer g.mu.Unlock()
 
 	// Validate line number
 	if line > g.totalLines {
@@ -4573,7 +4931,7 @@ func (g *Garland) readLineAt(line int64) (string, error) {
 	}
 
 	// Find start of line
-	lineResult, err := g.findLeafByLine(line, 0)
+	lineResult, err := g.findLeafByLineUnlocked(line, 0)
 	if err != nil {
 		return "", err
 	}
@@ -4839,6 +5197,11 @@ func (g *Garland) Decorate(entries []DecorationEntry) (ChangeResult, error) {
 	if len(entries) == 0 {
 		return ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}, nil
 	}
+	for _, e := range entries {
+		if !ValidDecorationKey(e.Key) {
+			return ChangeResult{}, ErrInvalidDecorationKey
+		}
+	}
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -4921,6 +5284,18 @@ func (g *Garland) Decorate(entries []DecorationEntry) (ChangeResult, error) {
 	if len(additions) > 0 {
 		// Group additions by their target leaf position
 		for _, add := range additions {
+			// A key is unique document-wide: an UPDATE must remove the
+			// old instance wherever it lives. addDecorationInternal only
+			// dedupes within the target leaf, so a move across leaves
+			// would otherwise leave two live copies of the key.
+			oldRootID, removedOld, err := g.removeDecorationDirect(add.key)
+			if err != nil {
+				return ChangeResult{}, err
+			}
+			if removedOld {
+				g.root = g.nodeRegistry[oldRootID]
+				changed = true
+			}
 			newRootID, err := g.addDecorationInternal(add.key, add.bytePos)
 			if err != nil {
 				return ChangeResult{}, err
@@ -4941,23 +5316,30 @@ func (g *Garland) Decorate(entries []DecorationEntry) (ChangeResult, error) {
 // GetDecorationPosition returns the current position of a decoration by key.
 // Uses registry-based O(1) existence check and cached location hints for fast lookup.
 func (g *Garland) GetDecorationPosition(key string) (AbsoluteAddress, error) {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
+	g.mu.Lock()
+	defer g.mu.Unlock()
 
-	// O(1) existence check: if not in registry, it was never created
+	// During a transaction, always search the tree since decorations may
+	// have moved as a side effect of inserts/deletes (cache doesn't
+	// track these movements).
+	inTransaction := g.transaction != nil && g.transaction.hasMutations
+
+	// O(1) existence check: if not in registry, it was never created.
+	// EXCEPT inside a transaction: cache updates are queued until
+	// commit, so a key first set within the transaction has no entry
+	// yet - fall through to the tree search.
 	cacheEntry, exists := g.decorationCache[key]
 	if !exists {
-		return AbsoluteAddress{}, ErrDecorationNotFound
+		if !inTransaction {
+			return AbsoluteAddress{}, ErrDecorationNotFound
+		}
+		cacheEntry = &DecorationCacheEntry{}
 	}
 
 	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
 	if rootSnap == nil {
 		return AbsoluteAddress{}, ErrDecorationNotFound
 	}
-
-	// During a transaction, always search the tree since decorations may have moved
-	// as a side effect of inserts/deletes (cache doesn't track these movements)
-	inTransaction := g.transaction != nil && g.transaction.hasMutations
 
 	// Check if cached location is valid (same fork AND same revision, not in transaction)
 	// IMPORTANT: We must verify at the CURRENT revision, not the cached revision.
@@ -4988,21 +5370,30 @@ func (g *Garland) GetDecorationPosition(key string) (AbsoluteAddress, error) {
 	// Use cached offset as hint for middle-out search
 	bytePos, nodeID, nodeOffset, found := g.findDecorationWithHint(key, cacheEntry.LastKnownOffset)
 	if !found {
-		// Decoration not present at this revision - mark as confirmed absent
-		cacheEntry.LastKnownFork = g.currentFork
-		cacheEntry.LastKnownRev = g.currentRevision
-		cacheEntry.LastKnownNode = 0 // 0 = confirmed not present
-		cacheEntry.LastAccess = time.Now()
+		// Mid-transaction results must never be stamped into the
+		// cache: g.currentRevision is still the PRE-transaction
+		// revision, so after a rollback the entry would pass the
+		// exact fork+revision check while describing discarded state.
+		if !inTransaction {
+			// Decoration not present at this revision - mark as confirmed absent
+			cacheEntry.LastKnownFork = g.currentFork
+			cacheEntry.LastKnownRev = g.currentRevision
+			cacheEntry.LastKnownNode = 0 // 0 = confirmed not present
+			cacheEntry.LastAccess = time.Now()
+		}
 		return AbsoluteAddress{}, ErrDecorationNotFound
 	}
 
-	// Update cache with new location
-	cacheEntry.LastKnownFork = g.currentFork
-	cacheEntry.LastKnownRev = g.currentRevision
-	cacheEntry.LastKnownNode = nodeID
-	cacheEntry.LastKnownOffset = nodeOffset
-	cacheEntry.Tier = CacheTierHot
-	cacheEntry.LastAccess = time.Now()
+	if !inTransaction {
+		// Update cache with new location (see rollback note above for
+		// why this is skipped during a transaction)
+		cacheEntry.LastKnownFork = g.currentFork
+		cacheEntry.LastKnownRev = g.currentRevision
+		cacheEntry.LastKnownNode = nodeID
+		cacheEntry.LastKnownOffset = nodeOffset
+		cacheEntry.Tier = CacheTierHot
+		cacheEntry.LastAccess = time.Now()
+	}
 
 	return ByteAddress(bytePos), nil
 }
@@ -5080,6 +5471,21 @@ func (g *Garland) updateDecorationCacheForNode(nodeID NodeID, nodeOffset int64, 
 // applyPendingDecorationUpdates applies queued cache updates with the given revision.
 func (g *Garland) applyPendingDecorationUpdates(fork ForkID, rev RevisionID) {
 	now := time.Now()
+	// Deletions FIRST, updates second - mirroring Decorate's processing
+	// order (deletions, then additions). A MOVE queues a delete for the
+	// old instance and an update for the new one in the same mutation;
+	// applying deletes last would clobber the fresh entry with
+	// "confirmed not present" and the cache would deny a live key.
+	for _, key := range g.pendingDecorationDeletes {
+		if entry, exists := g.decorationCache[key]; exists {
+			entry.LastKnownFork = fork
+			entry.LastKnownRev = rev
+			entry.LastKnownNode = 0 // 0 = confirmed not present
+			entry.LastAccess = now
+		}
+	}
+	g.pendingDecorationDeletes = g.pendingDecorationDeletes[:0] // Clear slice, keep capacity
+
 	for _, update := range g.pendingDecorationUpdates {
 		g.decorationCache[update.Key] = &DecorationCacheEntry{
 			LastKnownFork:   fork,
@@ -5091,17 +5497,49 @@ func (g *Garland) applyPendingDecorationUpdates(fork ForkID, rev RevisionID) {
 		}
 	}
 	g.pendingDecorationUpdates = g.pendingDecorationUpdates[:0] // Clear slice, keep capacity
+}
 
-	// Process pending deletions - mark as "confirmed not present" at this revision
+// flushPendingDecorationUpdatesVerified is the transaction-commit
+// counterpart of applyPendingDecorationUpdates. Queued entries carry
+// node IDs and offsets captured when each mutation ran; LATER mutations
+// in the same transaction can shift those offsets or supersede those
+// nodes, and the queue order can even invert a Decorate-then-remove
+// sequence (deletes are flushed first regardless of when they were
+// queued). Stamping such entries with the freshly committed revision
+// would make the read path trust them outright. Instead, re-resolve
+// every touched key against the committed tree and stamp what is
+// actually there.
+func (g *Garland) flushPendingDecorationUpdatesVerified(fork ForkID, rev RevisionID) {
+	hints := make(map[string]int64)
 	for _, key := range g.pendingDecorationDeletes {
-		if entry, exists := g.decorationCache[key]; exists {
-			entry.LastKnownFork = fork
-			entry.LastKnownRev = rev
-			entry.LastKnownNode = 0 // 0 = confirmed not present
-			entry.LastAccess = now
+		if _, ok := hints[key]; !ok {
+			hints[key] = 0
 		}
 	}
-	g.pendingDecorationDeletes = g.pendingDecorationDeletes[:0] // Clear slice, keep capacity
+	for _, u := range g.pendingDecorationUpdates {
+		hints[u.Key] = u.Offset // last queued offset is the best hint
+	}
+	g.pendingDecorationDeletes = g.pendingDecorationDeletes[:0]
+	g.pendingDecorationUpdates = g.pendingDecorationUpdates[:0]
+
+	now := time.Now()
+	for key, hint := range hints {
+		entry, exists := g.decorationCache[key]
+		if !exists {
+			entry = &DecorationCacheEntry{}
+			g.decorationCache[key] = entry
+		}
+		entry.LastKnownFork = fork
+		entry.LastKnownRev = rev
+		entry.LastAccess = now
+		if _, nodeID, nodeOffset, found := g.findDecorationWithHint(key, hint); found {
+			entry.LastKnownNode = nodeID
+			entry.LastKnownOffset = nodeOffset
+			entry.Tier = CacheTierHot
+		} else {
+			entry.LastKnownNode = 0 // confirmed not present
+		}
+	}
 }
 
 // findLeafAtOffset finds the leaf node containing the given byte offset.
@@ -5177,8 +5615,8 @@ func (g *Garland) GetDecorationsInByteRange(start, end int64) ([]DecorationEntry
 		return nil, ErrInvalidPosition
 	}
 
-	g.mu.RLock()
-	defer g.mu.RUnlock()
+	g.mu.Lock()
+	defer g.mu.Unlock()
 
 	if start > g.totalBytes {
 		return nil, ErrInvalidPosition
@@ -5244,8 +5682,8 @@ func (g *Garland) GetDecorationsOnLine(line int64) ([]DecorationEntry, error) {
 		return nil, ErrInvalidPosition
 	}
 
-	g.mu.RLock()
-	defer g.mu.RUnlock()
+	g.mu.Lock()
+	defer g.mu.Unlock()
 
 	if line > g.totalLines {
 		return nil, ErrInvalidPosition
@@ -5307,8 +5745,8 @@ func (g *Garland) findLineEndUnlocked(lineStart int64) int64 {
 // DumpDecorations writes all decorations to a file in INI-like format.
 // If fs is nil, uses the Garland's source filesystem.
 func (g *Garland) DumpDecorations(fs FileSystemInterface, path string) error {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
+	g.mu.Lock()
+	defer g.mu.Unlock()
 
 	rootSnap := g.root.snapshotAt(g.currentFork, g.currentRevision)
 	if rootSnap == nil {
@@ -5419,15 +5857,31 @@ func (g *Garland) lineRuneToByteUnlocked(line, runeInLine int64) (int64, error) 
 // Returns true if the decoration was found and removed, false if cache miss (caller should use fallback).
 // This is O(log n) when cache hits, and returns false when cache misses (no tree walk).
 func (g *Garland) removeDecorationViaCache(key string) (bool, error) {
+	// Mid-transaction the revision number does not advance per
+	// mutation, so a pre-transaction cache entry still carries the
+	// "current" fork+revision and would pass the exactness check below
+	// even though earlier in-transaction edits may have superseded the
+	// cached node. The cache cannot be trusted here at all.
+	if g.transaction != nil && g.transaction.hasMutations {
+		return false, nil
+	}
+
 	// Check cache for hint
 	cacheEntry, exists := g.decorationCache[key]
 	if !exists || cacheEntry.LastKnownNode == 0 {
 		return false, nil // No cache entry or marked as not present
 	}
 
-	// Check if cache is for current fork (different fork = definitely stale)
-	if cacheEntry.LastKnownFork != g.currentFork {
-		return false, nil // Wrong fork, need fallback
+	// The cache is a HINT and must be fully verified before acting on
+	// it (the read path requires the exact current fork AND revision;
+	// removal must be at least as strict). In a persistent structure a
+	// superseded node keeps its old snapshots forever, so an
+	// old-revision entry always LOOKS valid here: acting on it removes
+	// the key from a leaf that is no longer in the current tree,
+	// grafts stale data back in at a stale offset, and leaves the live
+	// copy of the decoration untouched.
+	if cacheEntry.LastKnownFork != g.currentFork || cacheEntry.LastKnownRev != g.currentRevision {
+		return false, nil // Stale hint: fall back to the tree walk
 	}
 
 	// Try to access the cached node directly

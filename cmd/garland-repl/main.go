@@ -209,6 +209,9 @@ func (r *REPL) handleCommand(input string) bool {
 	case "saveas":
 		r.cmdSaveAs(args)
 
+	case "rebase":
+		r.cmdRebase(args)
+
 	case "chill":
 		r.cmdChill(args)
 
@@ -2037,13 +2040,66 @@ func (r *REPL) cmdSave() {
 		return
 	}
 
-	err := r.garland.Save()
+	report, err := r.garland.Save()
 	if err != nil {
 		fmt.Printf("Save error: %v\n", err)
 		return
 	}
+	printScarWarnings(report)
 
 	fmt.Println("File saved")
+}
+
+func (r *REPL) cmdRebase(args []string) {
+	if !r.ensureGarland() {
+		return
+	}
+	var report garland.RebaseReport
+	var err error
+	if len(args) > 0 {
+		report, err = r.garland.RebaseOnFile(nil, strings.Join(args, " "))
+	} else {
+		report, err = r.garland.RebaseOnSource()
+	}
+	if err != nil {
+		fmt.Printf("Rebase error: %v\n", err)
+		return
+	}
+	if report.NoChange {
+		fmt.Println("Rebase: buffer already matches the file (no change)")
+	} else {
+		fmt.Printf("Rebase: %d bytes kept (%d blocks), %d bytes adopted, size %d -> %d\n",
+			report.BytesKept, report.BlocksKept, report.BytesAdopted,
+			report.OldSize, report.NewSize)
+		fmt.Printf("  'keep your version': undoseek %d\n", report.PreviousRevision)
+	}
+	if report.BlocksHealed > 0 {
+		fmt.Printf("  %d previously lost blocks healed from the file\n", report.BlocksHealed)
+	}
+	for _, reg := range report.Adopted {
+		fmt.Printf("  adopted [%d..%d)\n", reg.Offset, reg.Offset+reg.Length)
+	}
+}
+
+func printScarWarnings(report garland.SaveReport) {
+	for _, ev := range report.Integrity {
+		fmt.Printf("INTEGRITY [%s]: block at offset %d (%d bytes, file offset %d)\n",
+			ev.Kind, ev.BufferOffset, ev.Length, ev.FileOffset)
+		if ev.Detail != "" {
+			fmt.Printf("  %s\n", ev.Detail)
+		}
+	}
+	for _, s := range report.Scars {
+		fmt.Printf("WARNING: lost block at offset %d (%d bytes) written as scar", s.Offset, s.Length)
+		if s.Appended {
+			fmt.Printf(" (marker appended at end of file)")
+		}
+		fmt.Println()
+		if s.Reason != "" {
+			fmt.Printf("  reason: %s\n", s.Reason)
+		}
+		fmt.Printf("  marker: %s\n", s.Marker)
+	}
 }
 
 func (r *REPL) cmdSaveAs(args []string) {
@@ -2057,11 +2113,12 @@ func (r *REPL) cmdSaveAs(args []string) {
 	}
 
 	path := strings.Join(args, " ")
-	err := r.garland.SaveAs(nil, path)
+	report, err := r.garland.SaveAs(nil, path)
 	if err != nil {
 		fmt.Printf("SaveAs error: %v\n", err)
 		return
 	}
+	printScarWarnings(report)
 
 	fmt.Printf("File saved to %s\n", path)
 }

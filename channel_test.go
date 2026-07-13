@@ -463,3 +463,99 @@ func TestChannelSourceStreamingContinuesAfterEdits(t *testing.T) {
 		t.Errorf("Revision 1 content = %q, want %q", string(data), expected)
 	}
 }
+
+// waitStreamComplete polls until the stream finishes loading.
+func waitStreamComplete(t *testing.T, g *Garland) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if g.ByteCount().Complete {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("stream never completed")
+}
+
+// TestChannelSourceSplitRune: a UTF-8 sequence split across two channel
+// sends must not be split across two LEAVES - per-leaf rune/line counts
+// would be wrong (each half of the rune miscounted). The loader holds
+// back an incomplete tail and rejoins it with the next chunk.
+func TestChannelSourceSplitRune(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	dataChan := make(chan []byte)
+	g, err := lib.Open(FileOptions{DataChannel: dataChan})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer g.Close()
+
+	full := "héllo wörld\n" // é and ö are 2-byte sequences
+	b := []byte(full)
+	// Split INSIDE é (after its first byte) and INSIDE ö.
+	dataChan <- append([]byte(nil), b[:2]...)
+	time.Sleep(10 * time.Millisecond)
+	// The incomplete lead byte must be held back, not made visible.
+	if bc := g.ByteCount().Value; bc != 1 {
+		t.Errorf("after split-rune chunk: ByteCount = %d, want 1 (tail held)", bc)
+	}
+	dataChan <- append([]byte(nil), b[2:9]...)
+	dataChan <- append([]byte(nil), b[9:]...)
+	close(dataChan)
+	waitStreamComplete(t, g)
+
+	if bc := g.ByteCount().Value; bc != int64(len(b)) {
+		t.Errorf("ByteCount = %d, want %d", bc, len(b))
+	}
+	wantRunes := int64(len([]rune(full)))
+	if rc := g.RuneCount().Value; rc != wantRunes {
+		t.Errorf("RuneCount = %d, want %d (split rune corrupted counts)", rc, wantRunes)
+	}
+	if lc := g.LineCount().Value; lc != 1 {
+		t.Errorf("LineCount = %d, want 1", lc)
+	}
+	c := g.NewCursor()
+	if err := c.SeekByte(0); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.ReadBytes(int64(len(b)))
+	if err != nil {
+		t.Fatalf("ReadBytes: %v", err)
+	}
+	if string(got) != full {
+		t.Errorf("content = %q, want %q", got, full)
+	}
+}
+
+// TestChannelSourceBinaryTailPassthrough: a stream ending in bytes that
+// LOOK like an incomplete UTF-8 sequence (e.g. binary data) must still
+// arrive byte-for-byte - the held tail is flushed verbatim at EOF.
+func TestChannelSourceBinaryTailPassthrough(t *testing.T) {
+	lib, _ := Init(LibraryOptions{})
+	dataChan := make(chan []byte)
+	g, err := lib.Open(FileOptions{DataChannel: dataChan})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer g.Close()
+
+	payload := []byte{0x00, 0x01, 0x02, 0xF0} // ends with a lone 4-byte leader
+	dataChan <- append([]byte(nil), payload...)
+	close(dataChan)
+	waitStreamComplete(t, g)
+
+	if bc := g.ByteCount().Value; bc != int64(len(payload)) {
+		t.Fatalf("ByteCount = %d, want %d (binary tail dropped?)", bc, len(payload))
+	}
+	c := g.NewCursor()
+	if err := c.SeekByte(0); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.ReadBytes(int64(len(payload)))
+	if err != nil {
+		t.Fatalf("ReadBytes: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Errorf("content = %x, want %x", got, payload)
+	}
+}

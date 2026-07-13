@@ -113,11 +113,14 @@ func TestCreateLeafSnapshotWithDecorations(t *testing.T) {
 	if snap.originalFileOffset != 100 {
 		t.Errorf("Expected originalFileOffset 100, got %d", snap.originalFileOffset)
 	}
-	if snap.dataHash == nil {
-		t.Error("dataHash should not be nil")
+	// Hashes are computed lazily at chill time, never at creation:
+	// eager hashing was the dominant per-keystroke cost, and the eager
+	// decoration hash used a different encoding than thaw verification.
+	if snap.dataHash != nil {
+		t.Error("dataHash should be nil until the snapshot is chilled")
 	}
-	if snap.decorationHash == nil {
-		t.Error("decorationHash should not be nil")
+	if snap.decorationHash != nil {
+		t.Error("decorationHash should be nil until the snapshot is chilled")
 	}
 }
 
@@ -250,7 +253,7 @@ func TestPartitionDecorationsEdgeCases(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Test with insertBefore=true (decorations at pos go right)
-			left, right := partitionDecorations(tt.decorations, tt.pos, true)
+			left, _, right := partitionDecorations(tt.decorations, tt.pos, true)
 			if len(left) != tt.wantLeft {
 				t.Errorf("left count = %d, want %d", len(left), tt.wantLeft)
 			}
@@ -268,7 +271,7 @@ func TestPartitionDecorationsPositionAdjustment(t *testing.T) {
 		{Key: "c", Position: 25},
 	}
 
-	left, right := partitionDecorations(decorations, 10, true)
+	left, _, right := partitionDecorations(decorations, 10, true)
 
 	if len(left) != 1 || left[0].Position != 5 {
 		t.Error("Left decoration position should remain unchanged")
@@ -302,28 +305,6 @@ func TestComputeHash(t *testing.T) {
 	}
 	if len(hash1) != 32 { // SHA-256 produces 32 bytes
 		t.Errorf("Hash length = %d, want 32", len(hash1))
-	}
-}
-
-func TestComputeDecorationHash(t *testing.T) {
-	dec1 := []Decoration{{Key: "a", Position: 10}}
-	dec2 := []Decoration{{Key: "a", Position: 10}}
-	dec3 := []Decoration{{Key: "b", Position: 10}}
-	dec4 := []Decoration{{Key: "a", Position: 20}}
-
-	hash1 := computeDecorationHash(dec1)
-	hash2 := computeDecorationHash(dec2)
-	hash3 := computeDecorationHash(dec3)
-	hash4 := computeDecorationHash(dec4)
-
-	if !bytes.Equal(hash1, hash2) {
-		t.Error("Same decorations should produce same hash")
-	}
-	if bytes.Equal(hash1, hash3) {
-		t.Error("Different keys should produce different hash")
-	}
-	if bytes.Equal(hash1, hash4) {
-		t.Error("Different positions should produce different hash")
 	}
 }
 

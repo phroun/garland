@@ -27,6 +27,12 @@ var (
 var (
 	// ErrDecorationNotFound indicates that a decoration key does not exist.
 	ErrDecorationNotFound = errors.New("decoration not found")
+
+	// ErrInvalidDecorationKey indicates a decoration key with illegal
+	// characters. RULING: keys are identifiers, not storage - ASCII
+	// letters, digits, '_', '.', '#', and '-' only, non-empty. This
+	// keeps every serialization of keys framing-safe by construction.
+	ErrInvalidDecorationKey = errors.New("invalid decoration key: letters, digits, '_', '.', '#', '-' only")
 )
 
 // Versioning errors

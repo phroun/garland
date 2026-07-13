@@ -1,6 +1,7 @@
 package garland
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"time"
 	"unicode/utf8"
@@ -65,6 +66,13 @@ type NodeSnapshot struct {
 	dataHash       []byte // SHA-256 hash for verification
 	decorationHash []byte // SHA-256 hash for decoration verification
 
+	// placeholderReason records WHY this snapshot became a placeholder,
+	// captured at the moment the loss is discovered (cold-storage read
+	// failure, hash mismatch, source file changed on disk, ...). It is
+	// carried through to the ScarWarning when the block is scarred
+	// during a save. Empty unless storageState is StoragePlaceholder.
+	placeholderReason string
+
 	// originalFileOffset is the byte offset in the original file where this
 	// content came from. -1 if not from the original file (not eligible for warm storage).
 	originalFileOffset int64
@@ -87,6 +95,18 @@ type NodeSnapshot struct {
 	// lastAccessTime tracks when this snapshot's data was last accessed.
 	// Used for LRU-based memory management. Zero value means never accessed.
 	lastAccessTime time.Time
+}
+
+// becomePlaceholder marks the snapshot's data as lost, recording why.
+// The reason is kept from this moment of discovery until it is reported
+// back to the app (in a ScarWarning) when the block is scarred on save.
+// The first recorded reason wins: a placeholder re-touched by a later
+// failed access keeps the original cause.
+func (snap *NodeSnapshot) becomePlaceholder(reason string) {
+	if snap.storageState != StoragePlaceholder || snap.placeholderReason == "" {
+		snap.placeholderReason = reason
+	}
+	snap.storageState = StoragePlaceholder
 }
 
 // newNode creates a new node with the given ID and Garland reference.
@@ -173,25 +193,29 @@ func createLeafSnapshot(data []byte, decorations []Decoration, originalOffset in
 	snap.byteCount = int64(len(data))
 	snap.runeCount = int64(utf8.RuneCount(data))
 
-	// Count newlines and build line starts index
+	// Count newlines and build line starts index. Hops newline to
+	// newline with IndexByte instead of decoding every rune - this runs
+	// on every leaf rebuild, i.e. on every keystroke.
 	snap.lineStarts = make([]LineStart, 0)
 	snap.lineStarts = append(snap.lineStarts, LineStart{ByteOffset: 0, RuneOffset: 0})
 
-	var runeOffset int64 = 0
-	for i := 0; i < len(data); {
-		r, size := utf8.DecodeRune(data[i:])
-		if r == '\n' {
-			snap.lineCount++
-			// Next line starts after this newline
-			if i+size < len(data) {
-				snap.lineStarts = append(snap.lineStarts, LineStart{
-					ByteOffset: int64(i + size),
-					RuneOffset: runeOffset + 1,
-				})
-			}
+	var runeOffset int64
+	prev := 0
+	for {
+		i := bytes.IndexByte(data[prev:], '\n')
+		if i < 0 {
+			break
 		}
-		i += size
-		runeOffset++
+		nl := prev + i
+		snap.lineCount++
+		runeOffset += int64(utf8.RuneCount(data[prev : nl+1]))
+		if nl+1 < len(data) {
+			snap.lineStarts = append(snap.lineStarts, LineStart{
+				ByteOffset: int64(nl + 1),
+				RuneOffset: runeOffset,
+			})
+		}
+		prev = nl + 1
 	}
 
 	// Calculate runes after last newline from lineStarts
@@ -206,11 +230,18 @@ func createLeafSnapshot(data []byte, decorations []Decoration, originalOffset in
 		snap.runesAfterLastNewline = 0
 	}
 
-	// Compute hash
-	snap.dataHash = computeHash(data)
-	if len(decorations) > 0 {
-		snap.decorationHash = computeDecorationHash(decorations)
-	}
+	// Hashes are computed LAZILY, at chill time (chillSnapshot /
+	// chillToWarmStorage fill them in before data leaves memory), for
+	// two reasons:
+	//   - SHA-256 over up to 128KB on every leaf rebuild was the
+	//     dominant per-keystroke cost, paid even though most leaves
+	//     are superseded without ever being chilled.
+	//   - An eagerly computed decorationHash used a DIFFERENT encoding
+	//     (computeDecorationHash) than what cold storage writes and
+	//     thaw verifies (encodeDecorations), so any chilled leaf with
+	//     decorations failed verification on thaw and silently dropped
+	//     its marks. With one writer - the chill path - the hash always
+	//     matches the stored encoding.
 
 	return snap
 }
@@ -284,30 +315,28 @@ func computeHash(data []byte) []byte {
 	return h[:]
 }
 
-// computeDecorationHash computes a hash of decoration data.
-func computeDecorationHash(decorations []Decoration) []byte {
-	// Simple hash: concatenate key and position bytes
-	var data []byte
-	for _, d := range decorations {
-		data = append(data, []byte(d.Key)...)
-		data = append(data, byte(d.Position>>56), byte(d.Position>>48),
-			byte(d.Position>>40), byte(d.Position>>32),
-			byte(d.Position>>24), byte(d.Position>>16),
-			byte(d.Position>>8), byte(d.Position))
-	}
-	return computeHash(data)
-}
-
 // partitionDecorations splits decorations at a given position.
 // When insertBefore=true: decorations at pos go to right (will be shifted)
 // When insertBefore=false: decorations at pos go to left (stay in place)
 // Right decorations have their positions adjusted by -pos.
-func partitionDecorations(decorations []Decoration, pos int64, insertBefore bool) (left, right []Decoration) {
+// partitionDecorations splits a leaf's decorations around an insert at
+// pos. Marks strictly before pos stay in the left piece; marks
+// strictly after go to the right piece (rebased). A mark EXACTLY at
+// pos is governed by insertBefore: true slides it past the inserted
+// content (right piece), false keeps it at its absolute address, which
+// is the FIRST BYTE OF THE INSERTED CONTENT - returned in boundary so
+// the caller homes it at offset 0 of the middle (inserted) leaf.
+// Storage invariant: a mark never lives at a leaf's end offset (only
+// an EOF mark on the final leaf may), so the left piece never receives
+// boundary marks.
+func partitionDecorations(decorations []Decoration, pos int64, insertBefore bool) (left, boundary, right []Decoration) {
 	for _, d := range decorations {
-		goesToLeft := d.Position < pos || (!insertBefore && d.Position == pos)
-		if goesToLeft {
+		switch {
+		case d.Position < pos:
 			left = append(left, d)
-		} else {
+		case d.Position == pos && !insertBefore:
+			boundary = append(boundary, Decoration{Key: d.Key, Position: 0})
+		default:
 			right = append(right, Decoration{
 				Key:      d.Key,
 				Position: d.Position - pos,

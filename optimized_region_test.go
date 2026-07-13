@@ -142,7 +142,11 @@ func TestCursorOptimizedRegionSerial(t *testing.T) {
 	}
 }
 
-func TestBeginOptimizedRegion(t *testing.T) {
+// TestBeginOptimizedRegionQuarantined: optimized regions are unfinished
+// scaffolding (edits never route through them, so a region's fixed
+// bounds go stale - a corruption hazard). The entry point is
+// quarantined until the feature is wired in or removed.
+func TestBeginOptimizedRegionQuarantined(t *testing.T) {
 	lib, _ := Init(LibraryOptions{})
 	g, err := lib.Open(FileOptions{DataString: "Hello World"})
 	if err != nil {
@@ -152,39 +156,14 @@ func TestBeginOptimizedRegion(t *testing.T) {
 
 	cursor := g.NewCursor()
 
-	// Explicitly begin a region
-	err = cursor.BeginOptimizedRegion(0, 5)
-	if err != nil {
-		t.Fatalf("BeginOptimizedRegion failed: %v", err)
+	if err := cursor.BeginOptimizedRegion(0, 5); err != ErrNotSupported {
+		t.Fatalf("BeginOptimizedRegion = %v, want ErrNotSupported (quarantined)", err)
 	}
-
-	if !cursor.HasOptimizedRegion() {
-		t.Error("HasOptimizedRegion() should be true after BeginOptimizedRegion")
+	if cursor.HasOptimizedRegion() {
+		t.Error("quarantined BeginOptimizedRegion must not create a region")
 	}
-
-	serial := cursor.OptimizedRegionSerial()
-	if serial == -1 {
-		t.Error("OptimizedRegionSerial() should not be -1 after BeginOptimizedRegion")
-	}
-
-	// Check bounds
-	start, end, ok := cursor.OptimizedRegionBounds()
-	if !ok {
-		t.Error("OptimizedRegionBounds() should return ok=true")
-	}
-	if start != 0 || end != 5 {
-		t.Errorf("OptimizedRegionBounds() = (%d, %d), want (0, 5)", start, end)
-	}
-
-	// Begin another region (should dissolve the first)
-	err = cursor.BeginOptimizedRegion(5, 11)
-	if err != nil {
-		t.Fatalf("Second BeginOptimizedRegion failed: %v", err)
-	}
-
-	newSerial := cursor.OptimizedRegionSerial()
-	if newSerial == serial {
-		t.Error("New region should have different serial")
+	if cursor.OptimizedRegionSerial() != -1 {
+		t.Error("quarantined BeginOptimizedRegion must not assign a serial")
 	}
 }
 
@@ -198,22 +177,10 @@ func TestCheckpoint(t *testing.T) {
 
 	cursor := g.NewCursor()
 
-	// Begin a region
-	err = cursor.BeginOptimizedRegion(0, 5)
-	if err != nil {
-		t.Fatalf("BeginOptimizedRegion failed: %v", err)
-	}
-
-	if !cursor.HasOptimizedRegion() {
-		t.Error("Should have region after BeginOptimizedRegion")
-	}
-
-	// Checkpoint should dissolve it
-	err = g.Checkpoint()
-	if err != nil {
+	// Checkpoint must succeed and leave no region either way.
+	if err := g.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
-
 	if cursor.HasOptimizedRegion() {
 		t.Error("Should not have region after Checkpoint")
 	}
@@ -340,7 +307,7 @@ func TestTransactionStartCheckpointsRegions(t *testing.T) {
 	cursor := g.NewCursor()
 
 	// Begin a region
-	err = cursor.BeginOptimizedRegion(0, 5)
+	err = g.beginOptimizedRegionForCursor(cursor, 0, 5)
 	if err != nil {
 		t.Fatalf("BeginOptimizedRegion failed: %v", err)
 	}
@@ -380,7 +347,7 @@ func TestTransactionCommitDissolvesRegions(t *testing.T) {
 	}
 
 	// Explicitly begin a region inside the transaction
-	err = cursor.BeginOptimizedRegion(0, 5)
+	err = g.beginOptimizedRegionForCursor(cursor, 0, 5)
 	if err != nil {
 		t.Fatalf("BeginOptimizedRegion failed: %v", err)
 	}
@@ -418,7 +385,7 @@ func TestTransactionRollbackDiscardsRegions(t *testing.T) {
 	}
 
 	// Begin a region
-	err = cursor.BeginOptimizedRegion(0, 5)
+	err = g.beginOptimizedRegionForCursor(cursor, 0, 5)
 	if err != nil {
 		t.Fatalf("BeginOptimizedRegion failed: %v", err)
 	}
@@ -451,12 +418,12 @@ func TestMultipleCursorsIndependentRegions(t *testing.T) {
 	}
 
 	// Begin regions on both cursors
-	err = cursor1.BeginOptimizedRegion(0, 5)
+	err = g.beginOptimizedRegionForCursor(cursor1, 0, 5)
 	if err != nil {
 		t.Fatalf("cursor1.BeginOptimizedRegion failed: %v", err)
 	}
 
-	err = cursor2.BeginOptimizedRegion(10, 15)
+	err = g.beginOptimizedRegionForCursor(cursor2, 10, 15)
 	if err != nil {
 		t.Fatalf("cursor2.BeginOptimizedRegion failed: %v", err)
 	}
@@ -504,7 +471,7 @@ func TestGraceWindowBounds(t *testing.T) {
 	cursor := g.NewCursor()
 
 	// Begin region at position 10-15
-	err = cursor.BeginOptimizedRegion(10, 15)
+	err = g.beginOptimizedRegionForCursor(cursor, 10, 15)
 	if err != nil {
 		t.Fatalf("BeginOptimizedRegion failed: %v", err)
 	}
@@ -540,7 +507,7 @@ func TestRegionContentPreservation(t *testing.T) {
 	cursor := g.NewCursor()
 
 	// Create region covering "Hello"
-	err = cursor.BeginOptimizedRegion(0, 5)
+	err = g.beginOptimizedRegionForCursor(cursor, 0, 5)
 	if err != nil {
 		t.Fatalf("BeginOptimizedRegion failed: %v", err)
 	}
@@ -583,7 +550,7 @@ func TestRegionBeginDissolvesExisting(t *testing.T) {
 	cursor := g.NewCursor()
 
 	// Begin first region
-	err = cursor.BeginOptimizedRegion(0, 5)
+	err = g.beginOptimizedRegionForCursor(cursor, 0, 5)
 	if err != nil {
 		t.Fatalf("First BeginOptimizedRegion failed: %v", err)
 	}
@@ -591,7 +558,7 @@ func TestRegionBeginDissolvesExisting(t *testing.T) {
 	firstSerial := cursor.OptimizedRegionSerial()
 
 	// Begin second region (should dissolve first)
-	err = cursor.BeginOptimizedRegion(10, 15)
+	err = g.beginOptimizedRegionForCursor(cursor, 10, 15)
 	if err != nil {
 		t.Fatalf("Second BeginOptimizedRegion failed: %v", err)
 	}
@@ -627,7 +594,7 @@ func TestProcessCursorNoAutoRegion(t *testing.T) {
 	}
 
 	// Can still explicitly create region
-	err = cursor.BeginOptimizedRegion(0, 5)
+	err = g.beginOptimizedRegionForCursor(cursor, 0, 5)
 	if err != nil {
 		t.Fatalf("BeginOptimizedRegion failed: %v", err)
 	}
