@@ -502,12 +502,20 @@ func TestSaveAs(t *testing.T) {
 }
 
 func TestSaveAsNilFS(t *testing.T) {
+	// A nil filesystem now RESOLVES to the library default (local disk)
+	// rather than being rejected - see TestSaveAsNilFilesystem for the
+	// end-to-end streaming behavior. Here we just confirm it no longer
+	// returns ErrNotSupported and actually writes the file.
+	dir := t.TempDir()
 	lib, _ := Init(LibraryOptions{})
 	g, _ := lib.Open(FileOptions{DataString: "Hello World"})
 
-	_, err := g.SaveAs(nil, "/tmp/test.txt")
-	if err != ErrNotSupported {
-		t.Errorf("SaveAs with nil fs returned %v, want ErrNotSupported", err)
+	dst := filepath.Join(dir, "out.txt")
+	if _, err := g.SaveAs(nil, dst); err != nil {
+		t.Fatalf("SaveAs(nil, %q) = %v, want nil (resolves to default fs)", dst, err)
+	}
+	if b, _ := os.ReadFile(dst); string(b) != "Hello World" {
+		t.Errorf("SaveAs(nil) wrote %q, want %q", b, "Hello World")
 	}
 }
 

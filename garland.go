@@ -179,6 +179,14 @@ func Init(options LibraryOptions) (*Library, error) {
 	return lib, nil
 }
 
+// DefaultFS returns the filesystem this library uses for local-disk
+// operations (the same one Garland resolves to when no explicit
+// filesystem is given). Useful for hosts that want to wrap or delegate
+// to it when composing a custom FileSystemInterface.
+func (lib *Library) DefaultFS() FileSystemInterface {
+	return lib.defaultFS
+}
+
 // ReadyThreshold specifies when a garland is considered "ready".
 type ReadyThreshold struct {
 	Lines int64 // number of complete lines (0 = ignore)
@@ -629,8 +637,8 @@ func (g *Garland) Save() (SaveReport, error) {
 // the warm backing store is never destroyed. The returned SaveReport
 // lists any lost blocks written as scars.
 func (g *Garland) SaveAs(fs FileSystemInterface, name string) (SaveReport, error) {
-	if fs == nil {
-		return SaveReport{}, ErrNotSupported
+	if name == "" {
+		return SaveReport{}, ErrNoDataSource
 	}
 
 	// Serialize against other saves (including an in-flight
@@ -641,6 +649,18 @@ func (g *Garland) SaveAs(fs FileSystemInterface, name string) (SaveReport, error
 	// Full lock: streaming may thaw chilled snapshots, which mutates them.
 	g.mu.Lock()
 	defer g.mu.Unlock()
+
+	// A nil filesystem resolves exactly like SaveWith: the buffer's own
+	// source filesystem, else the library default (local disk). This
+	// lets a host stream a save-as to a new path without reimplementing
+	// FileSystemInterface just to name the local disk. Resolved under
+	// the lock because g.sourceFS can change (RebaseOnFile).
+	if fs == nil {
+		fs = g.sourceFS
+		if fs == nil {
+			fs = g.lib.defaultFS
+		}
+	}
 
 	if g.sourcePath != "" && name == g.sourcePath &&
 		(fs == g.sourceFS || (g.sourceFS == nil && fs == g.lib.defaultFS)) {
