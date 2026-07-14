@@ -38,6 +38,16 @@ type Cursor struct {
 	// Cursor's own position history (sparse, only recorded when cursor moves after version change)
 	positionHistory map[ForkRevision]*CursorPosition
 
+	// tracksHistory controls whether this cursor's position is recorded
+	// per revision and restored on undo/redo/fork navigation. Default
+	// true. Set false for EPHEMERAL cursors - paint carets, maintenance
+	// scanners, transient search cursors - that only need live position
+	// adjustment as content shifts, not per-version bookkeeping. An
+	// untracked cursor still stays valid (clamped/recomputed) under
+	// edits; it simply never accumulates history and is never teleported
+	// to a historical position on a seek.
+	tracksHistory bool
+
 	// Ready state
 	ready     bool
 	readyMu   sync.Mutex
@@ -51,7 +61,7 @@ type Cursor struct {
 }
 
 // newCursor creates a new cursor at position 0.
-func newCursor(g *Garland) *Cursor {
+func newCursor(g *Garland, tracksHistory bool) *Cursor {
 	c := &Cursor{
 		garland:         g,
 		bytePos:         0,
@@ -61,21 +71,53 @@ func newCursor(g *Garland) *Cursor {
 		lastFork:        g.currentFork,
 		lastRevision:    g.currentRevision,
 		positionHistory: make(map[ForkRevision]*CursorPosition),
+		tracksHistory:   tracksHistory,
 		ready:           false,
 		mode:            CursorModeHuman,
 		region:          nil,
 	}
 	c.readyCond = sync.NewCond(&c.readyMu)
 
-	// Record initial position
-	c.positionHistory[ForkRevision{g.currentFork, g.currentRevision}] = &CursorPosition{
-		BytePos:  0,
-		RunePos:  0,
-		Line:     0,
-		LineRune: 0,
+	// Record initial position (tracked cursors only).
+	if tracksHistory {
+		c.positionHistory[ForkRevision{g.currentFork, g.currentRevision}] = &CursorPosition{
+			BytePos:  0,
+			RunePos:  0,
+			Line:     0,
+			LineRune: 0,
+		}
 	}
 
 	return c
+}
+
+// TracksHistory reports whether this cursor records per-revision
+// positions and is restored on undo/redo/fork navigation.
+func (c *Cursor) TracksHistory() bool {
+	if c.garland == nil {
+		return c.tracksHistory
+	}
+	c.garland.mu.RLock()
+	defer c.garland.mu.RUnlock()
+	return c.tracksHistory
+}
+
+// SetTracksHistory turns per-revision position tracking on or off for
+// this cursor. Turning it off drops any history already accumulated
+// (freeing it) and stops future recording - the cursor still adjusts
+// to edits but is no longer teleported to historical positions on a
+// seek. Turning it back on resumes recording from the current version.
+func (c *Cursor) SetTracksHistory(track bool) {
+	if c.garland == nil {
+		c.tracksHistory = track
+		return
+	}
+	c.garland.mu.Lock()
+	defer c.garland.mu.Unlock()
+	c.tracksHistory = track
+	if !track {
+		c.positionHistory = make(map[ForkRevision]*CursorPosition)
+	}
 }
 
 // BytePos returns the cursor's absolute byte position.
@@ -409,11 +451,13 @@ func (c *Cursor) updatePosition(bytePos, runePos, line, lineRune int64) {
 		inMutatedTx := c.garland.transaction != nil && c.garland.transaction.hasMutations
 
 		if !inMutatedTx && (c.lastFork != currentFork || c.lastRevision != currentRev) {
-			c.positionHistory[ForkRevision{currentFork, currentRev}] = &CursorPosition{
-				BytePos:  bytePos,
-				RunePos:  runePos,
-				Line:     line,
-				LineRune: lineRune,
+			if c.tracksHistory {
+				c.positionHistory[ForkRevision{currentFork, currentRev}] = &CursorPosition{
+					BytePos:  bytePos,
+					RunePos:  runePos,
+					Line:     line,
+					LineRune: lineRune,
+				}
 			}
 			c.lastFork = currentFork
 			c.lastRevision = currentRev
