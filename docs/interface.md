@@ -294,7 +294,16 @@ type RebaseRegion struct {
 
 ```go
 // NewCursor creates a new cursor at position 0.
-func (g *Garland) NewCursor() *Cursor
+func (g *Garland) NewCursor() *Cursor            // tracked through undo/redo
+func (g *Garland) NewEphemeralCursor() *Cursor  // no per-revision history
+
+// Cursor history: a tracked cursor records its position per revision and
+// is restored on undo/redo/fork navigation. An ephemeral cursor (paint
+// caret, maintenance scan, transient search) still adjusts to edits but
+// keeps no history and is never teleported to a historical position -
+// toggle with SetTracksHistory / query with TracksHistory.
+func (c *Cursor) SetTracksHistory(track bool)
+func (c *Cursor) TracksHistory() bool
 
 // RemoveCursor removes a cursor from the Garland.
 func (g *Garland) RemoveCursor(c *Cursor) error

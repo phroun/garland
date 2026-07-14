@@ -1503,12 +1503,26 @@ func (g *Garland) handleWarmStorageMismatch(nodeID NodeID) {
 	}
 }
 
-// NewCursor creates a new cursor at position 0.
+// NewCursor creates a new cursor at position 0. Its position is tracked
+// through undo/redo/fork navigation (see Cursor.SetTracksHistory).
 func (g *Garland) NewCursor() *Cursor {
+	return g.newRegisteredCursor(true)
+}
+
+// NewEphemeralCursor creates a cursor whose position is NOT recorded per
+// revision or restored on seeks - for paint carets, maintenance scans,
+// and transient work that only needs a live, edit-adjusted position.
+// Equivalent to NewCursor followed by SetTracksHistory(false), but
+// without ever allocating the initial history entry.
+func (g *Garland) NewEphemeralCursor() *Cursor {
+	return g.newRegisteredCursor(false)
+}
+
+func (g *Garland) newRegisteredCursor(tracksHistory bool) *Cursor {
 	// newCursor reads currentFork/currentRevision - inside the lock,
 	// or a concurrent mutation's recordMutation races the read.
 	g.mu.Lock()
-	c := newCursor(g)
+	c := newCursor(g, tracksHistory)
 	g.cursors = append(g.cursors, c)
 	g.mu.Unlock()
 
@@ -4775,6 +4789,9 @@ func (g *Garland) recordMutation() ChangeResult {
 func (g *Garland) recordCursorPositionsInHistory() {
 	key := ForkRevision{g.currentFork, g.currentRevision}
 	for _, cursor := range g.cursors {
+		if !cursor.tracksHistory {
+			continue // ephemeral cursors accrue no history
+		}
 		// Always update position - cursor may have moved since last record
 		// This captures the position just before the mutation occurs
 		cursor.resolveStaleLineRuneLocked() // history must store real columns

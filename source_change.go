@@ -3,7 +3,6 @@ package garland
 import (
 	"os"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -177,13 +176,12 @@ func (g *Garland) captureSourceInfo() error {
 	return nil
 }
 
-// getInode extracts the inode number from file info (Unix only).
-func getInode(info os.FileInfo) uint64 {
-	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-		return stat.Ino
-	}
-	return 0
-}
+// getInode extracts the inode number from file info. It is
+// platform-specific: unix-like systems read syscall.Stat_t (see
+// inode_unix.go); platforms without a stable inode concept (Windows,
+// wasm, plan9) return 0 (see inode_other.go), which disables
+// inode-based source-replacement detection - callers already guard on
+// a zero inode.
 
 // CheckSourceMetadata performs a cheap metadata check on the source file.
 // This only stats the file, it doesn't read any content.
