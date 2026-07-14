@@ -162,9 +162,23 @@ func (g *Garland) Save() (SaveReport, error)
 // SaveWith is Save with explicit options (e.g. PreserveHistory=false).
 func (g *Garland) SaveWith(opts SaveOptions) (SaveReport, error)
 
-// SaveAs writes to a new location. Warm storage remains untouched.
-// (Saving onto the original path routes through the in-place engine.)
+// SaveAs streams the document to a new location (leaf-by-leaf, no
+// full-buffer materialization). Warm storage remains untouched.
+// Saving onto the original path routes through the in-place engine.
+// A nil fs resolves like Save/SaveWith - the buffer's source
+// filesystem, else the library default (local disk) - so a host can
+// stream a save-as without hand-rolling a FileSystemInterface.
 func (g *Garland) SaveAs(fs FileSystemInterface, name string) (SaveReport, error)
+
+// NewLocalFileSystem returns a FileSystemInterface backed by the real
+// OS filesystem (the default Garland uses). For hosts that want to
+// pass an explicit fs to SaveAs, or wrap/delegate to local disk when
+// building a custom FileSystemInterface.
+func NewLocalFileSystem() FileSystemInterface
+
+// DefaultFS returns the filesystem this library uses for local-disk
+// operations.
+func (lib *Library) DefaultFS() FileSystemInterface
 
 // SaveOptions configures Save behavior.
 type SaveOptions struct {

@@ -64,6 +64,17 @@ type localFileHandle struct {
 // localFileSystem implements FileSystemInterface for local files.
 type localFileSystem struct{}
 
+// NewLocalFileSystem returns a FileSystemInterface backed by the real
+// operating-system filesystem - the same implementation Garland uses
+// by default. Hosts that want to pass an explicit filesystem to
+// SaveAs, or wrap/partially delegate to local disk when building a
+// custom FileSystemInterface, can obtain one here instead of
+// reimplementing the whole interface. (SaveAs also accepts a nil
+// filesystem, which resolves to this automatically.)
+func NewLocalFileSystem() FileSystemInterface {
+	return &localFileSystem{}
+}
+
 func (fs *localFileSystem) Open(name string, mode OpenMode) (FileHandle, error) {
 	var flag int
 	switch mode {
