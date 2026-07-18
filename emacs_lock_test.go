@@ -213,6 +213,67 @@ func TestEmacsLockForeign(t *testing.T) {
 	}
 }
 
+// TestEmacsLockCustomOwner: FileOptions.LockOwner controls the
+// identity stamped into the lock file - the string a foreign editor
+// (or another garland) sees in its "being edited by" prompt.
+func TestEmacsLockCustomOwner(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "doc.txt")
+	if err := os.WriteFile(path, []byte("branded\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	lib, err := Init(LibraryOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const mew = "mew@workstation.7"
+	g, err := lib.Open(FileOptions{
+		FilePath:      path,
+		UseEmacsLocks: true,
+		LockOwner:     "  " + mew + "\n", // surrounding whitespace is trimmed
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Close()
+
+	c := g.NewCursor()
+	if _, err := c.InsertString("x", nil, false); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(emacsLockPath(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != mew {
+		t.Fatalf("lock content = %q, want %q", data, mew)
+	}
+
+	// A second garland on the same file must report the custom
+	// identity as the foreign owner, and recognize it is NOT its own.
+	g2, err := lib.Open(FileOptions{FilePath: path, UseEmacsLocks: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g2.Close()
+	owner, foreign := g2.SourceLockOwner()
+	if !foreign || owner != mew {
+		t.Fatalf("second garland sees owner %q foreign=%v, want %q", owner, foreign, mew)
+	}
+
+	// Our own lock (custom identity) is still recognized as ours on a
+	// re-probe: consistency checks must not demote it to foreign.
+	if _, err := g.SourceConsistency(); err != nil {
+		t.Fatal(err)
+	}
+	if !g.HoldsSourceLock() {
+		t.Fatal("custom-owner lock no longer recognized as our own")
+	}
+	if _, foreign := g.SourceLockOwner(); foreign {
+		t.Fatal("our own custom-owner lock reported as foreign")
+	}
+}
+
 // TestEmacsLockDisabledByDefault: without opting in, no lock file
 // appears and the lock APIs answer inert values.
 func TestEmacsLockDisabledByDefault(t *testing.T) {

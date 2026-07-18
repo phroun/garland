@@ -10,7 +10,10 @@ touchpoints. Full signatures: `interface.md`.
 - Pass a custom `FileSystem` in `FileOptions` if the file is
   virtualized. A custom FS must implement `Stat` and `DeviceInfo`
   (or return `ErrNotSupported` and volunteer metadata, see §2).
-- `UseEmacsLocks: true` if you want emacs-interoperable locking (§6).
+- `UseEmacsLocks: true` if you want emacs-interoperable locking (§6);
+  set `LockOwner` to stamp your app's own identity into the lock file
+  (the string other editors show in "being edited by" prompts;
+  default is environment-derived `user@host.pid`).
 - `g.SetBackupLocation(nil, backupDir, BackupOptions{})` right after
   open (§7). Nothing else to do for backups - they are automatic.
 
@@ -82,7 +85,16 @@ file open, in every loading style.
   saving leaves nothing behind. `g.BackupInfo()` for a status line;
   `BackupFailed` never blocks saves - decide whether to warn.
 
-## 8. Memory pressure (app-side hot-write mode)
+## 8. Undo coalescing (typing = one undo step)
+
+- `g.SetUndoCoalescing(true, autoBakeTime)` once at open (e.g. 1-2s
+  auto-bake). Adjacent typing runs and delete runs then collapse into
+  single revisions automatically.
+- Call `g.Bake()` wherever your UI wants a guaranteed undo boundary
+  (command executed, focus lost, mode switch). Seeks, saves, and
+  transactions already bake on their own.
+
+## 9. Memory pressure (app-side hot-write mode)
 
 - `g.MemoryPressure()`: when `SaveableBytes` dominates and
   `ResidentBytes` nears the hard limit, prompt/trigger a save -

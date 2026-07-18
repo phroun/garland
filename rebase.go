@@ -431,6 +431,8 @@ func (g *Garland) rebaseSourceBookkeeping(fs FileSystemInterface, path string,
 	}
 	g.sourceState.status = SourceStatusNormal
 	_ = g.captureSourceInfo()
+	// A fresh starting point is a hard edge for undo coalescing too.
+	g.coalesce.active = false
 	// Warm trust restarts clean: every warm block in the new view was
 	// just verified (anchored by hash) against this very file.
 	g.warmVerification = make(map[NodeID]*warmVerificationState)
