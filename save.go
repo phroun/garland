@@ -140,6 +140,12 @@ func (g *Garland) SaveWith(opts SaveOptions) (SaveReport, error) {
 	g.saveMu.Lock()
 	defer g.saveMu.Unlock()
 
+	// The pre-session backup must be in place before the rewrite
+	// touches the file. A finished (or unarmed, or failed) backup is a
+	// no-op here; a copy the background worker has not gotten to yet
+	// runs inline now.
+	g.ensureBackupBeforeSave()
+
 	fs := g.sourceFS
 	if fs == nil {
 		fs = g.lib.defaultFS
@@ -383,10 +389,12 @@ func (g *Garland) saveInPlace(fs FileSystemInterface, opts SaveOptions) (SaveRep
 		_ = g.captureSourceInfo()
 	}
 
-	// Anchor this save in history (revert/recovery) and release the
-	// emacs lock: buffer and file agree again.
+	// Anchor this save in history (revert/recovery), release the emacs
+	// lock (buffer and file agree again), and commit the backup: the
+	// file it protects has now been overwritten, so it is needed.
 	g.recordSavePointLocked(fs, g.sourcePath, true)
 	g.emacsLockSavedLocked()
+	g.commitBackupLocked()
 
 	report.Integrity = g.drainIntegrityEvents()
 	return report, nil

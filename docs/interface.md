@@ -478,6 +478,50 @@ func (lib *Library) DeviceInfoFor(fs FileSystemInterface, name string) (DeviceIn
 func (g *Garland) SourceDeviceInfo() (DeviceInfo, error)
 ```
 
+### Pre-session backups
+
+The app names a backup location per garland; on the FIRST mutation a
+background thread streams the source file's pre-session content there,
+so the backup is already in place before Save is pressed. A save that
+races ahead of the background copy performs it inline first - the
+backup ALWAYS holds pre-overwrite content. Only an in-place save of
+the protected file commits the backup (keeps it past Close); merely
+viewing never creates one, and an uncommitted backup is removed at
+Close, so browsing files does not accumulate backup storage.
+
+```go
+// Nil fs = library default. Empty dir disables (removing an
+// uncommitted backup). Configuring on an already-dirty buffer
+// captures immediately. One capture per configuration.
+func (g *Garland) SetBackupLocation(fs FileSystemInterface, dir string, opts BackupOptions) error
+
+type BackupOptions struct {
+    Name string // backup filename; default "<source basename>~"
+}
+
+// Cheap status query (safe on a paint path).
+func (g *Garland) BackupInfo() BackupInfo
+
+type BackupInfo struct {
+    State   BackupState
+    Path    string // destination backup file
+    Subject string // the source file it captures
+    Bytes   int64
+    Err     string // when State == BackupFailed
+}
+
+type BackupState int
+
+const (
+    BackupDisabled  BackupState = iota
+    BackupArmed     // configured; no modification yet
+    BackupPending   // copy armed by a mutation, not finished
+    BackupReady     // in place at the destination
+    BackupCommitted // a save overwrote the subject; kept past Close
+    BackupFailed    // copy failed; saves proceed regardless
+)
+```
+
 ---
 
 ## Cursors

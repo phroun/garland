@@ -364,6 +364,8 @@ func (g *Garland) saveConcurrent(fs FileSystemInterface, opts SaveOptions) (Save
 	if g.currentFork == planFork && g.currentRevision == planRev {
 		g.emacsLockSavedLocked()
 	}
+	// The rewrite overwrote the file the backup protects - commit it.
+	g.commitBackupLocked()
 	report.Integrity = g.drainIntegrityEvents()
 	g.saveInFlight = false
 	g.saveCond.Broadcast()

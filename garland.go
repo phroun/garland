@@ -432,6 +432,12 @@ type Garland struct {
 	// (FileOptions.UseEmacsLocks).
 	emacsLock *emacsLockState
 
+	// backup, when non-nil, streams a pre-session copy of the source
+	// file to an app-chosen location on the first mutation, so the
+	// backup is in place before any save overwrites the file
+	// (SetBackupLocation; see backup.go).
+	backup *backupState
+
 	// integrityLog accumulates block-level integrity events (slides,
 	// swaps, adoptions, losses) from the moment each is discovered
 	// until they are reported: peeked via IntegrityEvents, drained
@@ -623,12 +629,19 @@ func (lib *Library) Open(options FileOptions) (*Garland, error) {
 
 // Close releases resources associated with the Garland.
 func (g *Garland) Close() error {
-	// Let any in-flight concurrent save finish before tearing down.
+	// Let any in-flight save or backup stream finish before tearing
+	// down (both hold saveMu for their duration), then clean up the
+	// session artifacts: a held emacs lock does not survive the buffer
+	// it protects, and an uncommitted backup (its subject was never
+	// overwritten) is removed so viewing files never accumulates
+	// backup storage.
+	g.saveMu.Lock()
 	g.mu.Lock()
 	g.awaitNoSaveLocked()
-	// A held emacs lock does not survive the buffer it protects.
 	g.releaseEmacsLockLocked()
+	g.cleanupBackupLocked()
 	g.mu.Unlock()
+	g.saveMu.Unlock()
 
 	// Stop source file watching
 	g.DisableSourceWatch()
@@ -705,6 +718,11 @@ func (g *Garland) SaveAsWith(fs FileSystemInterface, name string, opts SaveAsOpt
 	// concurrent save's unlocked rewrite phase).
 	g.saveMu.Lock()
 	defer g.saveMu.Unlock()
+
+	// A same-path SaveAs routes through the in-place engine below and
+	// overwrites the source - the pre-session backup must be in place
+	// first (no-op when unarmed, finished, or failed).
+	g.ensureBackupBeforeSave()
 
 	// Full lock: streaming may thaw chilled snapshots, which mutates them.
 	g.mu.Lock()
@@ -4833,8 +4851,10 @@ func (g *Garland) setCursorFromLine(c *Cursor, line, runeInLine int64) error {
 // If not at HEAD revision, creates a new fork first.
 func (g *Garland) recordMutation() ChangeResult {
 	// The buffer is diverging from its source: make sure the emacs
-	// lock (when enabled) is held. Nil-check plus two bools when idle.
+	// lock (when enabled) is held and the pre-session backup (when
+	// configured) is armed. Nil-checks plus a few bools when idle.
 	g.emacsLockMutatedLocked()
+	g.backupMutatedLocked()
 
 	if g.transaction != nil {
 		// In transaction - check if we need to fork
