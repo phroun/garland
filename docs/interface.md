@@ -84,6 +84,40 @@ type FileSystemInterface interface {
     BlockChecksum(handle FileHandle, start, length int64) ([]byte, error)
     WriteBytes(handle FileHandle, data []byte) error
     Truncate(handle FileHandle, size int64) error
+
+    // Convenience / directory operations
+    WriteFile(name string, data []byte) error
+    ReadFile(name string) ([]byte, error)
+    MkdirAll(path string) error
+    Remove(name string) error
+    Rmdir(path string) error
+    Rename(oldpath, newpath string) error // atomic replace (cold storage relies on it)
+
+    // Metadata hooks (may return ErrNotSupported). Stat reports a
+    // missing file as FileMetadata{Exists:false} with a NIL error;
+    // errors are for real failures. A VFS without metadata support
+    // still works - Garland then tracks whatever the app volunteers
+    // via ReportSourceMetadata.
+    Stat(name string) (FileMetadata, error)
+    DeviceInfo(name string) (DeviceInfo, error)
+}
+
+// FileMetadata is what Garland tracks per source file to detect
+// external modification (captured at EVERY file open - memory, warm,
+// or cold mode - and re-baselined at each save/adoption).
+type FileMetadata struct {
+    Exists   bool
+    Size     int64
+    ModTime  time.Time
+    Identity string // storage-object identity ("dev:ino" locally); "" = unknown
+}
+
+// DeviceInfo describes the device/volume behind a path, for free-space
+// warnings and same-device recognition (removable media vs. working drive).
+type DeviceInfo struct {
+    DeviceID   string // "" = unknown
+    FreeBytes  int64  // -1 = unknown
+    TotalBytes int64  // -1 = unknown
 }
 
 type OpenMode int
@@ -135,6 +169,11 @@ type FileOptions struct {
     ReadAheadBytes int64
     ReadAheadRunes int64
     ReadAheadAll   bool // read entire file as soon as performant
+
+    // UseEmacsLocks (opt-in, file sources only): maintain an
+    // emacs-compatible ".#<name>" lock file while the buffer holds
+    // unsaved modifications. See "Source Metadata & Consistency".
+    UseEmacsLocks bool
 }
 
 type LoadingStyle int
@@ -168,7 +207,22 @@ func (g *Garland) SaveWith(opts SaveOptions) (SaveReport, error)
 // A nil fs resolves like Save/SaveWith - the buffer's source
 // filesystem, else the library default (local disk) - so a host can
 // stream a save-as without hand-rolling a FileSystemInterface.
+// Equivalent to SaveAsWith(fs, name, SaveAsOptions{}).
 func (g *Garland) SaveAs(fs FileSystemInterface, name string) (SaveReport, error)
+
+// SaveAsWith adds control over whether the destination becomes the
+// buffer's new source. AdoptAsSource=true: warm references re-home
+// onto the new file, change detection re-baselines against it, future
+// Save calls write there ("the file lives here now"). false: export /
+// removable-media case - the buffer keeps working from its original
+// source. PreserveHistory (adoption only) migrates old-source-backed
+// undo history off the abandoned source first.
+func (g *Garland) SaveAsWith(fs FileSystemInterface, name string, opts SaveAsOptions) (SaveReport, error)
+
+type SaveAsOptions struct {
+    AdoptAsSource   bool
+    PreserveHistory bool
+}
 
 // NewLocalFileSystem returns a FileSystemInterface backed by the real
 // OS filesystem (the default Garland uses). For hosts that want to
@@ -304,6 +358,172 @@ type RebaseRegion struct {
 
 ---
 
+## Source Metadata & Consistency
+
+Every file open captures the source's metadata (size, mtime, identity)
+through the filesystem hook, whatever the loading style. The app can
+ask at any time whether another program touched the file - before a
+save, on window focus, on a timer - and drive its UI from the answer
+(save silently / prompt to overwrite / fork to a copy / merge /
+abandon and reload).
+
+```go
+// Pull style: stat through the hook (VFS-aware), classify, report.
+// With a metadata-less hook it answers from the last volunteered
+// observation. Re-probes the emacs lock file when locks are enabled.
+func (g *Garland) SourceConsistency() (SourceConsistencyReport, error)
+
+// No I/O: answer from tracked state only (safe on a paint path).
+func (g *Garland) SourceConsistencyCached() SourceConsistencyReport
+
+// Push style: the app volunteers fresh facts (its own watcher, a sync
+// client, a VFS event). Recorded exactly as a stat result would be.
+// With no baseline yet, the first observation BECOMES the baseline.
+func (g *Garland) ReportSourceMetadata(meta FileMetadata) SourceConsistencyState
+
+type SourceConsistencyState int
+
+const (
+    ConsistencyUntracked SourceConsistencyState = iota // no baseline available
+    ConsistencyClean
+    ConsistencyAppended  // grew; existing content may be intact
+    ConsistencyModified  // same size, mtime changed
+    ConsistencyTruncated
+    ConsistencyReplaced  // path re-bound to a different storage object
+    ConsistencyMissing
+)
+
+type SourceConsistencyReport struct {
+    State      SourceConsistencyState
+    Baseline   FileMetadata // as of last agreement (open/save/adoption)
+    Observed   FileMetadata // most recent observation
+    ObservedAt time.Time
+    LockedBy   string // foreign emacs-lock owner, "" when none known
+}
+```
+
+### Save history & revert
+
+Every successful save records a SavePoint: path, metadata as written,
+and the fork/revision the save captured. This anchors "revert to last
+saved version" as a pure history seek, and source recovery below.
+
+```go
+func (g *Garland) SaveHistory() []SavePoint       // oldest first, bounded (8)
+func (g *Garland) LastSave() (SavePoint, bool)
+func (g *Garland) RevertToLastSave() error        // ForkSeek+UndoSeek to the save point;
+                                                  // abandoned edits stay reachable as redo
+                                                  // (prune from the save point to discard)
+
+type SavePoint struct {
+    Fork            ForkID
+    Revision        RevisionID
+    Path            string
+    Meta            FileMetadata // observed right after the save
+    SavedAt         time.Time
+    AdoptedAsSource bool
+}
+```
+
+### Source switching & recovery
+
+```go
+// AdoptWarmSource switches the warm-storage backing to another file
+// believed to hold exactly the current content - with the cheapest
+// sufficient check. Current leaves re-home onto the new file; history
+// backed by the old source migrates off it (unreadable blocks are
+// marked lost with a reason - the old source may be corrupt, which is
+// WHY it is being abandoned); change detection re-baselines.
+func (g *Garland) AdoptWarmSource(fs FileSystemInterface, name string, level VerifyLevel) error
+
+type VerifyLevel int
+
+const (
+    VerifyMetadata VerifyLevel = iota // swift: a SavePoint at the current
+                                      // fork/revision for that path, with
+                                      // matching file metadata
+    VerifySample                      // + hash-check a bounded sample of spans
+    VerifyFull                        // + hash-check every span
+)
+
+// TryRecoverSource walks save history newest-first and adopts the
+// first alternate location that verifies - automatic recovery when
+// the current source becomes corrupt or unreachable.
+func (g *Garland) TryRecoverSource(level VerifyLevel) (SavePoint, error) // ErrNoRecoverySource
+```
+
+### Emacs-compatible file locks (opt-in)
+
+With `FileOptions.UseEmacsLocks`, Garland maintains an emacs-style
+`.#<name>` lock file next to the source for exactly as long as the
+buffer holds unsaved modifications: acquired on the first mutation
+past a clean point, released on save / revert-to-saved / undo onto
+the saved revision / Close. The lock is a regular file containing
+"user@host.pid", written through the filesystem hook (VFS-portable;
+emacs reads this form as well as its symlink form). A foreign lock is
+NEVER clobbered - it is recorded and reported; the app decides.
+
+```go
+func (g *Garland) HoldsSourceLock() bool
+func (g *Garland) SourceLockOwner() (owner string, foreign bool) // last observed
+func (g *Garland) BreakSourceLock() error // steal deliberately; re-acquires if dirty
+```
+
+### Device information
+
+```go
+// Free space / device identity for a path - warn before a save that
+// may not fit, or recognize removable media. Nil fs = library default.
+func (lib *Library) DeviceInfoFor(fs FileSystemInterface, name string) (DeviceInfo, error)
+func (g *Garland) SourceDeviceInfo() (DeviceInfo, error)
+```
+
+### Pre-session backups
+
+The app names a backup location per garland; on the FIRST mutation a
+background thread streams the source file's pre-session content there,
+so the backup is already in place before Save is pressed. A save that
+races ahead of the background copy performs it inline first - the
+backup ALWAYS holds pre-overwrite content. Only an in-place save of
+the protected file commits the backup (keeps it past Close); merely
+viewing never creates one, and an uncommitted backup is removed at
+Close, so browsing files does not accumulate backup storage.
+
+```go
+// Nil fs = library default. Empty dir disables (removing an
+// uncommitted backup). Configuring on an already-dirty buffer
+// captures immediately. One capture per configuration.
+func (g *Garland) SetBackupLocation(fs FileSystemInterface, dir string, opts BackupOptions) error
+
+type BackupOptions struct {
+    Name string // backup filename; default "<source basename>~"
+}
+
+// Cheap status query (safe on a paint path).
+func (g *Garland) BackupInfo() BackupInfo
+
+type BackupInfo struct {
+    State   BackupState
+    Path    string // destination backup file
+    Subject string // the source file it captures
+    Bytes   int64
+    Err     string // when State == BackupFailed
+}
+
+type BackupState int
+
+const (
+    BackupDisabled  BackupState = iota
+    BackupArmed     // configured; no modification yet
+    BackupPending   // copy armed by a mutation, not finished
+    BackupReady     // in place at the destination
+    BackupCommitted // a save overwrote the subject; kept past Close
+    BackupFailed    // copy failed; saves proceed regardless
+)
+```
+
+---
+
 ## Cursors
 
 ```go
@@ -337,6 +557,10 @@ func (c *Cursor) SeekRune(pos int64) error
 
 // SeekLine moves cursor to a line and rune-within-line position.
 // Line and rune are both 0-indexed. Newline is the last character of its line.
+// A runeInLine past the line's rune count migrates forward into the
+// following line(s), bounded at end-of-buffer (the final line past a
+// trailing newline is reachable). LinePos() afterward reports the
+// ACTUAL resolved line:rune, always consistent with BytePos().
 func (c *Cursor) SeekLine(line, runeInLine int64) error
 
 // SeekByWord moves by n words (negative = backward) using

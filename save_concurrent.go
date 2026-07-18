@@ -282,6 +282,10 @@ func (g *Garland) saveConcurrent(fs FileSystemInterface, opts SaveOptions) (Save
 	if g.saveCond == nil {
 		g.saveCond = sync.NewCond(&g.mu)
 	}
+	// The buffer state this plan captures. The save point must anchor
+	// THESE coordinates - edits during the unlocked rewrite advance the
+	// live head past what gets written.
+	planFork, planRev := g.currentFork, g.currentRevision
 	g.saveInFlight = true
 	g.mu.Unlock()
 
@@ -351,6 +355,17 @@ func (g *Garland) saveConcurrent(fs FileSystemInterface, opts SaveOptions) (Save
 		g.sourceState.status = SourceStatusNormal
 		_ = g.captureSourceInfo()
 	}
+	// Anchor this save in history (revert/recovery) and release the
+	// emacs lock: buffer and file agree again. NOTE: edits made DURING
+	// the unlocked rewrite already advanced fork/revision past the
+	// state that was written; the save point records the coordinates
+	// the plan pinned, not the live head.
+	g.recordSavePointAtLocked(fs, g.sourcePath, true, planFork, planRev)
+	if g.currentFork == planFork && g.currentRevision == planRev {
+		g.emacsLockSavedLocked()
+	}
+	// The rewrite overwrote the file the backup protects - commit it.
+	g.commitBackupLocked()
 	report.Integrity = g.drainIntegrityEvents()
 	g.saveInFlight = false
 	g.saveCond.Broadcast()

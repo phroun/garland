@@ -116,10 +116,22 @@ type SourceChangeHandler func(g *Garland, status SourceChangeStatus, info Source
 
 // sourceState tracks the state of the source file for change detection.
 type sourceState struct {
-	// Original file metadata captured at open time
-	originalMtime time.Time
-	originalSize  int64
-	originalInode uint64
+	// Baseline file metadata: what the file looked like the last time
+	// buffer and file were known to agree (open, save, source adoption).
+	originalMtime    time.Time
+	originalSize     int64
+	originalIdentity string
+
+	// metaTracked reports whether a baseline was ever captured. False
+	// when there is no source path, or the filesystem hook does not
+	// support Stat and the application never volunteered metadata.
+	metaTracked bool
+
+	// Most recent observation of the file (from a stat through the
+	// filesystem hook or volunteered via ReportSourceMetadata).
+	observedMeta  FileMetadata
+	observedAt    time.Time
+	observedValid bool
 
 	// Change tracking
 	changeCounter  uint64    // Incremented on any detected metadata change
@@ -158,30 +170,138 @@ func (g *Garland) initSourceState() {
 	g.warmVerification = make(map[NodeID]*warmVerificationState)
 }
 
-// captureSourceInfo captures the current file metadata for change detection.
+// statSourceLocked observes the source file's current metadata through
+// the configured filesystem hook - VFS-aware, never os.Stat directly.
+// Returns ErrNotSupported when the hook has no metadata support; the
+// application can still volunteer metadata via ReportSourceMetadata.
+// Caller must hold at least the read lock.
+func (g *Garland) statSourceLocked() (FileMetadata, error) {
+	if g.sourcePath == "" {
+		return FileMetadata{}, ErrNoDataSource
+	}
+	fs := g.sourceFS
+	if fs == nil && g.lib != nil {
+		fs = g.lib.defaultFS
+	}
+	if fs == nil {
+		return FileMetadata{}, ErrNotSupported
+	}
+	return fs.Stat(g.sourcePath)
+}
+
+// captureSourceInfo (re-)baselines change detection at the file's
+// current metadata: buffer and file are known to agree right now
+// (open, save, source adoption, user-acknowledged reload).
 func (g *Garland) captureSourceInfo() error {
 	if g.sourcePath == "" {
 		return nil
 	}
 
-	info, err := os.Stat(g.sourcePath)
+	meta, err := g.statSourceLocked()
+	if err == ErrNotSupported {
+		// No metadata from this filesystem: tracking stays off until
+		// the application volunteers a baseline (ReportSourceMetadata).
+		return nil
+	}
 	if err != nil {
 		return err
 	}
+	if !meta.Exists {
+		return os.ErrNotExist
+	}
 
-	g.sourceState.originalMtime = info.ModTime()
-	g.sourceState.originalSize = info.Size()
-	g.sourceState.originalInode = getInode(info)
-
+	g.setSourceBaselineLocked(meta)
 	return nil
 }
 
-// getInode extracts the inode number from file info. It is
-// platform-specific: unix-like systems read syscall.Stat_t (see
-// inode_unix.go); platforms without a stable inode concept (Windows,
-// wasm, plan9) return 0 (see inode_other.go), which disables
-// inode-based source-replacement detection - callers already guard on
-// a zero inode.
+// setSourceBaselineLocked installs meta as the agreement baseline and
+// the freshest observation.
+func (g *Garland) setSourceBaselineLocked(meta FileMetadata) {
+	st := g.sourceState
+	st.originalMtime = meta.ModTime
+	st.originalSize = meta.Size
+	st.originalIdentity = meta.Identity
+	st.metaTracked = true
+	st.observedMeta = meta
+	st.observedAt = time.Now()
+	st.observedValid = true
+}
+
+// classifySourceMeta compares an observation against the baseline
+// WITHOUT mutating any state. Pure classification, shared by the
+// stat-driven and volunteered paths.
+func (g *Garland) classifySourceMeta(meta FileMetadata) SourceChangeInfo {
+	st := g.sourceState
+	result := SourceChangeInfo{
+		Type:         SourceUnchanged,
+		PreviousSize: st.originalSize,
+		CurrentSize:  meta.Size,
+	}
+
+	if !meta.Exists {
+		result.Type = SourceDeleted
+		result.CurrentSize = 0
+		return result
+	}
+
+	// File replacement: the path is bound to a different object.
+	if st.originalIdentity != "" && meta.Identity != "" &&
+		st.originalIdentity != meta.Identity {
+		result.Type = SourceReplaced
+		return result
+	}
+
+	if meta.Size < st.originalSize {
+		result.Type = SourceTruncated
+		return result
+	}
+
+	if meta.Size > st.originalSize {
+		result.Type = SourceAppended
+		result.AppendedBytes = meta.Size - st.originalSize
+		return result
+	}
+
+	if !meta.ModTime.Equal(st.originalMtime) {
+		result.Type = SourceModified
+		return result
+	}
+
+	return result
+}
+
+// absorbSourceObservationLocked records an observation (stat result or
+// volunteered metadata), classifies it against the baseline, and
+// updates the change counter / status accordingly. If no baseline was
+// ever captured (metadata-less VFS), the first observation BECOMES the
+// baseline. Caller must hold the write lock.
+func (g *Garland) absorbSourceObservationLocked(meta FileMetadata) SourceChangeInfo {
+	st := g.sourceState
+
+	if !st.metaTracked {
+		if meta.Exists {
+			g.setSourceBaselineLocked(meta)
+		}
+		return SourceChangeInfo{Type: SourceUnchanged,
+			PreviousSize: meta.Size, CurrentSize: meta.Size}
+	}
+
+	st.observedMeta = meta
+	st.observedAt = time.Now()
+	st.observedValid = true
+
+	info := g.classifySourceMeta(meta)
+	switch info.Type {
+	case SourceUnchanged:
+		// nothing to record
+	case SourceAppended, SourceModified:
+		g.incrementChangeCounter()
+		st.status = SourceStatusSuspectChange
+	default: // Replaced, Truncated, Deleted
+		g.incrementChangeCounter()
+	}
+	return info
+}
 
 // CheckSourceMetadata performs a cheap metadata check on the source file.
 // This only stats the file, it doesn't read any content.
@@ -201,62 +321,20 @@ func (g *Garland) checkSourceMetadataUnlocked() (SourceChangeInfo, error) {
 		return SourceChangeInfo{Type: SourceUnchanged}, nil
 	}
 
-	info, err := os.Stat(g.sourcePath)
-	if os.IsNotExist(err) {
-		g.incrementChangeCounter()
-		return SourceChangeInfo{
-			Type:         SourceDeleted,
-			PreviousSize: g.sourceState.originalSize,
-			CurrentSize:  0,
-		}, nil
+	meta, err := g.statSourceLocked()
+	if err == ErrNotSupported {
+		// Metadata-less filesystem: report from the last volunteered
+		// observation, if any.
+		if g.sourceState.metaTracked && g.sourceState.observedValid {
+			return g.classifySourceMeta(g.sourceState.observedMeta), nil
+		}
+		return SourceChangeInfo{Type: SourceUnchanged}, ErrNotSupported
 	}
 	if err != nil {
 		return SourceChangeInfo{}, err
 	}
 
-	currentSize := info.Size()
-	currentMtime := info.ModTime()
-	currentInode := getInode(info)
-
-	result := SourceChangeInfo{
-		Type:         SourceUnchanged,
-		PreviousSize: g.sourceState.originalSize,
-		CurrentSize:  currentSize,
-	}
-
-	// Check for file replacement (inode changed)
-	if g.sourceState.originalInode != 0 && currentInode != 0 &&
-		g.sourceState.originalInode != currentInode {
-		g.incrementChangeCounter()
-		result.Type = SourceReplaced
-		return result, nil
-	}
-
-	// Check for truncation
-	if currentSize < g.sourceState.originalSize {
-		g.incrementChangeCounter()
-		result.Type = SourceTruncated
-		return result, nil
-	}
-
-	// Check for growth (potential append)
-	if currentSize > g.sourceState.originalSize {
-		g.incrementChangeCounter()
-		result.Type = SourceAppended
-		result.AppendedBytes = currentSize - g.sourceState.originalSize
-		g.sourceState.status = SourceStatusSuspectChange
-		return result, nil
-	}
-
-	// Check for modification (same size but mtime changed)
-	if !currentMtime.Equal(g.sourceState.originalMtime) {
-		g.incrementChangeCounter()
-		result.Type = SourceModified
-		g.sourceState.status = SourceStatusSuspectChange
-		return result, nil
-	}
-
-	return result, nil
+	return g.absorbSourceObservationLocked(meta), nil
 }
 
 // incrementChangeCounter bumps the change counter and records the time.
@@ -429,60 +507,67 @@ func (g *Garland) verifyWarmBlock(nodeID NodeID, snap *NodeSnapshot) error {
 // LoadAppendedContent loads newly appended content from the source file.
 // Only valid after VerifyBoundaryForAppend succeeds.
 func (g *Garland) LoadAppendedContent() (int64, error) {
+	// Phase 1 (locked): observe the file and read the appended tail.
+	// The lock is NOT held across the cursor operations below - cursor
+	// APIs take the lock themselves (holding it here would deadlock).
 	g.mu.Lock()
-	defer g.mu.Unlock()
-
 	if g.sourceState == nil || g.sourcePath == "" {
+		g.mu.Unlock()
 		return 0, nil
 	}
 
-	// Get current file size
-	info, err := os.Stat(g.sourcePath)
+	meta, err := g.statSourceLocked()
 	if err != nil {
+		g.mu.Unlock()
 		return 0, err
 	}
+	if !meta.Exists {
+		g.mu.Unlock()
+		return 0, os.ErrNotExist
+	}
 
-	appendedBytes := info.Size() - g.sourceState.originalSize
+	appendedBytes := meta.Size - g.sourceState.originalSize
 	if appendedBytes <= 0 {
+		g.mu.Unlock()
 		return 0, nil
 	}
 
-	// Read the appended content
 	if g.sourceHandle == nil || g.sourceFS == nil {
+		g.mu.Unlock()
 		return 0, ErrWarmStorageMismatch
 	}
 
-	err = g.sourceFS.SeekByte(g.sourceHandle, g.sourceState.originalSize)
-	if err != nil {
+	if err := g.sourceFS.SeekByte(g.sourceHandle, g.sourceState.originalSize); err != nil {
+		g.mu.Unlock()
 		return 0, err
 	}
-
 	data, err := g.sourceFS.ReadBytes(g.sourceHandle, int(appendedBytes))
 	if err != nil {
+		g.mu.Unlock()
 		return 0, err
 	}
+	endPos := g.totalBytes
+	g.mu.Unlock()
 
-	// Append to the end of our content (before EOF)
-	cursor := g.NewCursor()
+	// Phase 2 (unlocked): append via a cursor. Ephemeral - a tail-load
+	// utility cursor has no business in undo history.
+	cursor := g.NewEphemeralCursor()
 	defer g.RemoveCursor(cursor)
 
-	// Seek to end
-	err = cursor.SeekByte(g.totalBytes)
-	if err != nil {
+	if err := cursor.SeekByte(endPos); err != nil {
+		return 0, err
+	}
+	if _, err := cursor.InsertBytes(data, nil, false); err != nil {
 		return 0, err
 	}
 
-	// Insert the appended content
-	_, err = cursor.InsertBytes(data, nil, false)
-	if err != nil {
-		return 0, err
-	}
-
-	// Update our tracked original size
-	g.sourceState.originalSize = info.Size()
-	g.sourceState.originalMtime = info.ModTime()
+	// Phase 3 (locked): the appended tail is now part of the buffer -
+	// advance the agreement baseline to the file state we just loaded.
+	g.mu.Lock()
+	g.setSourceBaselineLocked(meta)
 	g.sourceState.status = SourceStatusNormal
 	g.sourceState.appendAvailableBytes = 0
+	g.mu.Unlock()
 
 	return int64(len(data)), nil
 }
