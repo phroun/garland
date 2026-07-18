@@ -58,6 +58,10 @@ var (
 	// ErrNotFromOriginalFile indicates warm storage is not available for this node.
 	ErrNotFromOriginalFile = errors.New("node is not from original file")
 
+	// ErrNoRecoverySource indicates that no alternate known save
+	// location could be verified and adopted (TryRecoverSource).
+	ErrNoRecoverySource = errors.New("no alternate save location could be adopted")
+
 	// ErrMemoryPressure indicates that memory limits are exceeded and cannot be reduced.
 	// This occurs when hard memory limit is set but no cold storage is configured,
 	// or when cold storage is full/unavailable. The application should handle this

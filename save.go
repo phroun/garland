@@ -383,6 +383,11 @@ func (g *Garland) saveInPlace(fs FileSystemInterface, opts SaveOptions) (SaveRep
 		_ = g.captureSourceInfo()
 	}
 
+	// Anchor this save in history (revert/recovery) and release the
+	// emacs lock: buffer and file agree again.
+	g.recordSavePointLocked(fs, g.sourcePath, true)
+	g.emacsLockSavedLocked()
+
 	report.Integrity = g.drainIntegrityEvents()
 	return report, nil
 }

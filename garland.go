@@ -248,6 +248,14 @@ type FileOptions struct {
 	ReadAheadBytes int64
 	ReadAheadRunes int64
 	ReadAheadAll   bool
+
+	// UseEmacsLocks (opt-in, file sources only) maintains an
+	// emacs-compatible ".#<name>" lock file next to the source for as
+	// long as the buffer holds unsaved modifications, so emacs (and
+	// tools honoring its protocol) warn users off the file - and
+	// Garland reports foreign locks it finds (SourceLockOwner,
+	// SourceConsistencyReport.LockedBy). See emacs_lock.go.
+	UseEmacsLocks bool
 }
 
 // ChangeResult contains version information after a mutation.
@@ -413,6 +421,17 @@ type Garland struct {
 	sourceState      *sourceState
 	warmVerification map[NodeID]*warmVerificationState
 
+	// saveHistory is the ring of the most recent successful saves
+	// (bounded by maxSavePoints): the anchors for RevertToLastSave,
+	// AdoptWarmSource's swift metadata verification, and
+	// TryRecoverSource.
+	saveHistory []SavePoint
+
+	// emacsLock, when non-nil, maintains an emacs-compatible ".#<name>"
+	// lock file for as long as the buffer holds unsaved modifications
+	// (FileOptions.UseEmacsLocks).
+	emacsLock *emacsLockState
+
 	// integrityLog accumulates block-level integrity events (slides,
 	// swaps, adoptions, losses) from the moment each is discovered
 	// until they are reported: peeked via IntegrityEvents, drained
@@ -556,9 +575,17 @@ func (lib *Library) Open(options FileOptions) (*Garland, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Capture source file info for change detection
+		// Capture source file metadata for change detection. This
+		// happens for EVERY file open, whatever the loading style
+		// (memory, warm, cold): the app must always be able to ask
+		// later whether another program modified the file.
 		if err := g.captureSourceInfo(); err != nil {
 			return nil, err
+		}
+		if options.UseEmacsLocks {
+			// Construction is single-threaded; the garland is not yet
+			// published, so the *Locked helper is safe to call.
+			g.initEmacsLockLocked()
 		}
 
 	case options.DataChannel != nil:
@@ -599,6 +626,8 @@ func (g *Garland) Close() error {
 	// Let any in-flight concurrent save finish before tearing down.
 	g.mu.Lock()
 	g.awaitNoSaveLocked()
+	// A held emacs lock does not survive the buffer it protects.
+	g.releaseEmacsLockLocked()
 	g.mu.Unlock()
 
 	// Stop source file watching
@@ -636,7 +665,38 @@ func (g *Garland) Save() (SaveReport, error) {
 // onto the original file itself routes through the in-place engine so
 // the warm backing store is never destroyed. The returned SaveReport
 // lists any lost blocks written as scars.
+// Equivalent to SaveAsWith(fs, name, SaveAsOptions{}) - the
+// destination does NOT become the buffer's source.
 func (g *Garland) SaveAs(fs FileSystemInterface, name string) (SaveReport, error) {
+	return g.SaveAsWith(fs, name, SaveAsOptions{})
+}
+
+// SaveAsOptions configures SaveAsWith.
+type SaveAsOptions struct {
+	// AdoptAsSource makes the destination the buffer's new source and
+	// warm-storage backing after a successful write: warm references
+	// re-home onto the new file, change detection re-baselines against
+	// it, and future Save calls write there. Use this for "the file
+	// lives here now". Leave it false when the destination must not be
+	// depended on afterwards - an export, or removable media about to
+	// be ejected - so the buffer keeps working from its original
+	// source.
+	AdoptAsSource bool
+
+	// PreserveHistory (adoption only): undo history backed by the OLD
+	// source is migrated off it (cold storage when available, else
+	// memory) before the source switches. When false such history is
+	// marked lost - amputated, never silently corrupted. Ignored when
+	// AdoptAsSource is false (the old source stays attached, history
+	// untouched).
+	PreserveHistory bool
+}
+
+// SaveAsWith writes the current content to a new location with control
+// over whether the destination becomes the buffer's new source (warm-
+// storage location). See SaveAsOptions. The returned SaveReport lists
+// any lost blocks written as scars.
+func (g *Garland) SaveAsWith(fs FileSystemInterface, name string, opts SaveAsOptions) (SaveReport, error) {
 	if name == "" {
 		return SaveReport{}, ErrNoDataSource
 	}
@@ -664,6 +724,8 @@ func (g *Garland) SaveAs(fs FileSystemInterface, name string) (SaveReport, error
 
 	if g.sourcePath != "" && name == g.sourcePath &&
 		(fs == g.sourceFS || (g.sourceFS == nil && fs == g.lib.defaultFS)) {
+		// The destination IS the source: the in-place engine handles
+		// re-homing and baselines (and records the save point).
 		return g.saveInPlace(fs, SaveOptions{PreserveHistory: true})
 	}
 
@@ -676,7 +738,21 @@ func (g *Garland) SaveAs(fs FileSystemInterface, name string) (SaveReport, error
 	if err := g.streamWriteToFile(fs, name); err != nil {
 		return SaveReport{Scars: scars}, err
 	}
-	return SaveReport{Scars: scars, Integrity: g.drainIntegrityEvents()}, nil
+	report := SaveReport{Scars: scars, Integrity: g.drainIntegrityEvents()}
+
+	if opts.AdoptAsSource {
+		// The stream made every leaf resident, and the new file now
+		// holds exactly the current content in buffer order - adopt it.
+		handle, err := fs.Open(name, OpenModeRead)
+		if err != nil {
+			// The save itself succeeded; only the adoption failed.
+			return report, err
+		}
+		g.adoptSourceLocked(fs, name, handle, opts.PreserveHistory)
+	}
+
+	g.recordSavePointLocked(fs, name, opts.AdoptAsSource)
+	return report, nil
 }
 
 // streamWriteToFile writes the document to a file using streaming (no full materialization).
@@ -1896,6 +1972,10 @@ func (g *Garland) UndoSeek(revision RevisionID) error {
 		cursor.lastRevision = g.currentRevision
 	}
 
+	// Landing exactly on the last-saved state releases the emacs lock;
+	// landing anywhere else (re-)acquires it.
+	g.syncEmacsLockAfterSeekLocked()
+
 	return nil
 }
 
@@ -1979,6 +2059,10 @@ func (g *Garland) ForkSeek(fork ForkID) error {
 		cursor.lastFork = fork
 		cursor.lastRevision = targetRevision
 	}
+
+	// Landing exactly on the last-saved state releases the emacs lock;
+	// landing anywhere else (re-)acquires it.
+	g.syncEmacsLockAfterSeekLocked()
 
 	return nil
 }
@@ -4730,7 +4814,16 @@ func (g *Garland) setCursorFromLine(c *Cursor, line, runeInLine int64) error {
 	if err != nil {
 		return err
 	}
-	c.updatePosition(pos, runePos, line, runeInLine)
+	// A runeInLine past the line's rune count migrates forward into the
+	// following line(s), bounded at EOF (the final line past a trailing
+	// newline is reachable). The byte position above already resolves
+	// that; derive the ACTUAL line:rune from it rather than storing the
+	// requested column, so LinePos() and BytePos() can never disagree.
+	realLine, realLineRune, err := g.byteToLineRuneInternalUnlocked(pos)
+	if err != nil {
+		return err
+	}
+	c.updatePosition(pos, runePos, realLine, realLineRune)
 	return nil
 }
 
@@ -4739,6 +4832,10 @@ func (g *Garland) setCursorFromLine(c *Cursor, line, runeInLine int64) error {
 // Otherwise, creates a new revision.
 // If not at HEAD revision, creates a new fork first.
 func (g *Garland) recordMutation() ChangeResult {
+	// The buffer is diverging from its source: make sure the emacs
+	// lock (when enabled) is held. Nil-check plus two bools when idle.
+	g.emacsLockMutatedLocked()
+
 	if g.transaction != nil {
 		// In transaction - check if we need to fork
 		if !g.isAtHead() && !g.transaction.hasMutations {

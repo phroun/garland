@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // OpenMode specifies how a file should be opened.
@@ -22,6 +23,50 @@ const (
 
 // FileHandle represents an open file.
 type FileHandle interface{}
+
+// FileMetadata describes a file as observed at one moment: the
+// information Garland tracks to detect external modification of a
+// source file between opening it and saving over it. A virtualized
+// filesystem supplies these through FileSystemInterface.Stat, or the
+// application volunteers them via Garland.ReportSourceMetadata when it
+// learns fresher facts than Garland could observe itself.
+type FileMetadata struct {
+	// Exists is false when the path currently names no file. The other
+	// fields are meaningless in that case.
+	Exists bool
+
+	// Size is the file's length in bytes.
+	Size int64
+
+	// ModTime is the file's last-modification time.
+	ModTime time.Time
+
+	// Identity names the underlying storage object, independent of the
+	// path (on local unix filesystems "dev<dev>:ino<inode>"). Two
+	// different non-empty identities for the same path mean the path
+	// was re-bound to a different object - the classic write-temp-and-
+	// rename "file replaced" case. Empty means unknown; identity
+	// comparison is then skipped and detection falls back to
+	// size + mtime.
+	Identity string
+}
+
+// DeviceInfo describes the storage device/volume behind a path, for
+// free-space warnings ("this save may not fit") and for recognizing
+// when two paths live on different media (e.g. saving to removable
+// media vs. the working drive).
+type DeviceInfo struct {
+	// DeviceID identifies the device/volume holding the path (on local
+	// unix filesystems "dev<dev>", on Windows the volume name). Two
+	// equal non-empty IDs mean the same device. Empty means unknown.
+	DeviceID string
+
+	// FreeBytes is the space available to new writes, -1 if unknown.
+	FreeBytes int64
+
+	// TotalBytes is the device's total capacity, -1 if unknown.
+	TotalBytes int64
+}
 
 // FileSystemInterface abstracts file operations for custom protocols.
 // The library provides a default implementation for local files.
@@ -53,6 +98,19 @@ type FileSystemInterface interface {
 	// relies on this so a block being re-written (chill) can never be
 	// torn-read by a concurrent Get (unlocked save phase, thaw).
 	Rename(oldpath, newpath string) error
+
+	// Stat reports a path's current metadata for external-modification
+	// detection. A missing file is NOT an error: report it as
+	// FileMetadata{Exists: false} with a nil error; errors are reserved
+	// for real failures. Implementations without metadata may return
+	// ErrNotSupported - Garland then tracks only what the application
+	// volunteers through ReportSourceMetadata.
+	Stat(name string) (FileMetadata, error)
+
+	// DeviceInfo reports the storage device behind a path (identity and
+	// free space), for save-time free-space warnings. May return
+	// ErrNotSupported.
+	DeviceInfo(name string) (DeviceInfo, error)
 }
 
 // localFileHandle wraps an os.File for the local file system.
@@ -200,6 +258,26 @@ func (fs *localFileSystem) Remove(name string) error {
 func (fs *localFileSystem) Rmdir(path string) error {
 	// os.Remove only removes empty directories when given a directory path
 	return os.Remove(path)
+}
+
+func (fs *localFileSystem) Stat(name string) (FileMetadata, error) {
+	info, err := os.Stat(name)
+	if os.IsNotExist(err) {
+		return FileMetadata{}, nil
+	}
+	if err != nil {
+		return FileMetadata{}, err
+	}
+	return FileMetadata{
+		Exists:   true,
+		Size:     info.Size(),
+		ModTime:  info.ModTime(),
+		Identity: localFileIdentity(info),
+	}, nil
+}
+
+func (fs *localFileSystem) DeviceInfo(name string) (DeviceInfo, error) {
+	return localDeviceInfo(name)
 }
 
 // fsColdStorage implements ColdStorageInterface using a FileSystemInterface.
