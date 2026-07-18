@@ -252,6 +252,10 @@ func (g *Garland) recordSavePointLocked(fs FileSystemInterface, path string, ado
 // coordinates, for the concurrent save (whose plan pins a state the
 // live head may since have moved past). Caller must hold the write lock.
 func (g *Garland) recordSavePointAtLocked(fs FileSystemInterface, path string, adopted bool, fork ForkID, rev RevisionID) {
+	// A save pins the revision it wrote (revert/recovery anchor) -
+	// bake any coalescing run so later keystrokes can never amend it.
+	g.coalesce.active = false
+
 	meta, err := fs.Stat(path)
 	if err != nil {
 		meta = FileMetadata{} // unknown metadata still anchors the revision

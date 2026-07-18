@@ -256,6 +256,14 @@ type FileOptions struct {
 	// Garland reports foreign locks it finds (SourceLockOwner,
 	// SourceConsistencyReport.LockedBy). See emacs_lock.go.
 	UseEmacsLocks bool
+
+	// LockOwner overrides the identity written inside the emacs lock
+	// file (and used to recognize our own lock vs. a foreign one).
+	// Empty means the default "user@host.pid", derived from the
+	// environment. Follow that form for emacs interoperability; the
+	// value is used verbatim after trimming surrounding whitespace,
+	// and must be a single line. Only meaningful with UseEmacsLocks.
+	LockOwner string
 }
 
 // ChangeResult contains version information after a mutation.
@@ -438,6 +446,12 @@ type Garland struct {
 	// (SetBackupLocation; see backup.go).
 	backup *backupState
 
+	// Undo coalescing: run tracking plus the per-op decision handed
+	// from insert/delete entry points to recordMutation (see
+	// coalesce.go). Both guarded by mu.
+	coalesce        coalesceState
+	coalescePending coalescePending
+
 	// integrityLog accumulates block-level integrity events (slides,
 	// swaps, adoptions, losses) from the moment each is discovered
 	// until they are reported: peeked via IntegrityEvents, drained
@@ -591,7 +605,7 @@ func (lib *Library) Open(options FileOptions) (*Garland, error) {
 		if options.UseEmacsLocks {
 			// Construction is single-threaded; the garland is not yet
 			// published, so the *Locked helper is safe to call.
-			g.initEmacsLockLocked()
+			g.initEmacsLockLocked(options.LockOwner)
 		}
 
 	case options.DataChannel != nil:
@@ -1780,6 +1794,9 @@ func (g *Garland) TransactionStart(name string) error {
 		// This allows UndoSeek to restore positions from before the transaction
 		g.recordCursorPositionsInHistory()
 
+		// A transaction is its own grouping - bake any coalescing run.
+		g.coalesce.active = false
+
 		// First level: create new transaction state
 		g.transaction = &TransactionState{
 			depth:                 1,
@@ -1990,6 +2007,11 @@ func (g *Garland) UndoSeek(revision RevisionID) error {
 		cursor.lastRevision = g.currentRevision
 	}
 
+	// History navigation is a hard edge for undo coalescing: resuming
+	// an old run after looking around would rewrite what the user just
+	// inspected.
+	g.coalesce.active = false
+
 	// Landing exactly on the last-saved state releases the emacs lock;
 	// landing anywhere else (re-)acquires it.
 	g.syncEmacsLockAfterSeekLocked()
@@ -2077,6 +2099,11 @@ func (g *Garland) ForkSeek(fork ForkID) error {
 		cursor.lastFork = fork
 		cursor.lastRevision = targetRevision
 	}
+
+	// History navigation is a hard edge for undo coalescing: resuming
+	// an old run after looking around would rewrite what the user just
+	// inspected.
+	g.coalesce.active = false
 
 	// Landing exactly on the last-saved state releases the emacs lock;
 	// landing anywhere else (re-)acquires it.
@@ -3833,9 +3860,17 @@ func (g *Garland) insertBytesAt(c *Cursor, pos int64, data []byte, decorations [
 		return ChangeResult{}, ErrInvalidPosition
 	}
 
-	// Record cursor positions BEFORE any changes (for undo history)
-	// Only if not in transaction (transactions record at TransactionStart)
-	if g.transaction == nil {
+	// Coalescing: does this insert continue the active typing run?
+	// The decision is consumed by recordMutation; the deferred clear
+	// keeps a failed mutation from leaking it into the next op.
+	amend := g.coalesceDecideLocked(coalesceInsert, pos, int64(len(data)))
+	defer func() { g.coalescePending = coalescePending{} }()
+
+	// Record cursor positions BEFORE any changes (for undo history).
+	// Skipped in transactions (recorded at TransactionStart) and for
+	// amending ops: the run's revision is still current, and its
+	// END-of-run positions get recorded when the run bakes.
+	if g.transaction == nil && !amend {
 		g.recordCursorPositionsInHistory()
 	}
 
@@ -3899,14 +3934,20 @@ func (g *Garland) deleteBytesAt(c *Cursor, pos int64, length int64, includeLineD
 		return nil, ChangeResult{}, ErrInvalidPosition
 	}
 
-	// Record cursor positions BEFORE any changes (for undo history)
-	if g.transaction == nil {
-		g.recordCursorPositionsInHistory()
-	}
-
-	// Clamp length to available data
+	// Clamp length to available data (before the coalescing decision:
+	// the backspace-adjacency test needs the real deleted length)
 	if pos+length > g.totalBytes {
 		length = g.totalBytes - pos
+	}
+
+	// Coalescing: does this delete continue the active deletion run?
+	amend := g.coalesceDecideLocked(coalesceDelete, pos, length)
+	defer func() { g.coalescePending = coalescePending{} }()
+
+	// Record cursor positions BEFORE any changes (for undo history).
+	// Skipped in transactions and for amending ops (see insertBytesAt).
+	if g.transaction == nil && !amend {
+		g.recordCursorPositionsInHistory()
 	}
 
 	// Read the content being deleted to calculate deltas
@@ -4850,6 +4891,11 @@ func (g *Garland) setCursorFromLine(c *Cursor, line, runeInLine int64) error {
 // Otherwise, creates a new revision.
 // If not at HEAD revision, creates a new fork first.
 func (g *Garland) recordMutation() ChangeResult {
+	// Consume the coalescing decision (if the op made one). Consuming
+	// here means a decision can never outlive its own mutation.
+	pc := g.coalescePending
+	g.coalescePending = coalescePending{}
+
 	// The buffer is diverging from its source: make sure the emacs
 	// lock (when enabled) is held and the pre-session backup (when
 	// configured) is armed. Nil-checks plus a few bools when idle.
@@ -4857,6 +4903,9 @@ func (g *Garland) recordMutation() ChangeResult {
 	g.backupMutatedLocked()
 
 	if g.transaction != nil {
+		// A transaction is its own (stronger) grouping - any active
+		// coalescing run dissolves into it.
+		g.coalesce.active = false
 		// In transaction - check if we need to fork
 		if !g.isAtHead() && !g.transaction.hasMutations {
 			// First mutation in this transaction while not at HEAD - create fork
@@ -4867,6 +4916,32 @@ func (g *Garland) recordMutation() ChangeResult {
 		// Mark as having mutations
 		g.transaction.hasMutations = true
 		return ChangeResult{Fork: g.currentFork, Revision: g.transaction.pendingRevision}
+	}
+
+	streamKnown := func() int64 {
+		if g.loader != nil && !g.loader.eofReached {
+			return g.loader.bytesLoaded
+		}
+		return -1 // -1 means streaming is complete
+	}
+
+	// AMEND: this op continues a coalescing run - the run's revision
+	// absorbs it. Mutations path-copy into fresh node IDs and a
+	// revision's identity is entirely revisionInfo[rev].RootID, so
+	// re-pointing the root replaces the revision's content atomically;
+	// every other revision keeps resolving through its own root.
+	if pc.amend {
+		if ri := g.revisionInfo[ForkRevision{g.currentFork, g.currentRevision}]; ri != nil {
+			ri.RootID = g.root.id
+			ri.StreamKnownBytes = streamKnown()
+			g.applyPendingDecorationUpdates(g.currentFork, g.currentRevision)
+			g.coalesceExtendRunLocked(pc)
+			// Cursors' lastFork/lastRevision already name this revision.
+			g.kickMaintenance()
+			return ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}
+		}
+		// Missing revision info (should not happen): fall through to a
+		// normal bump rather than corrupt anything.
 	}
 
 	// Not in transaction - check if we need to fork first
@@ -4884,16 +4959,12 @@ func (g *Garland) recordMutation() ChangeResult {
 	}
 
 	// Store revision info (unnamed) with current root ID
-	streamKnown := int64(-1) // -1 means streaming is complete
-	if g.loader != nil && !g.loader.eofReached {
-		streamKnown = g.loader.bytesLoaded
-	}
 	g.revisionInfo[ForkRevision{g.currentFork, g.currentRevision}] = &RevisionInfo{
 		Revision:         g.currentRevision,
 		Name:             "",
 		HasChanges:       true,
 		RootID:           g.root.id,
-		StreamKnownBytes: streamKnown,
+		StreamKnownBytes: streamKnown(),
 	}
 
 	// Apply pending decoration cache updates with the correct revision
@@ -4905,11 +4976,25 @@ func (g *Garland) recordMutation() ChangeResult {
 		cursor.lastRevision = g.currentRevision
 	}
 
-	// Check memory pressure and perform incremental maintenance if
-	// needed. Only when limits are actually configured, and never more
-	// than one checker in flight: an unconditional goroutine per
-	// mutation means one full node-registry scan PER KEYSTROKE, each
-	// scan growing with the registry.
+	// Coalescing bookkeeping: a qualifying insert/delete STARTS a run
+	// at this fresh revision; any other mutation is a hard edge.
+	if pc.valid && g.coalesce.enabled {
+		g.coalesceStartRunLocked(pc)
+	} else {
+		g.coalesce.active = false
+	}
+
+	g.kickMaintenance()
+
+	return ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}
+}
+
+// kickMaintenance checks memory pressure and performs incremental
+// maintenance if needed. Only when limits are actually configured,
+// and never more than one checker in flight: an unconditional
+// goroutine per mutation means one full node-registry scan PER
+// KEYSTROKE, each scan growing with the registry.
+func (g *Garland) kickMaintenance() {
 	if g.lib != nil && (g.lib.memorySoftLimit > 0 || g.lib.memoryHardLimit > 0) &&
 		atomic.CompareAndSwapInt32(&g.maintenanceInFlight, 0, 1) {
 		go func() {
@@ -4917,8 +5002,6 @@ func (g *Garland) recordMutation() ChangeResult {
 			g.CheckMemoryPressure()
 		}()
 	}
-
-	return ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}
 }
 
 // recordCursorPositionsInHistory records all cursor positions in their history maps.

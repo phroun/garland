@@ -174,6 +174,11 @@ type FileOptions struct {
     // emacs-compatible ".#<name>" lock file while the buffer holds
     // unsaved modifications. See "Source Metadata & Consistency".
     UseEmacsLocks bool
+
+    // LockOwner overrides the identity written inside the lock file
+    // (default: environment-derived "user@host.pid"; follow that form
+    // for emacs interoperability). Single line, trimmed.
+    LockOwner string
 }
 
 type LoadingStyle int
@@ -459,9 +464,10 @@ With `FileOptions.UseEmacsLocks`, Garland maintains an emacs-style
 buffer holds unsaved modifications: acquired on the first mutation
 past a clean point, released on save / revert-to-saved / undo onto
 the saved revision / Close. The lock is a regular file containing
-"user@host.pid", written through the filesystem hook (VFS-portable;
-emacs reads this form as well as its symlink form). A foreign lock is
-NEVER clobbered - it is recorded and reported; the app decides.
+"user@host.pid" (identity overridable via FileOptions.LockOwner),
+written through the filesystem hook (VFS-portable; emacs reads this
+form as well as its symlink form). A foreign lock is NEVER clobbered -
+it is recorded and reported; the app decides.
 
 ```go
 func (g *Garland) HoldsSourceLock() bool
@@ -742,6 +748,27 @@ func (g *Garland) CurrentFork() ForkID
 
 // CurrentRevision returns the current revision number within the current fork.
 func (g *Garland) CurrentRevision() RevisionID
+
+// Undo coalescing (opt-in; off by default - every mutation is its own
+// revision). While enabled, a run of adjacent inserts (typing: each
+// insert landing at the beginning or end of the chunk the run built)
+// or adjacent deletes (forward-delete repeating at one caret, or
+// backspace walking left into it) AMENDS the current revision instead
+// of minting one per keystroke - typing a word is ONE undo step.
+// Runs end at a HARD EDGE: Bake(); an edit arriving more than
+// autoBakeTime after the previous one (0 disables time-based baking);
+// any non-continuation (different kind, non-adjacent or interior
+// position, any other mutation type); UndoSeek/ForkSeek; a successful
+// save (the save point pins its revision); TransactionStart. Runs may
+// freely exist within a bigger pending transaction - they simply
+// dissolve into it (the transaction is already one revision).
+func (g *Garland) SetUndoCoalescing(enabled bool, autoBakeTime time.Duration)
+func (g *Garland) UndoCoalescing() (enabled bool, autoBakeTime time.Duration)
+
+// Bake forces a hard edge: the current run is finalized and the next
+// edit starts a fresh history entry no matter how adjacent. Safe to
+// call at any time.
+func (g *Garland) Bake()
 
 // UndoSeek navigates to a specific revision within the current fork.
 // Cannot seek forward past the highest revision in this fork.

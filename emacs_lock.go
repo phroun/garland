@@ -71,11 +71,17 @@ func emacsLockPath(sourcePath string) string {
 
 // initEmacsLock enables lock tracking for this garland. Called from
 // Open when FileOptions.UseEmacsLocks is set with a file source.
-// Caller must hold the write lock.
-func (g *Garland) initEmacsLockLocked() {
+// owner overrides the identity written inside the lock file
+// (FileOptions.LockOwner); empty falls back to the environment-derived
+// "user@host.pid". Caller must hold the write lock.
+func (g *Garland) initEmacsLockLocked(owner string) {
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		owner = emacsLockOwnerInfo()
+	}
 	g.emacsLock = &emacsLockState{
 		enabled:   true,
-		ourInfo:   emacsLockOwnerInfo(),
+		ourInfo:   owner,
 		cleanFork: g.currentFork,
 		cleanRev:  g.currentRevision,
 		haveClean: true,
