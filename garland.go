@@ -4045,8 +4045,16 @@ func (g *Garland) overwriteBytesAtInternal(c *Cursor, pos int64, length int64, n
 		return nil, ChangeResult{}, ErrInvalidPosition
 	}
 
-	// Record cursor positions BEFORE any changes (for undo history)
-	if g.transaction == nil {
+	// Coalescing: does this overwrite continue the active overwrite run?
+	// The run tracks its OWN written span, so the decision keys on the
+	// written length (len(newData)), not the deleted length.
+	amend := g.coalesceDecideLocked(coalesceOverwrite, pos, int64(len(newData)))
+	defer func() { g.coalescePending = coalescePending{} }()
+
+	// Record cursor positions BEFORE any changes (for undo history).
+	// Skipped in transactions and for amending ops (the run's revision
+	// records its end-of-run positions when it bakes).
+	if g.transaction == nil && !amend {
 		g.recordCursorPositionsInHistory()
 	}
 

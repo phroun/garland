@@ -5,9 +5,10 @@ import (
 	"time"
 )
 
-// coalesce_test.go - undo coalescing: runs of adjacent inserts/deletes
-// collapse into one revision; Bake(), AutoBakeTime, seeks, saves, and
-// transactions are hard edges.
+// coalesce_test.go - undo coalescing: runs of adjacent inserts,
+// deletes, and overwrites each collapse into one revision (the three
+// kinds never merge with each other); Bake(), AutoBakeTime, seeks,
+// saves, and transactions are hard edges.
 
 func coalesceFixture(t *testing.T, content string) (*Garland, *Cursor) {
 	t.Helper()
@@ -31,6 +32,19 @@ func typeString(t *testing.T, c *Cursor, pos int64, s string) ChangeResult {
 		t.Fatal(err)
 	}
 	res, err := c.InsertString(s, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res
+}
+
+// overwriteAt overwrites `length` bytes at pos with s (replace-mode edit).
+func overwriteAt(t *testing.T, c *Cursor, pos, length int64, s string) ChangeResult {
+	t.Helper()
+	if err := c.SeekByte(pos); err != nil {
+		t.Fatal(err)
+	}
+	_, res, err := c.OverwriteBytes(length, []byte(s))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,6 +189,200 @@ func TestCoalesceKindSwitchBakes(t *testing.T) {
 	if g.CurrentRevision() != 2 {
 		t.Fatalf("current revision = %d, want 2", g.CurrentRevision())
 	}
+}
+
+// TestCoalesceOverwriteRun: replace-mode typing (overwrite one char,
+// caret advances, overwrite the next) collapses to ONE revision; undo
+// removes the whole run and restores the original bytes.
+func TestCoalesceOverwriteRun(t *testing.T) {
+	g, c := coalesceFixture(t, "0123456789")
+
+	// Overwrite "abc" over "012", one char at a time, caret advancing.
+	r0 := overwriteAt(t, c, 0, 1, "a")
+	r1 := overwriteAt(t, c, 1, 1, "b") // continues at the run's end
+	r2 := overwriteAt(t, c, 2, 1, "c")
+	if r0.Revision != 1 || r1.Revision != 1 || r2.Revision != 1 {
+		t.Fatalf("revisions = %d,%d,%d, want all 1", r0.Revision, r1.Revision, r2.Revision)
+	}
+	if g.CurrentRevision() != 1 {
+		t.Fatalf("current revision = %d, want 1", g.CurrentRevision())
+	}
+	if got := contentOf(t, g, c); got != "abc3456789" {
+		t.Fatalf("content = %q", got)
+	}
+
+	if err := g.UndoSeek(0); err != nil {
+		t.Fatal(err)
+	}
+	if got := contentOf(t, g, c); got != "0123456789" {
+		t.Fatalf("after undo content = %q, want the run fully removed", got)
+	}
+	if err := g.UndoSeek(1); err != nil {
+		t.Fatal(err)
+	}
+	if got := contentOf(t, g, c); got != "abc3456789" {
+		t.Fatalf("after redo content = %q, want the run fully restored", got)
+	}
+}
+
+// TestCoalesceOverwriteGrows: overwrites whose replacement is longer
+// than what they replace still coalesce, the run's written span growing
+// by the written length each time.
+func TestCoalesceOverwriteGrows(t *testing.T) {
+	g, c := coalesceFixture(t, "xyz")
+
+	overwriteAt(t, c, 0, 1, "AA")       // [0,1)->"AA": span [0,2), content "AAyz"
+	res := overwriteAt(t, c, 2, 1, "B") // caret at 2 == run end; "AAByz"... wait span
+	if res.Revision != 1 || g.CurrentRevision() != 1 {
+		t.Fatalf("second overwrite revision = %d, want coalesced into 1", res.Revision)
+	}
+	if got := contentOf(t, g, c); got != "AABz" {
+		t.Fatalf("content = %q, want AABz", got)
+	}
+}
+
+// TestCoalesceOverwriteNonAdjacentBakes: an overwrite away from the run
+// starts a new revision (and a fresh run there).
+func TestCoalesceOverwriteNonAdjacentBakes(t *testing.T) {
+	g, c := coalesceFixture(t, "0123456789")
+
+	overwriteAt(t, c, 0, 1, "a")
+	res := overwriteAt(t, c, 7, 1, "b") // far from the run
+	if res.Revision != 2 {
+		t.Fatalf("non-adjacent overwrite revision = %d, want 2", res.Revision)
+	}
+	res = overwriteAt(t, c, 8, 1, "c") // continues the new run
+	if res.Revision != 2 || g.CurrentRevision() != 2 {
+		t.Fatalf("continuation revision = %d, want coalesced into 2", res.Revision)
+	}
+}
+
+// TestCoalesceOverwriteInteriorBakes: re-overwriting inside the run
+// (navigating back into what you wrote) bakes, mirroring insert's
+// interior rule.
+func TestCoalesceOverwriteInteriorBakes(t *testing.T) {
+	g, c := coalesceFixture(t, "0123456789")
+
+	overwriteAt(t, c, 0, 1, "a")
+	overwriteAt(t, c, 1, 1, "b")        // run [0,2)
+	res := overwriteAt(t, c, 0, 1, "Z") // back at the start - interior
+	if res.Revision != 2 {
+		t.Fatalf("interior overwrite revision = %d, want new revision 2", res.Revision)
+	}
+	if g.CurrentRevision() != 2 {
+		t.Fatalf("current revision = %d, want 2", g.CurrentRevision())
+	}
+}
+
+// TestCoalesceOverwriteKindSeparate: overwrite runs never merge with
+// insert or delete runs, even at an adjacent position - each kind is
+// its own run.
+func TestCoalesceOverwriteKindSeparate(t *testing.T) {
+	g, c := coalesceFixture(t, "0123456789")
+
+	// insert then adjacent overwrite: different kinds, so the overwrite
+	// starts a fresh revision.
+	typeString(t, c, 0, "AB") // rev 1, insert run [0,2)
+	res := overwriteAt(t, c, 2, 1, "C")
+	if res.Revision != 2 {
+		t.Fatalf("overwrite after insert run: revision = %d, want 2", res.Revision)
+	}
+	// overwrite then adjacent delete: different kinds again.
+	if err := c.SeekByte(3); err != nil {
+		t.Fatal(err)
+	}
+	if _, dres, err := c.DeleteBytes(1, false); err != nil {
+		t.Fatal(err)
+	} else if dres.Revision != 3 {
+		t.Fatalf("delete after overwrite run: revision = %d, want 3", dres.Revision)
+	}
+	if g.CurrentRevision() != 3 {
+		t.Fatalf("current revision = %d, want 3", g.CurrentRevision())
+	}
+}
+
+// TestCoalesceOverwriteSeekBakes: history navigation ends an overwrite
+// run, like the other kinds.
+func TestCoalesceOverwriteSeekBakes(t *testing.T) {
+	g, c := coalesceFixture(t, "0123456789")
+
+	overwriteAt(t, c, 0, 1, "a") // rev 1, run [0,1)
+	if err := g.UndoSeek(0); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.UndoSeek(1); err != nil {
+		t.Fatal(err)
+	}
+	res := overwriteAt(t, c, 1, 1, "b") // adjacent to the old run
+	if res.Revision != 2 {
+		t.Fatalf("post-seek overwrite revision = %d, want 2 (run baked by seek)", res.Revision)
+	}
+}
+
+// TestCoalesceOvertypeAppend: "overtype mode" - a run of overwrites
+// within a line, then inserts appended at the end when the line runs
+// out - stays ONE revision. The overwrite->insert switch coalesces
+// (one-directional), so the whole overtype gesture is a single undo.
+func TestCoalesceOvertypeAppend(t *testing.T) {
+	g, c := coalesceFixture(t, "0123456789")
+
+	// Overtype "abc" over "012".
+	overwriteAt(t, c, 0, 1, "a")
+	overwriteAt(t, c, 1, 1, "b")
+	overwriteAt(t, c, 2, 1, "c") // overwrite run [0,3), "abc3456789"
+
+	// Reached the switch point: now APPEND via inserts at the run's end.
+	r1 := typeString(t, c, 3, "X") // insert at pos == run end
+	r2 := typeString(t, c, 4, "Y") // continues as an insert run
+	if r1.Revision != 1 || r2.Revision != 1 {
+		t.Fatalf("append inserts minted revisions %d,%d, want coalesced into 1", r1.Revision, r2.Revision)
+	}
+	if g.CurrentRevision() != 1 {
+		t.Fatalf("current revision = %d, want 1", g.CurrentRevision())
+	}
+	if got := contentOf(t, g, c); got != "abcXY3456789" {
+		t.Fatalf("content = %q", got)
+	}
+
+	// One undo removes the entire overtype gesture.
+	if err := g.UndoSeek(0); err != nil {
+		t.Fatal(err)
+	}
+	if got := contentOf(t, g, c); got != "0123456789" {
+		t.Fatalf("after undo content = %q, want the whole gesture removed", got)
+	}
+}
+
+// TestCoalesceOvertypeSwitchIsOneWay: after the overwrite->insert switch
+// the run is an insert run, so a subsequent overwrite bakes (the reverse
+// transition never coalesces).
+func TestCoalesceOvertypeSwitchIsOneWay(t *testing.T) {
+	g, c := coalesceFixture(t, "0123456789")
+
+	overwriteAt(t, c, 0, 1, "a")        // overwrite run [0,1)
+	typeString(t, c, 1, "X")            // insert continues it -> insert run [0,2)
+	res := overwriteAt(t, c, 2, 1, "b") // overwrite after insert run: bakes
+	if res.Revision != 2 {
+		t.Fatalf("overwrite after the switch: revision = %d, want 2 (one-way)", res.Revision)
+	}
+	if g.CurrentRevision() != 2 {
+		t.Fatalf("current revision = %d, want 2", g.CurrentRevision())
+	}
+}
+
+// TestCoalesceInsertBeforeOverwriteBakes: the switch is only at the END
+// of the overwrite run. An insert at the START (prepend) is not the
+// overtype-append gesture, so it bakes.
+func TestCoalesceInsertBeforeOverwriteBakes(t *testing.T) {
+	g, c := coalesceFixture(t, "0123456789")
+
+	overwriteAt(t, c, 1, 1, "a")
+	overwriteAt(t, c, 2, 1, "b")    // overwrite run [1,3)
+	res := typeString(t, c, 1, "Z") // insert at the run START
+	if res.Revision != 2 {
+		t.Fatalf("insert before overwrite run: revision = %d, want 2 (only end appends)", res.Revision)
+	}
+	_ = g
 }
 
 // TestBakeHardEdge: Bake() ends the run; the next perfectly adjacent
