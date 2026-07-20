@@ -750,11 +750,21 @@ func (g *Garland) CurrentFork() ForkID
 func (g *Garland) CurrentRevision() RevisionID
 
 // Undo coalescing (opt-in; off by default - every mutation is its own
-// revision). While enabled, a run of adjacent inserts (typing: each
-// insert landing at the beginning or end of the chunk the run built)
-// or adjacent deletes (forward-delete repeating at one caret, or
-// backspace walking left into it) AMENDS the current revision instead
-// of minting one per keystroke - typing a word is ONE undo step.
+// revision). While enabled, a run of adjacent edits AMENDS the current
+// revision instead of minting one per keystroke - typing a word is ONE
+// undo step. Three kinds coalesce, each independently (a run of one
+// kind never absorbs another kind's op):
+//   - inserts (typing: each insert landing at the beginning or end of
+//     the chunk the run built);
+//   - deletes (forward-delete repeating at one caret, or backspace
+//     walking left into it);
+//   - overwrites (replace-mode typing: each overwrite landing at the
+//     end of what the run has written).
+// One cross-kind transition coalesces, ONE-DIRECTIONAL: an insert may
+// continue an OVERWRITE run at its end (an editor's "overtype mode"
+// overwrites within a line then appends via inserts at the end - the
+// switch keeps coalescing). After it the run is an insert run, so a
+// later overwrite bakes; the reverse never coalesces. Bake() opts out.
 // Runs end at a HARD EDGE: Bake(); an edit arriving more than
 // autoBakeTime after the previous one (0 disables time-based baking);
 // any non-continuation (different kind, non-adjacent or interior
