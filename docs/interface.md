@@ -461,9 +461,15 @@ func (g *Garland) TryRecoverSource(level VerifyLevel) (SavePoint, error) // ErrN
 
 With `FileOptions.UseEmacsLocks`, Garland maintains an emacs-style
 `.#<name>` lock file next to the source for exactly as long as the
-buffer holds unsaved modifications: acquired on the first mutation
-past a clean point, released on save / revert-to-saved / undo onto
-the saved revision / Close. The lock is a regular file containing
+buffer holds unsaved CONTENT modifications: Open never creates a lock
+file; the lock is acquired on the first content mutation past a clean
+point, released on save / revert-to-saved / undo onto the saved
+content / transaction rollback onto it / Close. Decoration-only
+changes (marks, bookmarks) mint revisions for undo/redo but never
+engage the lock and never disturb the clean point - decorations don't
+serialize into the source, so undoing all content edits releases the
+lock even with decoration revisions in between. A read-only viewer
+(reads, marks, no edits) never locks. The lock is a regular file containing
 "user@host.pid" (identity overridable via FileOptions.LockOwner),
 written through the filesystem hook (VFS-portable; emacs reads this
 form as well as its symlink form). A foreign lock is NEVER clobbered -
@@ -486,7 +492,8 @@ func (g *Garland) SourceDeviceInfo() (DeviceInfo, error)
 
 ### Pre-session backups
 
-The app names a backup location per garland; on the FIRST mutation a
+The app names a backup location per garland; on the FIRST CONTENT
+mutation (decoration-only changes never arm it) a
 background thread streams the source file's pre-session content there,
 so the backup is already in place before Save is pressed. A save that
 races ahead of the background copy performs it inline first - the

@@ -184,21 +184,30 @@ func (g *Garland) BackupInfo() BackupInfo {
 	return info
 }
 
-// bufferDirtyLocked reports whether the buffer holds modifications the
-// source file does not: the current coordinates differ from the last
-// save point (or from the open state when nothing was ever saved).
-// Caller must hold at least the read lock.
+// bufferDirtyLocked reports whether the buffer holds CONTENT
+// modifications the source file does not: the current content sequence
+// differs from the last save point's (or from the open state when
+// nothing was ever saved). Decoration-only revisions never read as
+// dirty - marks don't serialize into the source. Caller must hold at
+// least the read lock.
 func (g *Garland) bufferDirtyLocked() bool {
 	if n := len(g.saveHistory); n > 0 {
 		sp := g.saveHistory[n-1]
+		if ri := g.findRevisionInfo(sp.Fork, sp.Revision); ri != nil && ri.Revision == sp.Revision {
+			return ri.ContentSeq != g.contentSeq
+		}
+		// Save point's revision info pruned away: fall back to
+		// coordinate identity (conservative - may arm a backup for a
+		// decoration-only divergence, never misses a content one).
 		return sp.Fork != g.currentFork || sp.Revision != g.currentRevision
 	}
-	return g.currentFork != 0 || g.currentRevision != 0
+	return g.contentSeq != 0
 }
 
-// backupMutatedLocked is the recordMutation hook: the first mutation
-// arms the background copy. Nil-check plus one bool when idle. Caller
-// must hold the write lock.
+// backupMutatedLocked is the recordMutation hook, fired for CONTENT
+// mutations only (decoration-only changes never reach it): the first
+// content mutation arms the background copy. Nil-check plus one bool
+// when idle. Caller must hold the write lock.
 func (g *Garland) backupMutatedLocked() {
 	bs := g.backup
 	if bs == nil || bs.wanted {

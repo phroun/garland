@@ -363,4 +363,5 @@ type RevisionInfo struct {
 	HasChanges       bool   // true if actual mutations occurred
 	RootID           NodeID // root node ID at this revision (for UndoSeek)
 	StreamKnownBytes int64  // bytes of streaming content known when revision was created (-1 if complete)
+	ContentSeq       uint64 // content sequence at this revision (see Garland.contentSeq)
 }
