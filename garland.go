@@ -254,7 +254,19 @@ type FileOptions struct {
 	// long as the buffer holds unsaved modifications, so emacs (and
 	// tools honoring its protocol) warn users off the file - and
 	// Garland reports foreign locks it finds (SourceLockOwner,
-	// SourceConsistencyReport.LockedBy). See emacs_lock.go.
+	// SourceConsistencyReport.LockedBy).
+	//
+	// Contract: Open never creates a lock file. The lock appears on
+	// the first CONTENT mutation past a clean point (the open
+	// baseline, then each successful save) and disappears when buffer
+	// and file agree again (save, revert/undo to the saved content,
+	// close). Decoration-only changes (marks, bookmarks) mint
+	// revisions for undo/redo but never engage the lock, never arm the
+	// pre-session backup, and never disturb the clean point -
+	// decorations don't serialize into the source, so they can never
+	// BE unsaved changes. A buffer opened for viewing (reads, marks,
+	// no edits) therefore never leaves a lock on disk. See
+	// emacs_lock.go.
 	UseEmacsLocks bool
 
 	// LockOwner overrides the identity written inside the emacs lock
@@ -335,10 +347,11 @@ type TransactionState struct {
 	poisoned bool   // whether any inner transaction rolled back
 
 	// Pre-transaction state for rollback
-	preTransactionRoot    NodeID
-	preTransactionFork    ForkID
-	preTransactionRev     RevisionID
-	preTransactionCursors map[*Cursor]*CursorPosition
+	preTransactionRoot       NodeID
+	preTransactionFork       ForkID
+	preTransactionRev        RevisionID
+	preTransactionContentSeq uint64
+	preTransactionCursors    map[*Cursor]*CursorPosition
 
 	// Pending revision (assigned at TransactionStart)
 	pendingRevision RevisionID
@@ -436,15 +449,27 @@ type Garland struct {
 	saveHistory []SavePoint
 
 	// emacsLock, when non-nil, maintains an emacs-compatible ".#<name>"
-	// lock file for as long as the buffer holds unsaved modifications
-	// (FileOptions.UseEmacsLocks).
+	// lock file for as long as the buffer holds unsaved CONTENT
+	// modifications (FileOptions.UseEmacsLocks).
 	emacsLock *emacsLockState
 
 	// backup, when non-nil, streams a pre-session copy of the source
-	// file to an app-chosen location on the first mutation, so the
-	// backup is in place before any save overwrites the file
+	// file to an app-chosen location on the first content mutation, so
+	// the backup is in place before any save overwrites the file
 	// (SetBackupLocation; see backup.go).
 	backup *backupState
+
+	// contentSeq names the buffer's current CONTENT state. Content
+	// mutations allocate a fresh sequence number (nextContentSeq);
+	// decoration-only mutations mint revisions like any other but leave
+	// the sequence alone; history seeks restore the landed revision's
+	// recorded sequence (RevisionInfo.ContentSeq). Two revisions carry
+	// the same sequence iff their content is byte-identical, so the
+	// emacs lock, the pre-session backup, and bufferDirtyLocked compare
+	// sequences instead of (fork, revision) identity - marks and
+	// bookmarks never read as "unsaved changes".
+	contentSeq     uint64
+	nextContentSeq uint64
 
 	// Undo coalescing: run tracking plus the per-op decision handed
 	// from insert/delete entry points to recordMutation (see
@@ -1799,15 +1824,16 @@ func (g *Garland) TransactionStart(name string) error {
 
 		// First level: create new transaction state
 		g.transaction = &TransactionState{
-			depth:                 1,
-			name:                  name,
-			poisoned:              false,
-			preTransactionRoot:    g.root.id,
-			preTransactionFork:    g.currentFork,
-			preTransactionRev:     g.currentRevision,
-			preTransactionCursors: g.snapshotCursorPositions(),
-			pendingRevision:       g.currentRevision + 1,
-			hasMutations:          false,
+			depth:                    1,
+			name:                     name,
+			poisoned:                 false,
+			preTransactionRoot:       g.root.id,
+			preTransactionFork:       g.currentFork,
+			preTransactionRev:        g.currentRevision,
+			preTransactionContentSeq: g.contentSeq,
+			preTransactionCursors:    g.snapshotCursorPositions(),
+			pendingRevision:          g.currentRevision + 1,
+			hasMutations:             false,
 		}
 	} else {
 		// Nested: just increment depth
@@ -1873,6 +1899,7 @@ func (g *Garland) TransactionCommit() (ChangeResult, error) {
 		HasChanges:       g.transaction.hasMutations,
 		RootID:           g.root.id,
 		StreamKnownBytes: streamKnown,
+		ContentSeq:       g.contentSeq,
 	}
 
 	result := ChangeResult{
@@ -1978,8 +2005,10 @@ func (g *Garland) UndoSeek(revision RevisionID) error {
 		}
 	}
 
-	// Update current revision
+	// Update current revision (and the content sequence recorded for
+	// it - syncEmacsLockAfterSeekLocked below compares sequences).
 	g.currentRevision = revision
+	g.contentSeq = revInfo.ContentSeq
 
 	// Update counts from the root snapshot at this revision
 	g.updateCountsFromRoot()
@@ -2077,9 +2106,12 @@ func (g *Garland) ForkSeek(fork ForkID) error {
 		}
 	}
 
-	// Switch to the new fork and revision
+	// Switch to the new fork and revision (and the content sequence
+	// recorded for it - syncEmacsLockAfterSeekLocked below compares
+	// sequences).
 	g.currentFork = fork
 	g.currentRevision = targetRevision
+	g.contentSeq = revInfo.ContentSeq
 
 	// Update counts from the root snapshot at this version
 	g.updateCountsFromRoot()
@@ -2669,6 +2701,7 @@ func (g *Garland) rollbackToPreTransaction() {
 	g.root = g.nodeRegistry[g.transaction.preTransactionRoot]
 	g.currentFork = g.transaction.preTransactionFork
 	g.currentRevision = g.transaction.preTransactionRev
+	g.contentSeq = g.transaction.preTransactionContentSeq
 
 	// Restore counts from the root snapshot at pre-transaction revision
 	g.updateCountsFromRoot()
@@ -2677,6 +2710,11 @@ func (g *Garland) rollbackToPreTransaction() {
 	for cursor, pos := range g.transaction.preTransactionCursors {
 		cursor.restorePosition(pos)
 	}
+
+	// The buffer is back at its pre-transaction state: if that state is
+	// content-clean, the emacs lock a discarded mutation acquired must
+	// go (buffer and file agree again).
+	g.syncEmacsLockAfterSeekLocked()
 }
 
 // Helper functions (stubs to be implemented)
@@ -3914,7 +3952,7 @@ func (g *Garland) insertBytesAt(c *Cursor, pos int64, data []byte, decorations [
 	}
 
 	// Handle versioning
-	return g.recordMutation(), nil
+	return g.recordMutation(mutationContent), nil
 }
 
 func (g *Garland) insertStringAt(c *Cursor, pos int64, data string, decorations []RelativeDecoration, insertBefore bool) (ChangeResult, error) {
@@ -4017,7 +4055,7 @@ func (g *Garland) deleteBytesAt(c *Cursor, pos int64, length int64, includeLineD
 	}
 
 	// Handle versioning
-	result := g.recordMutation()
+	result := g.recordMutation(mutationContent)
 	return relDecs, result, nil
 }
 
@@ -4212,7 +4250,7 @@ func (g *Garland) overwriteBytesAtInternal(c *Cursor, pos int64, length int64, n
 	}
 
 	// Handle versioning
-	result := g.recordMutation()
+	result := g.recordMutation(mutationContent)
 	return relDecs, result, nil
 }
 
@@ -4529,7 +4567,7 @@ func (g *Garland) moveBytesAt(c *Cursor, srcStart, srcEnd, dstStart, dstEnd int6
 		cursor.lineRuneDirty = false
 	}
 
-	result := g.recordMutation()
+	result := g.recordMutation(mutationContent)
 	return MoveResult{
 		ChangeResult:         result,
 		DisplacedDecorations: dstRelDecs,
@@ -4701,7 +4739,7 @@ func (g *Garland) copyBytesAt(c *Cursor, srcStart, srcEnd, dstStart, dstEnd int6
 		cursor.lineRuneDirty = false
 	}
 
-	result := g.recordMutation()
+	result := g.recordMutation(mutationContent)
 	return CopyResult{
 		ChangeResult:         result,
 		DisplacedDecorations: dstRelDecs,
@@ -4898,17 +4936,39 @@ func (g *Garland) setCursorFromLine(c *Cursor, line, runeInLine int64) error {
 // If in a transaction, marks it as having mutations.
 // Otherwise, creates a new revision.
 // If not at HEAD revision, creates a new fork first.
-func (g *Garland) recordMutation() ChangeResult {
+// mutationKind classifies what a mutation changed: buffer CONTENT
+// (bytes a save would write) or only decorations (marks, bookmarks -
+// never serialized into the source on save). Both mint revisions
+// identically - undo/redo treats a mark movement like any other edit -
+// the distinction only gates the divergence side effects: the content
+// sequence, the emacs lock, and the pre-session backup.
+type mutationKind int
+
+const (
+	mutationContent mutationKind = iota
+	mutationDecoration
+)
+
+func (g *Garland) recordMutation(kind mutationKind) ChangeResult {
 	// Consume the coalescing decision (if the op made one). Consuming
 	// here means a decision can never outlive its own mutation.
 	pc := g.coalescePending
 	g.coalescePending = coalescePending{}
 
-	// The buffer is diverging from its source: make sure the emacs
-	// lock (when enabled) is held and the pre-session backup (when
-	// configured) is armed. Nil-checks plus a few bools when idle.
-	g.emacsLockMutatedLocked()
-	g.backupMutatedLocked()
+	if kind == mutationContent {
+		// The buffer's CONTENT is diverging from its source: allocate a
+		// fresh content sequence (never reused - a seek-back-then-edit
+		// must not collide with an abandoned state's sequence), make
+		// sure the emacs lock (when enabled) is held and the
+		// pre-session backup (when configured) is armed. Nil-checks
+		// plus a few bools when idle. Decoration-only mutations skip
+		// all three: decorations never serialize into the source, so
+		// they can never BE unsaved changes.
+		g.nextContentSeq++
+		g.contentSeq = g.nextContentSeq
+		g.emacsLockMutatedLocked()
+		g.backupMutatedLocked()
+	}
 
 	if g.transaction != nil {
 		// A transaction is its own (stronger) grouping - any active
@@ -4942,6 +5002,7 @@ func (g *Garland) recordMutation() ChangeResult {
 		if ri := g.revisionInfo[ForkRevision{g.currentFork, g.currentRevision}]; ri != nil {
 			ri.RootID = g.root.id
 			ri.StreamKnownBytes = streamKnown()
+			ri.ContentSeq = g.contentSeq
 			g.applyPendingDecorationUpdates(g.currentFork, g.currentRevision)
 			g.coalesceExtendRunLocked(pc)
 			// Cursors' lastFork/lastRevision already name this revision.
@@ -4973,6 +5034,7 @@ func (g *Garland) recordMutation() ChangeResult {
 		HasChanges:       true,
 		RootID:           g.root.id,
 		StreamKnownBytes: streamKnown(),
+		ContentSeq:       g.contentSeq,
 	}
 
 	// Apply pending decoration cache updates with the correct revision
@@ -5552,7 +5614,7 @@ func (g *Garland) Decorate(entries []DecorationEntry) (ChangeResult, error) {
 
 	// Record the mutation only once for all changes
 	if changed {
-		return g.recordMutation(), nil
+		return g.recordMutation(mutationDecoration), nil
 	}
 
 	return ChangeResult{Fork: g.currentFork, Revision: g.currentRevision}, nil

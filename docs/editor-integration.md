@@ -74,8 +74,10 @@ file open, in every loading style.
 - Status display: `g.HoldsSourceLock()`, `g.SourceLockOwner()`, and
   `LockedBy` in the consistency report.
 - Foreign lock seen -> warn; offer `g.BreakSourceLock()` to steal.
-- Acquire/release is automatic (first edit / save / revert / undo
-  onto the saved revision / Close).
+- Acquire/release is automatic (first CONTENT edit / save / revert /
+  undo onto the saved content / Close). Opening never locks, and
+  decoration-only changes (marks, bookmarks) never lock: a viewer
+  that marks a block to copy from it is not advertised as editing.
 
 ## 7. Backups (automatic once configured)
 

@@ -181,6 +181,45 @@ type warmVerificationState struct {
     update LRU   update tracking notify on fail
 ```
 
+## Never-Mutated Buffers and External Modification
+
+A buffer that was never content-mutated holds no emacs lock (locks are
+lazy — see `FileOptions.UseEmacsLocks`), so an external writer is free
+to modify the source while a viewer has it open. What happens to
+warm-backed spans in that case, precisely:
+
+- **Verification is lazy.** Warm blocks are checksummed at *use* time —
+  on read (`WarmTrustStale` requires it; `verifyOnRead` covers the
+  trusted levels) and before LRU eviction of an in-memory block to warm
+  when changes are suspected. There is **no opportunistic
+  verify-and-chill sweep at detection time**: the moment
+  `SourceModified` / `SourceTruncated` / `SourceReplaced` is first
+  observed, blocks whose only copy is the (now-changed) source are not
+  proactively read back and rescued to cold storage.
+- **In-memory content is never lost to a changed source**: eviction of
+  a stale-trust block verifies first, and a mismatch routes the block
+  to cold storage (or keeps it in memory) instead of dropping it.
+- **Warm-only spans are exposed.** A span that was LRU-evicted to warm
+  storage *before* the external modification, and whose bytes the
+  external writer then changed, has no surviving copy anywhere. It
+  degrades to a placeholder when the mismatch is discovered. Spans the
+  writer did not touch still verify and remain usable.
+
+This is the deliberate trade-off of the emacs locking school (lock only
+when the buffer holds unsaved changes) as opposed to the vim school
+(eager swapfile at open, which warns writers off even for viewers):
+emacs likewise does not protect a read-only viewer's ability to keep
+displaying the original bytes after the file changes underneath it.
+Applications that need the display content of warm-backed viewers to
+survive external modification can narrow the window today by calling
+`Chill(ChillEverything)` (or verifying via `SourceConsistency` and
+chilling) when a change is first reported through the
+`SourceChangeHandler` / `EnableSourceWatch` path. An automatic
+verify-and-chill of still-intact warm blocks on first detection is a
+possible future improvement; it would shrink the loss window to blocks
+already clobbered at detection time, at the cost of a read of every
+warm span when a change fires.
+
 ## Append Handling
 
 ### Append Policy

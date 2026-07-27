@@ -597,7 +597,7 @@ func (g *Garland) scarifyPlaceholders() ([]ScarWarning, error) {
 	// but rune/line coordinates under them may have changed.
 	g.reconcileCursorCoordinates()
 
-	g.recordMutation()
+	g.recordMutation(mutationContent)
 	return warnings, nil
 }
 

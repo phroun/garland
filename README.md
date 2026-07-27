@@ -22,6 +22,7 @@ efficient document manipulation with version control.
 - **Transactions**: Group operations into atomic revisions with rollback support
 - **Memory management**: Configurable soft/hard limits with LRU eviction to cold storage
 - **File change detection**: Monitor and handle external modifications to source files
+- **Emacs-compatible locking** (opt-in): Open never creates a lock file; the `.#name` lock appears on the first *content* mutation past a clean point and disappears when buffer and file agree again (save, revert to saved content, close). Decoration-only changes (marks, bookmarks) mint undo revisions but never engage the lock — a read-only viewer never locks
 
 ## Installation
 

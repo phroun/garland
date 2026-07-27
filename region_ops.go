@@ -26,7 +26,7 @@ func (g *Garland) checkpointUnlocked() error {
 
 	// Only record a mutation if there were actual changes
 	if hasChanges {
-		g.recordMutation()
+		g.recordMutation(mutationContent)
 	}
 
 	return nil

@@ -369,7 +369,7 @@ func (g *Garland) rebaseLocked(fs FileSystemInterface, path string) (RebaseRepor
 		cursor.bytePos = rebaseMapPos(cursor.bytePos, mapping, size)
 	}
 	g.reconcileCursorCoordinates()
-	g.recordMutation()
+	g.recordMutation(mutationContent)
 
 	g.rebaseSourceBookkeeping(fs, path, handle, switching, ownHandle)
 	return report, nil

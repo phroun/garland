@@ -11,13 +11,21 @@ import (
 //
 // When FileOptions.UseEmacsLocks is enabled, Garland maintains an
 // emacs-style lock file next to the source (".#<name>") for exactly as
-// long as the buffer holds unsaved modifications - the same protocol
-// emacs, and tools interoperating with it, use to warn two editors off
-// the same file:
+// long as the buffer holds unsaved CONTENT modifications - the same
+// protocol emacs, and tools interoperating with it, use to warn two
+// editors off the same file:
 //
-//   - The lock appears on the first mutation past a clean point and
-//     disappears when buffer and file agree again (save, revert to the
-//     saved revision, close).
+//   - Open NEVER creates a lock file: a buffer opened for viewing
+//     (reads, marks, no edits) never locks. The lock appears on the
+//     first CONTENT mutation past a clean point and disappears when
+//     buffer and file agree again (save, revert to the saved content,
+//     close).
+//   - Decoration-only mutations (marks, bookmarks) mint revisions for
+//     undo/redo like any other edit, but never engage the lock and
+//     never disturb the clean point: decorations do not serialize into
+//     the source on save, so they can never BE unsaved changes. This
+//     matches emacs, where setting the mark or a bookmark does not
+//     modify the buffer and never locks.
 //   - The lock is a REGULAR file containing "user@host.pid", written
 //     through the filesystem hook so virtualized filesystems
 //     participate too. (Emacs itself prefers a dangling symlink on
@@ -39,12 +47,15 @@ type emacsLockState struct {
 	// (observed gone on a later probe, or BreakSourceLock).
 	foreignOwner string
 
-	// cleanFork/cleanRev name the buffer state that matches the source
-	// file (open baseline, then each successful save). Seeking history
-	// onto this exact state releases the lock; anything else wants it.
-	cleanFork ForkID
-	cleanRev  RevisionID
-	haveClean bool
+	// cleanContentSeq names the CONTENT state that matches the source
+	// file (open baseline, then each successful save). Landing on any
+	// revision carrying this content sequence releases the lock;
+	// anything else wants it. Comparing content sequences instead of
+	// (fork, revision) identity means decoration-only revisions can sit
+	// between the clean revision and the current one without poisoning
+	// the clean point: undoing all content edits still releases.
+	cleanContentSeq uint64
+	haveClean       bool
 }
 
 // emacsLockOwnerInfo builds our lock-owner string.
@@ -80,11 +91,10 @@ func (g *Garland) initEmacsLockLocked(owner string) {
 		owner = emacsLockOwnerInfo()
 	}
 	g.emacsLock = &emacsLockState{
-		enabled:   true,
-		ourInfo:   owner,
-		cleanFork: g.currentFork,
-		cleanRev:  g.currentRevision,
-		haveClean: true,
+		enabled:         true,
+		ourInfo:         owner,
+		cleanContentSeq: g.contentSeq,
+		haveClean:       true,
 	}
 	g.probeEmacsLockLocked()
 }
@@ -170,9 +180,10 @@ func (g *Garland) releaseEmacsLockLocked() {
 	el.held = false
 }
 
-// emacsLockMutatedLocked is the recordMutation hook: the buffer just
-// diverged from (or further from) the source - make sure the lock is
-// held. Cheap when already held or blocked by a foreign lock. Caller
+// emacsLockMutatedLocked is the recordMutation hook, fired for CONTENT
+// mutations only (decoration-only changes never reach it): the buffer
+// just diverged from (or further from) the source - make sure the lock
+// is held. Cheap when already held or blocked by a foreign lock. Caller
 // must hold the write lock.
 func (g *Garland) emacsLockMutatedLocked() {
 	el := g.emacsLock
@@ -183,30 +194,31 @@ func (g *Garland) emacsLockMutatedLocked() {
 }
 
 // emacsLockSavedLocked is the successful-save hook: buffer and source
-// agree at the current fork/revision - that becomes the clean point
+// agree at the current content state - that becomes the clean point
 // and the lock is released. Caller must hold the write lock.
 func (g *Garland) emacsLockSavedLocked() {
 	el := g.emacsLock
 	if el == nil || !el.enabled {
 		return
 	}
-	el.cleanFork = g.currentFork
-	el.cleanRev = g.currentRevision
+	el.cleanContentSeq = g.contentSeq
 	el.haveClean = true
 	g.releaseEmacsLockLocked()
 }
 
 // syncEmacsLockAfterSeekLocked is the history-seek hook (UndoSeek,
-// ForkSeek): landing exactly on the clean point releases the lock;
-// landing anywhere else wants it - matching emacs, where undoing back
-// to the saved state marks the buffer unmodified. Caller must hold the
-// write lock.
+// ForkSeek, transaction rollback): landing on the clean CONTENT state
+// releases the lock; landing anywhere else wants it - matching emacs,
+// where undoing back to the saved state marks the buffer unmodified.
+// The comparison is by content sequence, so decoration-only revisions
+// between the clean revision and the landing point don't keep the lock
+// alive. Caller must hold the write lock.
 func (g *Garland) syncEmacsLockAfterSeekLocked() {
 	el := g.emacsLock
 	if el == nil || !el.enabled {
 		return
 	}
-	if el.haveClean && g.currentFork == el.cleanFork && g.currentRevision == el.cleanRev {
+	if el.haveClean && g.contentSeq == el.cleanContentSeq {
 		g.releaseEmacsLockLocked()
 		return
 	}
@@ -262,7 +274,7 @@ func (g *Garland) BreakSourceLock() error {
 	}
 	el.foreignOwner = ""
 	el.held = false
-	dirty := !(el.haveClean && g.currentFork == el.cleanFork && g.currentRevision == el.cleanRev)
+	dirty := !(el.haveClean && g.contentSeq == el.cleanContentSeq)
 	if dirty {
 		g.acquireEmacsLockLocked()
 	}
