@@ -590,6 +590,54 @@ func (g *Garland) insertInternal(
 	return g.concatenate(snap.leftID, newRightID)
 }
 
+// buildEditSubtree builds a balanced subtree from an edit-time payload
+// too large for one leaf - the same shape the loader gives the same
+// bytes (buildBalancedSubtree), but stamped at the CURRENT
+// fork/revision with no warm-storage backing (edit content has no home
+// in the source file). decs positions are relative to data; each
+// decoration lands in the leaf that holds its byte. subtreeOffset is
+// data's absolute buffer offset once inserted, for the decoration
+// cache.
+func (g *Garland) buildEditSubtree(data []byte, decs []Decoration, subtreeOffset int64) (NodeID, error) {
+	if int64(len(data)) <= g.targetLeafSize {
+		g.nextNodeID++
+		g.nodeManipulations++
+		leaf := newNode(g.nextNodeID, g)
+		g.nodeRegistry[leaf.id] = leaf
+		leaf.setSnapshot(g.currentFork, g.currentRevision, createLeafSnapshot(data, decs, -1))
+		g.updateDecorationCacheForNode(leaf.id, subtreeOffset, decs)
+		return leaf.id, nil
+	}
+
+	// Split at the midpoint on a rune boundary so per-leaf rune/line
+	// indexes stay meaningful.
+	mid := alignToRuneBoundary(data, int64(len(data))/2)
+	if mid == 0 {
+		// Degenerate (non-UTF-8 continuation run at the midpoint):
+		// split unaligned rather than recurse forever.
+		mid = int64(len(data)) / 2
+	}
+
+	var leftDecs, rightDecs []Decoration
+	for _, d := range decs {
+		if d.Position < mid {
+			leftDecs = append(leftDecs, d)
+		} else {
+			rightDecs = append(rightDecs, Decoration{Key: d.Key, Position: d.Position - mid})
+		}
+	}
+
+	leftID, err := g.buildEditSubtree(data[:mid:mid], leftDecs, subtreeOffset)
+	if err != nil {
+		return 0, err
+	}
+	rightID, err := g.buildEditSubtree(data[mid:], rightDecs, subtreeOffset+mid)
+	if err != nil {
+		return 0, err
+	}
+	return g.concatenate(leftID, rightID)
+}
+
 // insertIntoLeaf handles insertion within a leaf node.
 // Returns the ID of the new subtree (which may be a single leaf or internal nodes).
 // absoluteOffset is the byte offset where this leaf starts in the document.
@@ -713,18 +761,30 @@ func (g *Garland) insertIntoLeaf(
 		g.updateDecorationCacheForNode(leftID, leftOffset, leftDecs)
 	}
 
-	// Create new middle leaf (inserted content)
+	// Create the middle (inserted content). A payload larger than one
+	// leaf becomes a balanced subtree of bounded leaves - the shape the
+	// loader gives the same bytes. A single oversized leaf would make
+	// every later seek that lands in it scan the whole payload, forever.
 	middleOffset := absoluteOffset + int64(len(leftData))
-	g.nextNodeID++
-	g.nodeManipulations++
-	middleNode := newNode(g.nextNodeID, g)
-	g.nodeRegistry[middleNode.id] = middleNode
-	middleSnap := createLeafSnapshot(data, absoluteDecs, -1)
-	middleNode.setSnapshot(g.currentFork, g.currentRevision, middleSnap)
-	middleID := middleNode.id
+	var middleID NodeID
+	if int64(len(data)) > g.maxLeafSize {
+		var err error
+		middleID, err = g.buildEditSubtree(data, absoluteDecs, middleOffset)
+		if err != nil {
+			return 0, err
+		}
+	} else {
+		g.nextNodeID++
+		g.nodeManipulations++
+		middleNode := newNode(g.nextNodeID, g)
+		g.nodeRegistry[middleNode.id] = middleNode
+		middleSnap := createLeafSnapshot(data, absoluteDecs, -1)
+		middleNode.setSnapshot(g.currentFork, g.currentRevision, middleSnap)
+		middleID = middleNode.id
 
-	// Update cache for newly inserted decorations
-	g.updateDecorationCacheForNode(middleID, middleOffset, absoluteDecs)
+		// Update cache for newly inserted decorations
+		g.updateDecorationCacheForNode(middleID, middleOffset, absoluteDecs)
+	}
 
 	// Create new right leaf (original content after insertion point)
 	var rightID NodeID
